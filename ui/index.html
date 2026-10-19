@@ -93,9 +93,15 @@
     <div class="card-kicker">Step 2 · AI Analysis</div>
     <div class="row-between">
       <h2>Viral moments</h2>
-      <button id="detectBtn" class="primary">Find moments with AI</button>
+      <button id="detectBtn" class="primary">Find moments</button>
     </div>
-    <p class="sub">Needs your free Gemini API key (Settings). Every clip is scored 0–100 for virality.</p>
+    <div class="row" style="margin: 10px 0 2px;">
+      <div class="segmented" id="detectModeSeg">
+        <button type="button" data-value="ai" class="seg">AI (Gemini key)</button>
+        <button type="button" data-value="offline" class="seg">Offline (no key)</button>
+      </div>
+    </div>
+    <p class="sub" id="detectModeSub">AI mode needs your free Gemini API key (Settings). Every clip is scored 0–100 for virality.</p>
     <div id="detectProgress" class="hidden">
       <div class="bar shimmer"><div id="detectBar" class="fill"></div></div>
       <div id="detectStage" class="stage">Analyzing…</div>
@@ -106,7 +112,7 @@
         <circle cx="27" cy="27" r="15"/><path d="M38 38l12 12"/><path d="M20 27l5 5 9-10" stroke="#0B0F14" stroke-width="4"/>
       </svg>
       <div class="empty-title">No moments yet</div>
-      <div class="empty-sub">Hit “Find moments with AI” and the best clips will appear here, ranked by virality.</div>
+      <div class="empty-sub">Pick a detection mode above, hit “Find moments”, and the best clips will appear here, ranked by score.</div>
     </div>
     <div id="detectSkeleton" class="hidden">
       <div class="skeleton-card"><div class="sk sk-title"></div><div class="sk sk-line"></div><div class="sk sk-line short"></div></div>
