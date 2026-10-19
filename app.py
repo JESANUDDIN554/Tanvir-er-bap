@@ -29,6 +29,7 @@ from pipeline import (  # noqa: E402
     find_moments_by_keywords, parse_srt_file,
     render_clip, retime_words, write_srt, write_vtt, write_xml_timeline,
     merge_clips, probe_duration, set_custom_styles,
+    generate_posting_package,
     LANGUAGES, GENRES, RATIOS,
 )
 
@@ -36,6 +37,39 @@ JOBS = {}
 BATCHES = {}
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"),
                               ".clipmaker_pc_settings.json")
+
+# Job pruning: long desktop sessions must not grow JOBS forever.
+JOB_TTL_S = 6 * 3600   # drop non-working jobs older than 6h
+JOB_HARD_CAP = 40      # ...and never keep more than 40
+JOB_KEEP_MIN = 20      # hard-cap pruning stops here (most recent kept)
+
+
+def _drop_job(jid):
+    job = JOBS.pop(jid, None)
+    if job is None:
+        return
+    # free the disk too - a pruned job's /files URLs 404 anyway
+    import shutil
+    shutil.rmtree(os.path.join(BASE_DIR, "work", jid),
+                  ignore_errors=True)
+
+
+def _prune_jobs():
+    now = time.time()
+    for jid, job in list(JOBS.items()):
+        if job.get("status") == "working":
+            continue  # never prune a job with a live thread
+        if now - job.get("created", now) > JOB_TTL_S:
+            _drop_job(jid)
+    if len(JOBS) > JOB_HARD_CAP:
+        ordered = sorted(JOBS.items(),
+                         key=lambda kv: kv[1].get("created", 0))
+        for jid, job in ordered:
+            if len(JOBS) <= JOB_KEEP_MIN:
+                break
+            if job.get("status") == "working":
+                continue
+            _drop_job(jid)
 
 DEFAULT_SETTINGS = {
     "api_key": "",
@@ -54,6 +88,21 @@ DEFAULT_SETTINGS = {
     "auto_censor": False,
     "face_track": True,
     "use_cookies": False,
+    # Opus-gap features (all offline-first; new toggles)
+    "speaker_colors": False,       # Speaker 1/2 caption colors
+    "speaker_color_1": "#ffd166",
+    "speaker_color_2": "#6cc7ff",
+    "hook_overlay": True,          # hook text overlay, first ~2.5s
+    "cta_overlay": True,           # CTA overlay in the last 2s
+    "cta_text": "Follow for more 🔔",
+    "safe_zone": False,            # Reels-safe caption nudge + filename tag
+    "punch_zoom": True,            # subtle zoom-punch + slow drift
+    "enhance_clarity": False,      # sharpen + denoise ("enhance", not "AI upscale")
+    "logo_path": "",               # brand-kit corner logo PNG
+    "brand_kits": [],              # [{name, caption_style, primary, secondary,
+                                   #   outline, logo_path, intro_path, outro_path}]
+    "planner": [],                 # [{id, job_id, title, scheduled, done,
+                                   #   export_name}] - local posting planner
 }
 
 # Clip-length presets -> (min_s, max_s) for moment detection.
@@ -85,6 +134,16 @@ def save_settings(data):
             json.dump(data, f)
     except OSError:
         pass
+
+
+def _hex_to_ass(hex_color):
+    """#RRGGBB -> ASS &HAABBGGRR (opaque). Safe fallback to white."""
+    import re
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", (hex_color or "").strip())
+    if not m:
+        return "&H00FFFFFF"
+    r, g, b = m.group(1)[0:2], m.group(1)[2:4], m.group(1)[4:6]
+    return ("&H00" + b + g + r).upper()
 
 
 def _job_progress(job_id):
@@ -121,7 +180,9 @@ class Api:
                         "status": "working", "error": "",
                         "video_path": "", "title": "", "duration": 0,
                         "words": [], "moments": [], "renders": [],
-                        "language": "auto", "source": "url"}
+                        "language": "auto", "source": "url",
+                        "created": time.time()}
+        _prune_jobs()
         return job_id
 
     def import_url(self, url, use_cookies=False, language="auto"):
@@ -327,6 +388,7 @@ class Api:
                                "Offline mode."}
         clip_min, clip_max = self._clip_len_range(clip_len)
         job["status"] = "working"
+        job.pop("detect_error", None)  # don't ship a stale failure
         t = threading.Thread(
             target=self._run_detect,
             args=(job_id, api_key, clip_min, clip_max,
@@ -343,12 +405,19 @@ class Api:
                 max_clips=max_clips, progress_cb=_job_progress(job_id))
             if not moments:
                 raise RuntimeError("no_moments")
-            job["moments"] = moments
+            # keep keyword-search ("matched") moments a concurrent
+            # find_moments call may have added; replace the rest
+            kept = [m for m in job.get("moments", []) if m.get("matched")]
+            job["moments"] = kept + moments
             job["status"] = "moments"
             job["stage"] = f"Found {len(moments)} moments"
             job["progress"] = 100
+            job.pop("detect_error", None)
         except Exception as e:  # noqa: BLE001
-            job["status"] = "transcribed"  # back to transcript state
+            # back to transcript state - unless keyword moments from
+            # find_moments are still present, then stay on moments
+            job["status"] = ("moments" if job.get("moments")
+                             else "transcribed")
             msg = str(e)
             if "no_api_key" in msg or "bad_api_key" in msg:
                 job["detect_error"] = ("Gemini API key was rejected. "
@@ -368,6 +437,7 @@ class Api:
             return {"ok": False, "error": "Import a video first."}
         clip_min, clip_max = self._clip_len_range(clip_len)
         job["status"] = "working"
+        job.pop("detect_error", None)  # don't ship a stale failure
         t = threading.Thread(
             target=self._run_detect_offline,
             args=(job_id, clip_min, clip_max,
@@ -385,12 +455,19 @@ class Api:
                 job["words"], clip_min, clip_max, max_clips=max_clips)
             if not moments:
                 raise RuntimeError("no_moments")
-            job["moments"] = moments
+            # keep keyword-search ("matched") moments a concurrent
+            # find_moments call may have added; replace the rest
+            kept = [m for m in job.get("moments", []) if m.get("matched")]
+            job["moments"] = kept + moments
             job["status"] = "moments"
             job["stage"] = f"Found {len(moments)} moments (offline)"
             job["progress"] = 100
+            job.pop("detect_error", None)
         except Exception as e:  # noqa: BLE001
-            job["status"] = "transcribed"  # back to transcript state
+            # back to transcript state - unless keyword moments from
+            # find_moments are still present, then stay on moments
+            job["status"] = ("moments" if job.get("moments")
+                             else "transcribed")
             if "no_moments" in str(e):
                 job["detect_error"] = ("The offline scan found no strong "
                                        "moments in this transcript.")
@@ -439,6 +516,32 @@ class Api:
         m.pop("caption_edited", None)
         return {"ok": True}
 
+    # -- AI posting package --------------------------------------------
+    def posting_package(self, job_id, index):
+        """Per-clip posting package: 3 titles, FB description, hashtags.
+
+        Generated once per moment and cached on it. With a Gemini key ->
+        AI copy ("ai" mode); without -> extractive on-PC fallback
+        ("extractive" mode). The "mode" field always says which produced
+        the copy."""
+        job = JOBS.get(job_id)
+        if not job or not (0 <= index < len(job.get("moments", []))):
+            return {"ok": False, "error": "Moment not found."}
+        m = job["moments"][index]
+        if m.get("posting"):
+            return {"ok": True, "package": m["posting"], "cached": True}
+        words = m.get("edited_words") or [
+            w for w in job["words"]
+            if w["end"] > m["start"] and w["start"] < m["end"]]
+        if not words:
+            return {"ok": False, "error": "No captions in this moment."}
+        settings = load_settings()
+        api_key = settings.get("api_key", "").strip() or None
+        pkg = generate_posting_package(
+            words, m, genre=settings.get("genre", ""), api_key=api_key)
+        m["posting"] = pkg
+        return {"ok": True, "package": pkg, "cached": False}
+
     # -- per-clip trim -------------------------------------------------
     def trim_moment(self, job_id, index, start, end):
         """Adjust a moment's start/end (seconds), clamped to the video."""
@@ -478,35 +581,82 @@ class Api:
         clip_min, clip_max = self._clip_len_range(clip_len)
         moments, unmatched = find_moments_by_keywords(
             job["words"], queries, clip_min, clip_max, max_clips=40)
-        job["moments"].extend(moments)
-        if moments and job["status"] == "transcribed":
-            job["status"] = "moments"
+        # dedupe: don't append the same query hit twice
+        seen = {(round(m.get("start", 0), 2), round(m.get("end", 0), 2),
+                 m.get("matched")) for m in job.get("moments", [])}
+        fresh = [m for m in moments
+                 if (round(m["start"], 2), round(m["end"], 2),
+                     m.get("matched")) not in seen]
+        job["moments"].extend(fresh)
+        if fresh:
+            if job.get("status") != "working":
+                # a render/AI pass is in flight: leave its status alone,
+                # the appended moments are still visible via job_status
+                job["status"] = "moments"
             job["stage"] = f"Found {len(job['moments'])} moments"
-        return {"ok": True, "found": len(moments), "unmatched": unmatched}
+        return {"ok": True, "found": len(fresh), "unmatched": unmatched}
 
     # -- render ----------------------------------------------------------
     def render(self, job_id, indices, options=None):
         job = JOBS.get(job_id)
         if not job or not job.get("moments"):
             return {"ok": False, "error": "Nothing to render yet."}
+        try:
+            indices = [int(i) for i in (indices or [])]
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Bad clip selection."}
+        if not indices or any(i < 0 or i >= len(job["moments"])
+                              for i in indices):
+            return {"ok": False, "error": "Clip selection out of range."}
+        # one render per job at a time: two threads writing the same
+        # 01_title.mp4 filenames corrupt each other's output
+        lock = job.setdefault("_render_lock", threading.Lock())
+        if not lock.acquire(blocking=False):
+            return {"ok": False, "error": "render_in_progress",
+                    "message": "A render is already running for this "
+                               "video - wait for it to finish."}
         settings = load_settings()
         opts = dict(options or {})
         # defaults from settings, overridable per render call
         for key in ("caption_style", "ratio", "quality", "face_track",
                     "remove_fillers", "remove_silences", "auto_censor",
-                    "emojis", "highlight"):
+                    "emojis", "highlight", "speaker_colors", "hook_overlay",
+                    "cta_overlay", "cta_text", "safe_zone", "punch_zoom",
+                    "enhance_clarity", "logo_path"):
             opts.setdefault(key, settings.get(key))
         opts.setdefault("caption_style", "bold-pop")
         opts.setdefault("ratio", "9:16")
         opts.setdefault("quality", "1080p")
         opts["custom_styles"] = settings.get("custom_styles", [])
         set_custom_styles(opts["custom_styles"])
+        # speaker colors: toggle + two hexes from settings -> ASS tuple
+        if opts.get("speaker_colors"):
+            opts["speaker_colors"] = (
+                _hex_to_ass(settings.get("speaker_color_1", "#ffd166")),
+                _hex_to_ass(settings.get("speaker_color_2", "#6cc7ff")))
+        else:
+            opts["speaker_colors"] = None
+        # CTA: toggle gates the text (per-render text overrides settings)
+        if opts.get("cta_overlay"):
+            cta = (opts.get("cta_text")
+                   or settings.get("cta_text", "")).strip()
+            opts["cta_text"] = cta or None
+        else:
+            opts["cta_text"] = None
+        opts["hook_overlay"] = bool(opts.get("hook_overlay", True))
+        logo = (opts.get("logo_path")
+                or settings.get("logo_path", "")).strip()
+        opts["logo_path"] = logo or None
         job["last_render_opts"] = {k: opts.get(k) for k in
                                    ("caption_style", "ratio", "quality",
                                     "face_track", "remove_fillers",
                                     "remove_silences", "auto_censor",
-                                    "emojis", "highlight")}
+                                    "emojis", "highlight", "speaker_colors",
+                                    "hook_overlay", "cta_text", "safe_zone",
+                                    "punch_zoom", "enhance_clarity",
+                                    "logo_path")}
         job["status"] = "working"
+        job.pop("render_error", None)  # don't ship a stale failure
         t = threading.Thread(
             target=self._run_render,
             args=(job_id, list(indices), opts),
@@ -515,6 +665,18 @@ class Api:
         return {"ok": True}
 
     def _run_render(self, job_id, indices, opts):
+        job = JOBS[job_id]
+        lock = job.get("_render_lock")
+        try:
+            self._render_clips(job_id, indices, opts)
+        finally:
+            if lock is not None:
+                try:
+                    lock.release()
+                except RuntimeError:
+                    pass  # already released
+
+    def _render_clips(self, job_id, indices, opts):
         job = JOBS[job_id]
         outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
         os.makedirs(outdir, exist_ok=True)
@@ -526,7 +688,8 @@ class Api:
                 job["progress"] = int(n / max(len(indices), 1) * 100)
                 safe = "".join(c if c.isalnum() or c in " -_" else ""
                                for c in m["title"])[:40].strip() or "clip"
-                out = os.path.join(outdir, f"{n + 1:02d}_{safe}.mp4")
+                tag = "_reels-safe" if opts.get("safe_zone") else ""
+                out = os.path.join(outdir, f"{n + 1:02d}_{safe}{tag}.mp4")
                 render_clip(job["video_path"], m, job["words"],
                             opts.get("caption_style", "bold-pop"),
                             out, _job_progress(job_id),
@@ -539,7 +702,16 @@ class Api:
                             ratio=opts.get("ratio", "9:16"),
                             quality=opts.get("quality", "1080p"),
                             custom_styles=opts.get("custom_styles", []),
-                            edited_words=m.get("edited_words"))
+                            edited_words=m.get("edited_words"),
+                            speaker_colors=opts.get("speaker_colors"),
+                            hook_overlay=bool(opts.get("hook_overlay",
+                                                       True)),
+                            cta_text=opts.get("cta_text"),
+                            safe_zone=bool(opts.get("safe_zone")),
+                            punch_zoom=bool(opts.get("punch_zoom")),
+                            enhance_clarity=bool(
+                                opts.get("enhance_clarity")),
+                            logo_path=opts.get("logo_path"))
                 renders.append({"path": out, "title": m["title"],
                                 "virality": m["virality"],
                                 "moment_index": i,
@@ -549,6 +721,7 @@ class Api:
             job["status"] = "done"
             job["stage"] = f"Done - {len(renders)} clips rendered"
             job["progress"] = 100
+            job.pop("render_error", None)
         except Exception as e:  # noqa: BLE001
             job["status"] = "moments"
             job["render_error"] = "Render failed: " + str(e)[:220]
@@ -559,6 +732,15 @@ class Api:
     # -- caption exports (SRT/VTT), ZIP, XML timeline, previews -----------
     def _render_words(self, job, render_idx):
         r = job["renders"][render_idx]
+        if r.get("words"):
+            # merged clip: captions were combined at merge time onto the
+            # merged timeline - use a synthetic full-span window so the
+            # SRT/VTT writers don't clip them to one source moment
+            total = r.get("merged_duration") or 0
+            if not total:
+                total = max((w["end"] for w in r["words"]),
+                            default=0)
+            return r, {"start": 0, "end": total}, r["words"]
         m = job["moments"][r["moment_index"]]
         words = m.get("edited_words") or [
             w for w in job["words"]
@@ -617,6 +799,116 @@ class Api:
         return {"ok": True, "path": out,
                 "url": self._download_url(job_id, out)}
 
+    # -- brand kits ------------------------------------------------------
+    def save_brand_kit(self, name, kit):
+        """Save a named brand kit: caption style + colors + corner logo
+        PNG + intro/outro paths. One-click apply happens in the UI."""
+        name = (name or "").strip()[:40]
+        if not name:
+            return {"ok": False, "error": "Name the brand kit first."}
+        kit = dict(kit or {})
+        settings = load_settings()
+        kits = settings.get("brand_kits") or []
+        entry = {
+            "name": name,
+            "caption_style": str(kit.get("caption_style", "bold-pop")),
+            "primary": str(kit.get("primary", "#ffffff")),
+            "secondary": str(kit.get("secondary", "#2effc8")),
+            "outline": str(kit.get("outline", "#000000")),
+            "logo_path": str(kit.get("logo_path", ""))[:500],
+            "intro_path": str(kit.get("intro_path", ""))[:500],
+            "outro_path": str(kit.get("outro_path", ""))[:500],
+        }
+        kits = [k for k in kits if k.get("name") != name] + [entry]
+        settings["brand_kits"] = kits
+        save_settings(settings)
+        return {"ok": True, "kits": kits}
+
+    def delete_brand_kit(self, name):
+        settings = load_settings()
+        kits = [k for k in (settings.get("brand_kits") or [])
+                if k.get("name") != name]
+        settings["brand_kits"] = kits
+        save_settings(settings)
+        return {"ok": True, "kits": kits}
+
+    # -- local posting planner (scheduler-lite) --------------------------
+    # No auto-posting (no accounts connected): a persisted per-clip
+    # schedule queue with a checklist view and export-day naming.
+    def get_planner(self):
+        return {"planner": load_settings().get("planner", [])}
+
+    def add_planner_entry(self, job_id, render_idx, scheduled):
+        """Queue a rendered clip for posting at an ISO datetime."""
+        from datetime import datetime
+        job = JOBS.get(job_id)
+        if not job or not (0 <= render_idx < len(job.get("renders", []))):
+            return {"ok": False, "error": "Clip not found."}
+        try:
+            dt = datetime.fromisoformat(str(scheduled))
+        except (TypeError, ValueError):
+            return {"ok": False,
+                    "error": "Pick a valid date and time."}
+        r = job["renders"][render_idx]
+        safe = "".join(c if c.isalnum() or c in " -_" else ""
+                       for c in r["title"])[:40].strip() or "clip"
+        export_name = f"{dt.strftime('%Y-%m-%d')}_{safe}.mp4"
+        entry = {
+            "id": uuid.uuid4().hex[:8],
+            "job_id": job_id,
+            "render_idx": render_idx,
+            "title": r["title"],
+            "path": r["path"],
+            "scheduled": dt.isoformat(timespec="minutes"),
+            "done": False,
+            "export_name": export_name,
+        }
+        settings = load_settings()
+        planner = settings.get("planner", [])
+        planner.append(entry)
+        planner.sort(key=lambda e: e.get("scheduled", ""))
+        settings["planner"] = planner
+        save_settings(settings)
+        return {"ok": True, "entry": entry, "planner": planner}
+
+    def update_planner_entry(self, entry_id, fields):
+        from datetime import datetime
+        settings = load_settings()
+        planner = settings.get("planner", [])
+        for e in planner:
+            if e.get("id") == entry_id:
+                fields = dict(fields or {})
+                if "done" in fields:
+                    e["done"] = bool(fields["done"])
+                if fields.get("scheduled"):
+                    try:
+                        dt = datetime.fromisoformat(
+                            str(fields["scheduled"]))
+                    except (TypeError, ValueError):
+                        return {"ok": False,
+                                "error": "Pick a valid date and time."}
+                    e["scheduled"] = dt.isoformat(timespec="minutes")
+                    safe = "".join(
+                        c if c.isalnum() or c in " -_" else ""
+                        for c in e["title"])[:40].strip() or "clip"
+                    e["export_name"] = \
+                        f"{dt.strftime('%Y-%m-%d')}_{safe}.mp4"
+                break
+        else:
+            return {"ok": False, "error": "Entry not found."}
+        planner.sort(key=lambda e: e.get("scheduled", ""))
+        settings["planner"] = planner
+        save_settings(settings)
+        return {"ok": True, "planner": planner}
+
+    def delete_planner_entry(self, entry_id):
+        settings = load_settings()
+        planner = [e for e in settings.get("planner", [])
+                   if e.get("id") != entry_id]
+        settings["planner"] = planner
+        save_settings(settings)
+        return {"ok": True, "planner": planner}
+
     def make_zip(self, job_id, with_captions=True):
         """Download-all ZIP: every rendered MP4 (+ SRT/VTT when present)."""
         import zipfile
@@ -642,8 +934,12 @@ class Api:
         return {"ok": True, "path": zpath,
                 "url": self._download_url(job_id, zpath)}
 
-    def preview_captions(self, job_id, index):
-        """Captions-only preview: black video + burned captions for a moment."""
+    def preview_captions(self, job_id, index, options=None):
+        """Captions-only preview: black video + burned captions for a moment.
+
+        options (optional): {"caption_style", "emojis", "highlight"} -
+        the caller's current UI selections. Falls back to saved settings
+        for anything not given, so old 2-arg calls keep working."""
         import subprocess
         job = JOBS.get(job_id)
         if not job or not (0 <= index < len(job.get("moments", []))):
@@ -656,6 +952,12 @@ class Api:
             return {"ok": False, "error": "No captions in this moment."}
         settings = load_settings()
         set_custom_styles(settings.get("custom_styles", []))
+        ui_opts = options or {}
+        style = ui_opts.get("caption_style") or settings.get(
+            "caption_style", "bold-pop")
+        emojis = ui_opts.get("emojis", settings.get("emojis", False))
+        highlight = ui_opts.get("highlight",
+                                settings.get("highlight", False))
         outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
         os.makedirs(outdir, exist_ok=True)
         ass_fd, ass_path = __import__("tempfile").mkstemp(suffix=".ass",
@@ -666,10 +968,10 @@ class Api:
             from pipeline import build_ass, _ffmpeg_ass_path
             dur = max(1.0, m["end"] - m["start"])
             build_ass(words, m["start"], m["end"],
-                      settings.get("caption_style", "bold-pop"),
+                      style,
                       m.get("hook", ""), ass_path, res=(540, 960),
-                      emojis=bool(settings.get("emojis")),
-                      highlight=bool(settings.get("highlight")))
+                      emojis=bool(emojis),
+                      highlight=bool(highlight))
             cmd = ["ffmpeg", "-y", "-v", "error",
                    "-f", "lavfi", "-i",
                    f"color=c=black:s=540x960:d={dur:.2f}:r=30",
@@ -716,10 +1018,31 @@ class Api:
                         intro_path=intro, outro_path=outro)
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": str(e)[:220]}
+        # combined caption words for the merged timeline (offsets by each
+        # source clip's duration) so SRT/VTT exports cover the whole merge.
+        # Source words are in source-video time; rebase them to each
+        # clip's own 0-based timeline first (nested merges are already
+        # 0-based, their synthetic window starts at 0).
+        merged_words, offset = [], 0.0
+        try:
+            clip_durs = [probe_duration(p) for p in paths]
+        except Exception:  # noqa: BLE001
+            clip_durs = [0.0] * len(paths)
+        for i, dur in zip(idxs, clip_durs):
+            _, msrc, w = self._render_words(job, i)
+            base = (msrc or {}).get("start") or 0
+            for wd in w:
+                merged_words.append({
+                    "start": max(0.0, wd["start"] - base + offset),
+                    "end": max(0.0, wd["end"] - base + offset),
+                    "word": wd["word"]})
+            offset += dur or 0.0
         job["renders"].append({
             "path": out, "title": "Merged clip",
             "virality": max(job["renders"][i]["virality"] for i in idxs),
             "moment_index": job["renders"][idxs[0]]["moment_index"],
+            "words": merged_words, "merged": True,
+            "merged_duration": round(offset, 2),
             "url": f"/files/{job_id}/clips/{os.path.basename(out)}"})
         return {"ok": True, "path": out,
                 "url": self._download_url(job_id, out)}
@@ -777,6 +1100,11 @@ _MIME = {
     ".css": "text/css; charset=utf-8",
     ".json": "application/json",
     ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
     ".ico": "image/x-icon",
     ".svg": "image/svg+xml",
 }
@@ -813,6 +1141,10 @@ def make_wsgi_app(api):
             try:
                 payload = json.loads(raw.decode("utf-8") or "{}")
             except ValueError:
+                return _wsgi_response(
+                    start_response, "400 Bad Request", "application/json",
+                    json.dumps({"ok": False, "error": "bad json"}))
+            if not isinstance(payload, dict):
                 return _wsgi_response(
                     start_response, "400 Bad Request", "application/json",
                     json.dumps({"ok": False, "error": "bad json"}))
@@ -919,10 +1251,13 @@ def _find_chrome_or_edge():
 
 
 def _launch_window(url):
-    """Open the UI in a desktop-style window.
+    """Open the UI in a desktop-style window - at most ONE window/tab per
+    process.
 
     Returns the browser Popen handle when we own the window process,
-    else None (fell back to a normal browser tab).
+    else None (fell back to a normal browser tab). If the --app launch
+    dies immediately, falls back to ONE normal tab. No retry loops:
+    a failed open is attempted exactly once, total.
     """
     exe = _find_chrome_or_edge()
     if exe:
@@ -930,10 +1265,19 @@ def _launch_window(url):
                                ".clipmaker_pc_profile")
         os.makedirs(profile, exist_ok=True)
         try:
-            return subprocess.Popen(
+            proc = subprocess.Popen(
                 [exe, "--app=" + url, "--user-data-dir=" + profile,
                  "--no-first-run", "--no-default-browser-check"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # instant-death check (costs nothing: the window is already
+            # opening while we poll) - a dead launch falls back to one tab
+            deadline = time.time() + 0.5
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+            else:
+                return proc
         except OSError:
             pass
     import webbrowser
@@ -956,39 +1300,235 @@ def _auto_update_ytdlp():
         pass
 
 
+# ---------------------------------------------------------------------------
+# Single-instance guard: repeated launches must not pile up servers/windows.
+# A lockfile in the home dir holds the owner's pid; the port is published
+# once the server binds. A second launch sees a live owner and exits
+# quietly - no second server, no second window. A stale lock (dead pid)
+# is removed and the launch proceeds.
+# ---------------------------------------------------------------------------
+LOCKFILE = os.path.join(os.path.expanduser("~"), ".clipmaker_pc.lock")
+
+
+def _pid_alive(pid):
+    """True if a process with this pid exists (cross-platform)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x00100000,
+                                                   False, pid)
+            if h:
+                ctypes.windll.kernel32.CloseHandle(h)
+                return True
+            return False
+        except Exception:  # noqa: BLE001 - assume dead
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, we just can't signal it
+    except OSError:
+        return False
+
+
+def _read_lockfile():
+    try:
+        with open(LOCKFILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_lockfile(port, mode=None):
+    """Publish this process as the owner.
+
+    mode: the owner's window mode - "app" (desktop --app window) or
+    "fallback" (plain browser tab). None until the launch decision is
+    made; duplicates treat an unknown mode as "fallback"."""
+    tmp = LOCKFILE + ".%d.tmp" % os.getpid()
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "port": port, "mode": mode}, f)
+        os.replace(tmp, LOCKFILE)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _update_lockfile_mode(mode):
+    """Record the owner's window mode after the launch decision.
+
+    Atomic write; only touches the lockfile when this process still
+    owns it (a newer owner is never clobbered)."""
+    info = _read_lockfile()
+    if not info or info.get("pid") != os.getpid():
+        return
+    info["mode"] = mode
+    tmp = LOCKFILE + ".%d.tmp" % os.getpid()
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+        os.replace(tmp, LOCKFILE)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _release_lockfile():
+    info = _read_lockfile()
+    if info and info.get("pid") == os.getpid():
+        try:
+            os.remove(LOCKFILE)
+        except OSError:
+            pass
+
+
+def _acquire_single_instance():
+    """Returns (owned, owner_mode).
+
+    owned=True: this process owns the app and may start the server.
+    owned=False: another live instance owns it - the caller must NOT
+    start a second server. owner_mode is the owner's window mode
+    ("app" / "fallback"), or None when unknown (e.g. an older build's
+    lockfile, or the owner is still deciding) - treat None as
+    "fallback".
+    """
+    for _ in range(3):
+        try:
+            # atomic create-and-fill: the lockfile never exists empty,
+            # so a concurrent launcher can't misread it as corrupt
+            fd = os.open(LOCKFILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "port": None,
+                           "mode": None}, f)
+            return True, None
+        except FileExistsError:
+            pass
+        info = _read_lockfile()
+        if info is None:
+            # unreadable lock: might be a concurrent owner mid-write -
+            # wait a beat before judging it stale
+            time.sleep(0.3)
+            info = _read_lockfile() or {}
+        if _pid_alive(info.get("pid")):
+            # Live owner: give it a few seconds to publish its port
+            # (still starting up).
+            for _ in range(50):
+                if (_read_lockfile() or {}).get("port"):
+                    break
+                time.sleep(0.1)
+            return False, (_read_lockfile() or {}).get("mode")
+        # stale lock (owner died without cleaning up): drop it, retry
+        try:
+            os.remove(LOCKFILE)
+        except OSError:
+            time.sleep(0.2)
+    # Lock never settled (bizarre FS state): proceed as owner without a
+    # lock rather than refusing to start at all. One window per process
+    # still holds.
+    return True, None
+
+
+def _wait_port_open(port, timeout=5.0):
+    """Block until the localhost server accepts connections.
+
+    Usually instant; replaces the old fixed sleep so the window opens
+    the moment the server is actually reachable."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.05)
+    return False
+
+
 def main():
     from waitress import serve
 
-    # keep yt-dlp fresh without ever blocking startup
-    threading.Thread(target=_auto_update_ytdlp, daemon=True).start()
+    # Single instance: a repeated launch never starts a second server.
+    # --app mode owner: exit silently (the desktop window is the UI).
+    # fallback-mode owner (plain browser tab): the server can outlive a
+    # closed tab, so a duplicate opens the existing instance's URL
+    # exactly ONCE, then exits. (This also fixes the "100 browser tabs"
+    # pile-up: every extra launch used to start its own server+window.)
+    owned, owner_mode = _acquire_single_instance()
+    if not owned:
+        if owner_mode != "app":
+            port = (_read_lockfile() or {}).get("port")
+            if port:
+                import webbrowser
+                webbrowser.open("http://127.0.0.1:%d/" % port)
+        return
 
-    api = Api()
-    port = _free_port()
-    url = "http://127.0.0.1:%d/" % port
-    print("ClipMaker PC running at " + url, flush=True)
+    # Die gracefully on SIGTERM (task manager / kill): turn it into a
+    # KeyboardInterrupt so the finally below still releases the lock.
+    # (A lock left behind by SIGKILL is still self-healing: the next
+    # launch sees a dead pid and treats it as stale.)
+    def _on_term(_signum, _frame):
+        raise KeyboardInterrupt()
+    try:
+        import signal
+        signal.signal(signal.SIGTERM, _on_term)
+    except (OSError, ValueError):  # noqa: BLE001 - non-fatal
+        pass
 
-    server_thread = threading.Thread(
-        target=serve,
-        kwargs={"app": make_wsgi_app(api), "host": "127.0.0.1",
-                "port": port, "threads": 8},
-        daemon=True)
-    server_thread.start()
+    try:
+        # keep yt-dlp fresh without ever blocking startup
+        threading.Thread(target=_auto_update_ytdlp, daemon=True).start()
 
-    time.sleep(0.6)  # let the server bind before opening the window
-    proc = _launch_window(url)
-    if proc is not None:
-        # When the user closes the app window, shut the server down too.
+        api = Api()
+        port = _free_port()
+        url = "http://127.0.0.1:%d/" % port
+        print("ClipMaker PC running at " + url, flush=True)
+
+        server_thread = threading.Thread(
+            target=serve,
+            kwargs={"app": make_wsgi_app(api), "host": "127.0.0.1",
+                    "port": port, "threads": 8},
+            daemon=True)
+        server_thread.start()
+
+        _write_lockfile(port)
+        # Server binds first, then the window opens the moment the port
+        # accepts connections - the UI's splash screen covers the warmup.
+        _wait_port_open(port)
+
+        proc = _launch_window(url)
+        # record the window mode so a duplicate launch behaves right:
+        # silent exit in --app mode, open-the-URL-once in fallback mode
+        _update_lockfile_mode("app" if proc is not None else "fallback")
+        if proc is not None:
+            # When the user closes the app window, shut the server down too.
+            try:
+                proc.wait()
+            except KeyboardInterrupt:
+                pass
+            return
+        # Fallback (normal browser tab): keep serving until killed.
         try:
-            proc.wait()
+            while True:
+                time.sleep(3600)
         except KeyboardInterrupt:
             pass
-        os._exit(0)
-    # Fallback (normal browser tab): keep serving until killed.
-    try:
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        pass
+    finally:
+        _release_lockfile()
 
 
 if __name__ == "__main__":
