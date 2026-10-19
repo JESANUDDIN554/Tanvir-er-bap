@@ -199,6 +199,24 @@
     </div>
 
     <div class="field">
+      <label class="field-label">Brand kit <span class="hint">— one click applies caption style + colors + logo + intro/outro</span></label>
+      <div class="row row-tight">
+        <select id="brandKitSelect" class="select" style="max-width:230px"><option value="">No brand kit</option></select>
+        <button id="applyBrandKitBtn" class="ghost-btn small">Apply kit</button>
+        <button id="deleteBrandKitBtn" class="ghost-btn small">Delete</button>
+      </div>
+      <div class="row row-tight" style="margin-top:8px">
+        <input id="brandKitName" type="text" placeholder="Kit name, e.g. Bodycam Daily" spellcheck="false" style="max-width:200px">
+        <input id="brandLogoInput" type="text" placeholder="Corner logo PNG path (optional)" spellcheck="false" style="max-width:260px">
+        <button id="saveBrandKitBtn" class="ghost-btn small">Save current as brand kit</button>
+      </div>
+      <div class="row row-tight">
+        <input id="brandIntroInput" type="text" placeholder="Intro clip path (optional)" spellcheck="false" style="max-width:230px">
+        <input id="brandOutroInput" type="text" placeholder="Outro clip path (optional)" spellcheck="false" style="max-width:230px">
+      </div>
+    </div>
+
+    <div class="field">
       <label class="field-label">Caption style</label>
       <div class="style-grid" id="styleCards">
         <button type="button" class="style-card" data-value="bold-pop"><span class="style-preview sp-bold">YOUR <em>WORDS</em> POP</span><span class="style-name">Bold Pop</span></button>
@@ -226,6 +244,12 @@
       <label class="switch-row" for="fillerCheck"><span class="switch-text">Remove filler words <span class="hint">— um, uh, like, you know…</span></span><span class="switch"><input type="checkbox" id="fillerCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="censorCheck"><span class="switch-text">Auto-censor <span class="hint">— beep over profanity</span></span><span class="switch"><input type="checkbox" id="censorCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="faceTrackCheck"><span class="switch-text">Face-tracked reframe <span class="hint">— follows the speaker (slower)</span></span><span class="switch"><input type="checkbox" id="faceTrackCheck"><span class="track"><span class="thumb"></span></span></span></label>
+      <label class="switch-row" for="speakerColorsCheck"><span class="switch-text">Speaker color captions <span class="hint">— Speaker 1/2 get different caption colors (heuristic split)</span></span><span class="switch"><input type="checkbox" id="speakerColorsCheck"><span class="track"><span class="thumb"></span></span></span></label>
+      <label class="switch-row" for="hookOverlayCheck"><span class="switch-text">Hook text overlay <span class="hint">— punchiest line over the first ~2.5s</span></span><span class="switch"><input type="checkbox" id="hookOverlayCheck"><span class="track"><span class="thumb"></span></span></span></label>
+      <label class="switch-row" for="ctaOverlayCheck"><span class="switch-text">CTA overlay <span class="hint">— call-to-action in the last 2 seconds</span></span><span class="switch"><input type="checkbox" id="ctaOverlayCheck"><span class="track"><span class="thumb"></span></span></span></label>
+      <label class="switch-row" for="punchZoomCheck"><span class="switch-text">Punch-in zoom <span class="hint">— subtle zoom on the hook + slow drift</span></span><span class="switch"><input type="checkbox" id="punchZoomCheck"><span class="track"><span class="thumb"></span></span></span></label>
+      <label class="switch-row" for="enhanceCheck"><span class="switch-text">Enhance clarity <span class="hint">— sharpen + denoise for low-res sources (not an AI upscale)</span></span><span class="switch"><input type="checkbox" id="enhanceCheck"><span class="track"><span class="thumb"></span></span></span></label>
+      <label class="switch-row" for="safeZoneCheck"><span class="switch-text">Reels-safe export <span class="hint">— captions nudged into safe zones, filename tagged</span></span><span class="switch"><input type="checkbox" id="safeZoneCheck"><span class="track"><span class="thumb"></span></span></span></label>
     </div>
 
     <details class="more-options">
@@ -237,6 +261,18 @@
           <button type="button" data-value="1080p" class="seg on">1080p</button>
         </div>
       </div>
+      <div class="field">
+        <label class="field-label">Speaker colors <span class="hint">— used when “Speaker color captions” is on</span></label>
+        <div class="row row-tight">
+          <label class="color-pick" title="Speaker 1 color">Speaker 1 <input type="color" id="speakerColor1" value="#ffd166"></label>
+          <label class="color-pick" title="Speaker 2 color">Speaker 2 <input type="color" id="speakerColor2" value="#6cc7ff"></label>
+        </div>
+      </div>
+      <div class="field">
+        <label class="field-label">CTA text <span class="hint">— shown in the last 2s when CTA overlay is on</span></label>
+        <input id="ctaTextInput" type="text" value="Follow for more 🔔" style="max-width:280px" spellcheck="false">
+      </div>
+      <label class="switch-row" for="safeZoneGuideCheck"><span class="switch-text">Reels safe-zone guide <span class="hint">— show Reels UI margins in previews</span></span><span class="switch"><input type="checkbox" id="safeZoneGuideCheck"><span class="track"><span class="thumb"></span></span></span></label>
     </details>
 
     <div id="detectProgress" class="hidden">
@@ -253,7 +289,7 @@
       <div class="skeleton-card"><div class="sk sk-title"></div><div class="sk sk-line"></div><div class="sk sk-line short"></div></div>
       <div class="skeleton-card"><div class="sk sk-title"></div><div class="sk sk-line"></div><div class="sk sk-line short"></div></div>
     </div>
-    <div class="row-between" id="momentsBar" style="margin-top:14px">
+    <div class="row-between hidden" id="momentsBar" style="margin-top:14px">
       <span class="stage" id="momentsCount"></span>
       <button id="sortBtn" class="ghost-btn small">Sort: virality ↓</button>
     </div>
@@ -285,6 +321,11 @@
       <div class="empty-sub">Generate your selected moments and the finished videos will land here.</div>
     </div>
     <div id="renders" class="renders-grid"></div>
+
+    <div class="planner-box">
+      <div class="field-label">Posting planner <span class="hint">— local schedule queue. No auto-posting: it just keeps your plan.</span></div>
+      <div id="plannerList"><div class="empty-sub">Nothing scheduled yet — set a date/time on a clip above and hit “Plan”.</div></div>
+    </div>
 
     <div class="composer-box">
       <div class="field-label">Clip Composer <span class="hint">— tick 2+ clips above, optional intro/outro, merge into one</span></div>
@@ -336,7 +377,14 @@
 <div id="previewModal" class="modal hidden">
   <div class="modal-box wide">
     <h2 id="previewTitle">Preview</h2>
-    <video id="previewVideo" controls style="width:100%;border-radius:12px;background:#000"></video>
+    <div class="preview-wrap" id="previewWrap">
+      <video id="previewVideo" controls style="width:100%;border-radius:12px;background:#000"></video>
+      <div id="safeZoneOverlay" class="safe-zone-overlay hidden" aria-hidden="true">
+        <div class="sz-top"><span>Top bar — keep titles below this</span></div>
+        <div class="sz-right"><span>Right rail</span></div>
+        <div class="sz-bottom"><span>Caption / description zone</span></div>
+      </div>
+    </div>
     <div class="row">
       <button id="closePreviewBtn" class="ghost-btn">Close</button>
     </div>
@@ -354,6 +402,17 @@
         <button id="keyToggle" class="ghost-btn small" type="button" title="Show / hide key">Show</button>
       </div>
       <p class="hint">Free — get one at <a href="#" id="keyHelp">aistudio.google.com</a>. Only needed for AI detection mode; Offline mode needs no key.</p>
+    </div>
+    <div class="field">
+      <label class="field-label">Appearance <span class="hint">— default matches the web app</span></label>
+      <div class="segmented" id="themeSeg">
+        <button type="button" data-value="dark" class="seg on">Dark</button>
+        <button type="button" data-value="light" class="seg">Light</button>
+      </div>
+      <div class="row row-tight">
+        <label class="color-pick" title="Accent color">Accent <input type="color" id="accentPick" value="#2effc8"></label>
+        <button id="accentReset" class="ghost-btn small" type="button">Reset accent</button>
+      </div>
     </div>
     <div class="row">
       <button id="saveSettingsBtn" class="primary">Save settings</button>
