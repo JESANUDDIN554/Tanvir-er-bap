@@ -23,8 +23,8 @@ if getattr(sys, "frozen", False):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pipeline import (  # noqa: E402
-    download_video, transcribe, detect_moments, render_clip,
-    retime_words, write_srt, merge_clips,
+    download_video, transcribe, detect_moments, detect_moments_offline,
+    render_clip, retime_words, write_srt, merge_clips,
 )
 
 JOBS = {}
@@ -159,6 +159,46 @@ class Api:
                                        "this transcript.")
             else:
                 job["detect_error"] = "Moment detection failed: " + msg[:220]
+            job["stage"] = "Transcript ready"
+            job["progress"] = 100
+
+    # -- offline moment detection (no API key) ---------------------------
+    def detect_offline(self, job_id, max_clips=8):
+        job = JOBS.get(job_id)
+        if not job or job["status"] != "transcribed":
+            return {"ok": False, "error": "Import a video first."}
+        settings = load_settings()
+        clip_len = settings.get("clip_length", "30-60s")
+        clip_min, clip_max = (30, 60) if clip_len == "30-60s" else (60, 120)
+        job["status"] = "working"
+        t = threading.Thread(
+            target=self._run_detect_offline,
+            args=(job_id, clip_min, clip_max, max_clips),
+            daemon=True)
+        t.start()
+        return {"ok": True}
+
+    def _run_detect_offline(self, job_id, clip_min, clip_max, max_clips):
+        job = JOBS[job_id]
+        try:
+            job["stage"] = "Scanning transcript (offline)"
+            job["progress"] = 40
+            moments = detect_moments_offline(
+                job["words"], clip_min, clip_max, max_clips=max_clips)
+            if not moments:
+                raise RuntimeError("no_moments")
+            job["moments"] = moments
+            job["status"] = "moments"
+            job["stage"] = f"Found {len(moments)} moments (offline)"
+            job["progress"] = 100
+        except Exception as e:  # noqa: BLE001
+            job["status"] = "transcribed"  # back to transcript state
+            if "no_moments" in str(e):
+                job["detect_error"] = ("The offline scan found no strong "
+                                       "moments in this transcript.")
+            else:
+                job["detect_error"] = ("Offline detection failed: "
+                                       + str(e)[:220])
             job["stage"] = "Transcript ready"
             job["progress"] = 100
 
