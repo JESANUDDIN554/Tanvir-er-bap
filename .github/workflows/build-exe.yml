@@ -1,0 +1,97 @@
+# Builds the ClipMaker PC Windows .exe on GitHub's Windows runner
+# (PyInstaller cannot cross-compile from Linux/macOS) and publishes it
+# as a GitHub Release with ffmpeg bundled - the zip is fully standalone.
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.py'
+      - 'requirements.txt'
+      - 'ClipMakerPC.spec'
+      - 'ui/**'
+      - '.github/workflows/build-exe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create/update the Release
+  issues: write     # file an issue with the log tail if the build fails
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Download YuNet face model (binary, not stored in git)
+        shell: bash
+        run: |
+          curl -L -o models/face_yunet.onnx https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+          ls -la models/
+
+      - name: Build with PyInstaller
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          sed -i 's/upx=True/upx=False/' ClipMakerPC.spec
+          pyinstaller ClipMakerPC.spec 2>&1 | tee build.log
+
+      - name: Bundle ffmpeg + ffprobe (standalone, no install needed)
+        if: success()
+        shell: bash
+        run: |
+          curl -L -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          7z x ffmpeg.zip -offmpeg_dl > /dev/null
+          EXE_DIR=$(echo ffmpeg_dl/ffmpeg-*-essentials_build/bin)
+          cp "$EXE_DIR/ffmpeg.exe" "$EXE_DIR/ffprobe.exe" dist/ClipMakerPC/
+          ls -la dist/ClipMakerPC/ffmpeg.exe dist/ClipMakerPC/ffprobe.exe dist/ClipMakerPC/ClipMakerPC.exe
+
+      - name: Zip the bundle
+        if: success()
+        shell: pwsh
+        run: Compress-Archive -Path dist/ClipMakerPC -DestinationPath ClipMakerPC-win64.zip
+
+      - name: Upload build artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipMakerPC-win64
+          path: ClipMakerPC-win64.zip
+
+      - name: Publish GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.0.0
+          name: ClipMaker PC v2.0.0
+          body: |
+            Standalone Windows build - unzip and double-click `ClipMakerPC\ClipMakerPC.exe`.
+            ffmpeg/ffprobe are bundled, no install needed. Paste your free Gemini API
+            key (aistudio.google.com) in Settings. Requires WebView2 (preinstalled on Windows 10/11).
+            First transcription downloads the Whisper model (~150MB, one time).
+          files: ClipMakerPC-win64.zip
+
+      - name: File failure issue with log tail
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY="$(tail -c 6000 build.log 2>/dev/null || echo 'no build log captured')"
+          gh issue create --title "Windows build failed (${GITHUB_SHA:0:7})" --body "Build log tail:
+          \`\`\`
+          $BODY
+          \`\`\`
+          [View the run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
