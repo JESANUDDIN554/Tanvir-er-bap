@@ -14,9 +14,55 @@ function fmtTime(s) {
 function show(el) { el.classList.remove("hidden"); }
 function hide(el) { el.classList.add("hidden"); }
 
+/* entrance animation, only when the element was hidden */
+function reveal(el) {
+  const wasHidden = el.classList.contains("hidden");
+  el.classList.remove("hidden");
+  if (wasHidden && el.classList.contains("step-card")) {
+    el.classList.remove("pop");
+    void el.offsetWidth;
+    el.classList.add("pop");
+  }
+}
+
+/* step indicator: 1 import, 2 moments, 3 clips */
+function setStep(n) {
+  document.querySelectorAll(".step-dot").forEach((d) => {
+    const s = parseInt(d.dataset.step, 10);
+    d.classList.toggle("active", s === n);
+    d.classList.toggle("done", s < n);
+  });
+}
+
+/* toast notifications */
+function toast(msg, isErr) {
+  const box = $("toasts");
+  if (!box) return;
+  const t = document.createElement("div");
+  t.className = "toast" + (isErr ? " err" : "");
+  t.textContent = msg;
+  box.appendChild(t);
+  requestAnimationFrame(() => t.classList.add("in"));
+  setTimeout(() => { t.classList.remove("in"); setTimeout(() => t.remove(), 350); }, 2600);
+}
+
+/* animated virality count-up */
+function countUp(el, target) {
+  const t0 = performance.now(), dur = 750;
+  function frame(t) {
+    const p = Math.min(1, (t - t0) / dur);
+    el.textContent = Math.round(target * (1 - Math.pow(1 - p, 3)));
+    if (p < 1) requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
 async function poll() {
   if (!jobId) return;
-  const st = await window.pywebview.api.job_status(jobId);
+  let st;
+  try {
+    st = await window.pywebview.api.job_status(jobId);
+  } catch (e) { return; }
   if (st.status === "missing") return;
 
   // import progress
@@ -29,8 +75,9 @@ async function poll() {
     $("videoTitle").textContent = st.title || "Video";
     $("videoMeta").textContent =
       `${fmtTime(st.duration)} · ${st.word_count} words transcribed`;
-    show($("videoInfo"));
-    show($("step2"));
+    reveal($("videoInfo"));
+    reveal($("step2"));
+    setStep(2);
     $("importBtn").disabled = false;
   }
   if (st.status === "error") {
@@ -38,27 +85,32 @@ async function poll() {
     $("importError").textContent = st.error;
     show($("importError"));
     $("importBtn").disabled = false;
+    toast("Import failed", true);
   }
   // detect progress
   if (st.status === "working" && st.stage.startsWith("AI analyzing")) {
     show($("detectProgress"));
+    hide($("detectError"));
     $("detectBar").style.width = st.progress + "%";
     $("detectStage").textContent = st.stage;
   }
   if (st.detect_error) {
     hide($("detectProgress"));
+    hide($("detectSkeleton"));
     $("detectError").textContent = st.detect_error;
     show($("detectError"));
   }
   if (st.status === "moments") {
     hide($("detectProgress"));
+    hide($("detectSkeleton"));
     const sig = JSON.stringify(st.moments.map((m) =>
       [m.title, m.start, m.end, m.virality, !!m.caption_edited]));
     if (sig !== lastMomentsSig) { lastMomentsSig = sig; renderMoments(st.moments); }
   }
   // render progress
   if (st.status === "working" && st.stage.startsWith("Rendering")) {
-    show($("step3"));
+    reveal($("step3"));
+    setStep(3);
     show($("renderProgress"));
     $("renderBar").style.width = st.progress + "%";
     $("renderStage").textContent = st.stage;
@@ -67,17 +119,23 @@ async function poll() {
     hide($("renderProgress"));
     $("renderError").textContent = st.render_error;
     show($("renderError"));
+    toast("Render failed", true);
   }
   if (st.status === "done") {
     hide($("renderProgress"));
     const sig = JSON.stringify((st.renders || []).map((r) => r.path));
-    if (sig !== lastRendersSig) { lastRendersSig = sig; renderRenders(st.renders); }
-    show($("step3"));
+    if (sig !== lastRendersSig) {
+      lastRendersSig = sig;
+      renderRenders(st.renders);
+      if (st.renders && st.renders.length) toast(`Done — ${st.renders.length} clip${st.renders.length > 1 ? "s" : ""} rendered`);
+    }
+    reveal($("step3"));
+    setStep(3);
   }
   if (st.status === "moments" && st.renders && st.renders.length) {
     const sig = JSON.stringify(st.renders.map((r) => r.path));
     if (sig !== lastRendersSig) { lastRendersSig = sig; renderRenders(st.renders); }
-    show($("step3"));
+    reveal($("step3"));
   }
 }
 
@@ -97,34 +155,44 @@ function badgeClass(v) {
 function bar(label, v) {
   const cls = v >= 80 ? "" : v >= 60 ? "mid" : "low";
   return `<div class="vrow"><span>${label}</span>
-    <div class="vbar"><div class="vfill ${cls}" style="width:${v}%"></div></div>
+    <div class="vbar"><div class="vfill ${cls}" data-w="${v}" style="width:0%"></div></div>
     <b>${v}</b></div>`;
 }
 
 function renderMoments(moments) {
   const box = $("moments");
   box.innerHTML = "";
+  hide($("momentsEmpty"));
   selectedMoments = moments.map((_, i) => i);
   moments.forEach((m, i) => {
     const div = document.createElement("div");
     div.className = "moment";
-    const edited = m.caption_edited ? ' <span class="edited-tag">✏️ edited</span>' : "";
+    div.style.animationDelay = Math.min(i * 70, 420) + "ms";
+    const edited = m.caption_edited ? ' <span class="edited-tag">edited</span>' : "";
     div.innerHTML = `
-      <input type="checkbox" data-i="${i}" checked>
+      <input type="checkbox" data-i="${i}" checked aria-label="Select clip">
       <div class="moment-body">
         <div class="moment-title">${escapeHtml(m.title)}${edited}</div>
-        <div class="moment-meta">⏱ ${fmtTime(m.start)} → ${fmtTime(m.end)} · ${Math.round(m.end - m.start)}s</div>
-        <div class="moment-hook">🪝 ${escapeHtml(m.hook)}</div>
+        <div class="moment-meta">${fmtTime(m.start)} → ${fmtTime(m.end)} · ${Math.round(m.end - m.start)}s</div>
+        <div class="moment-hook">${escapeHtml(m.hook)}</div>
         <div class="vbreak">
           ${bar("Hook", m.hook_score ?? m.virality)}
           ${bar("Flow", m.flow_score ?? m.virality)}
           ${bar("Value", m.value_score ?? m.virality)}
         </div>
         <div class="moment-reason">${escapeHtml(m.reason)}</div>
-        <button class="ghost-btn small editCapBtn" data-i="${i}">✏️ Edit captions</button>
+        <button class="ghost-btn small editCapBtn" data-i="${i}">Edit captions</button>
       </div>
-      <div class="badge ${badgeClass(m.virality)}">🔥 ${m.virality}</div>`;
+      <div class="vbadge ${badgeClass(m.virality)}">
+        <span class="vscore" data-v="${m.virality}">0</span>
+        <span class="vlabel">virality</span>
+      </div>`;
     box.appendChild(div);
+  });
+  // animate bars + score count-ups
+  requestAnimationFrame(() => {
+    box.querySelectorAll(".vfill").forEach((f) => { f.style.width = f.dataset.w + "%"; });
+    box.querySelectorAll(".vscore").forEach((s) => countUp(s, parseInt(s.dataset.v, 10)));
   });
   box.querySelectorAll("input[type=checkbox]").forEach((cb) => {
     cb.addEventListener("change", () => {
@@ -145,14 +213,18 @@ function renderRenders(renders) {
   const box = $("renders");
   box.innerHTML = "";
   mergeSelected = [];
-  renders.forEach((r, i) => {
+  if (renders && renders.length) hide($("rendersEmpty"));
+  (renders || []).forEach((r, i) => {
     const div = document.createElement("div");
     div.className = "render-item";
+    div.style.animationDelay = Math.min(i * 60, 360) + "ms";
     div.innerHTML = `
       <input type="checkbox" class="merge-check" data-i="${i}" title="Tick to merge">
-      <div class="render-body"><strong>${escapeHtml(r.title)}</strong>
-        <span class="badge ${badgeClass(r.virality)}">🔥 ${r.virality}</span>
-        <div class="path">${escapeHtml(r.path)}</div></div>
+      <div class="render-body">
+        <div class="render-title">${escapeHtml(r.title)}
+          <span class="mini-badge ${badgeClass(r.virality)}">${r.virality}</span></div>
+        <div class="path">${escapeHtml(r.path)}</div>
+      </div>
       <button class="ghost-btn small srtBtn" data-i="${i}">SRT</button>`;
     box.appendChild(div);
   });
@@ -172,6 +244,7 @@ function renderRenders(renders) {
         jobId, parseInt(btn.dataset.i, 10));
       if (res.ok) {
         btn.textContent = "✓ SRT";
+        toast("SRT captions saved");
         setTimeout(() => { btn.textContent = "SRT"; }, 2000);
       } else {
         alert(res.error || "SRT export failed.");
@@ -200,6 +273,7 @@ $("saveCaptionBtn").addEventListener("click", async () => {
     jobId, editingIndex, $("captionText").value);
   if (res.ok) {
     $("captionMsg").textContent = `✓ Saved (${res.word_count} words). Re-render the clip to bake in corrections.`;
+    toast("Captions saved");
     poll(); // refresh moment list to show the edited tag
   } else {
     $("captionMsg").textContent = "⚠ " + (res.error || "Save failed.");
@@ -208,7 +282,7 @@ $("saveCaptionBtn").addEventListener("click", async () => {
 $("resetCaptionBtn").addEventListener("click", async () => {
   if (editingIndex === null) return;
   const res = await window.pywebview.api.reset_caption_words(jobId, editingIndex);
-  if (res.ok) { hide($("captionModal")); poll(); }
+  if (res.ok) { hide($("captionModal")); toast("Captions reset"); poll(); }
 });
 $("closeCaptionBtn").addEventListener("click", () => hide($("captionModal")));
 
@@ -221,6 +295,7 @@ $("mergeBtn").addEventListener("click", async () => {
   if (res.ok) {
     mergeSelected = [];
     hide($("mergeBtn"));
+    toast("Clips merged");
     poll();
   } else {
     alert(res.error || "Merge failed.");
@@ -240,11 +315,13 @@ $("importBtn").addEventListener("click", async () => {
   hide($("importError")); hide($("videoInfo"));
   hide($("step2")); hide($("step3"));
   $("moments").innerHTML = ""; $("renders").innerHTML = "";
+  show($("momentsEmpty")); show($("rendersEmpty"));
   lastMomentsSig = ""; lastRendersSig = ""; mergeSelected = [];
   hide($("renderRow"));
   show($("importProgress"));
   $("importBar").style.width = "0%";
   $("importBtn").disabled = true;
+  setStep(1);
   const res = await window.pywebview.api.import_url(url);
   jobId = res.job_id;
   startPoll();
@@ -260,6 +337,7 @@ $("detectBtn").addEventListener("click", async () => {
     return;
   }
   show($("detectProgress"));
+  show($("detectSkeleton"));
   startPoll();
 });
 
@@ -289,16 +367,53 @@ $("newVideoBtn").addEventListener("click", () => {
   $("urlInput").value = "";
   ["step2", "step3"].forEach((s) => hide($(s)));
   hide($("videoInfo")); hide($("importProgress")); hide($("importError"));
+  show($("momentsEmpty")); show($("rendersEmpty"));
   $("importBtn").disabled = false;
+  setStep(1);
 });
 
 // -- settings ---------------------------------------------------------------
+function syncStyleCards() {
+  const v = $("captionStyleSelect").value;
+  document.querySelectorAll("#styleCards .style-card").forEach((c) => {
+    c.classList.toggle("on", c.dataset.value === v);
+  });
+}
+function syncLenPills() {
+  const v = $("clipLenSelect").value;
+  document.querySelectorAll("#clipLenPills .seg").forEach((p) => {
+    p.classList.toggle("on", p.dataset.value === v);
+  });
+}
+document.querySelectorAll("#styleCards .style-card").forEach((c) => {
+  c.addEventListener("click", () => {
+    $("captionStyleSelect").value = c.dataset.value;
+    syncStyleCards();
+  });
+});
+document.querySelectorAll("#clipLenPills .seg").forEach((p) => {
+  p.addEventListener("click", () => {
+    $("clipLenSelect").value = p.dataset.value;
+    syncLenPills();
+  });
+});
+$("keyToggle").addEventListener("click", () => {
+  const inp = $("apiKeyInput");
+  const showing = inp.type === "text";
+  inp.type = showing ? "password" : "text";
+  $("keyToggle").textContent = showing ? "Show" : "Hide";
+});
+
 function openSettings() { show($("settingsModal")); }
 $("settingsBtn").addEventListener("click", async () => {
   const s = await window.pywebview.api.get_settings();
   $("apiKeyInput").value = s.api_key || "";
+  $("apiKeyInput").type = "password";
+  $("keyToggle").textContent = "Show";
   $("clipLenSelect").value = s.clip_length || "30-60s";
   $("captionStyleSelect").value = s.caption_style || "bold-pop";
+  syncLenPills();
+  syncStyleCards();
   $("faceTrackCheck").checked = s.face_track !== false;
   $("fillerCheck").checked = !!s.remove_fillers;
   openSettings();
@@ -313,9 +428,22 @@ $("saveSettingsBtn").addEventListener("click", async () => {
     remove_fillers: $("fillerCheck").checked,
   });
   hide($("settingsModal"));
+  toast("Settings saved");
 });
 $("keyHelp").addEventListener("click", (e) => {
   e.preventDefault();
   window.pywebview.api.open_folder(null); // noop keeps pywebview happy
   alert("Get a free key at:\nhttps://aistudio.google.com/app/apikey\n\nPaste it here and press Save.");
+});
+
+// -- splash -----------------------------------------------------------------
+window.addEventListener("DOMContentLoaded", () => {
+  setStep(1);
+  setTimeout(() => {
+    const sp = document.getElementById("splash");
+    if (sp) {
+      sp.classList.add("gone");
+      setTimeout(() => sp.remove(), 600);
+    }
+  }, 900);
 });
