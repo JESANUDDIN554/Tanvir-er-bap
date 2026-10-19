@@ -346,4 +346,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Build trigger: re-run Windows exe workflow (no functional change)
+# UI v2.1 premium overhaul - single clean rebuild trigger
