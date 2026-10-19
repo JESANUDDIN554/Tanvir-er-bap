@@ -561,6 +561,179 @@ def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8):
 
 
 # ---------------------------------------------------------------------------
+# Heuristic speaker split (offline diarization-lite) + AI posting packages
+# ---------------------------------------------------------------------------
+
+def diarize_heuristic(words):
+    """Split words into 2 speakers using local pause cues only.
+
+    A gap > 1.0s between words starts a new turn, and turns alternate
+    between Speaker 1 and Speaker 2. This is a heuristic for chaotic
+    multi-speaker audio (e.g. bodycam) - labels are honest
+    ("Speaker 1"/"Speaker 2"): no attempt is made to identify WHO is
+    speaking (officer vs suspect), which needs real diarization.
+    Returns a NEW word list with a "speaker" field (0/1) on each word.
+    """
+    out = []
+    speaker = 0
+    prev_end = None
+    for w in words:
+        nw = dict(w)
+        if prev_end is not None and w["start"] - prev_end > 1.0:
+            speaker = 1 - speaker  # new turn -> other speaker
+        nw["speaker"] = speaker
+        out.append(nw)
+        prev_end = w["end"]
+    return out
+
+
+SPEAKER_LABELS = ("Speaker 1", "Speaker 2")
+
+# Hashtag seeds per genre for posting packages (extractive fallback).
+GENRE_HASHTAGS = {
+    "podcast": ["#podcast", "#podcastclips", "#interview", "#podcasting"],
+    "comedy": ["#comedy", "#funny", "#memes", "#laugh"],
+    "gaming": ["#gaming", "#gamer", "#gameclips", "#twitch"],
+    "news": ["#bodycam", "#police", "#cops", "#caughtoncamera"],
+    "business": ["#business", "#entrepreneur", "#money", "#success"],
+    "fitness": ["#fitness", "#gym", "#workout", "#gymlife"],
+    "": ["#reels", "#viral", "#shorts", "#fyp"],
+}
+
+POSTING_PROMPT_TEMPLATE = """You are writing a Facebook Reels posting package for a short clip.
+Below is the clip's transcript - verbatim words actually said in the clip.
+
+RULES - follow strictly:
+- Only use words, claims and people from the transcript. Never invent events, quotes, or people.
+- Titles under 60 characters, punchy, no clickbait lies.
+- Description: 2-3 sentences, Facebook-ready, ends with a question to drive comments.
+- Up to 8 hashtags, lowercase, no spaces.
+- Return ONLY valid JSON, no other text.
+
+Transcript:
+{transcript}
+
+JSON format:
+{{"titles": ["Title option 1", "Title option 2", "Title option 3"],
+"description": "Two to three sentences with a line break, ending in a question",
+"hashtags": ["#tag1", "#tag2"]}}"""
+
+
+def _extractive_posting_package(words, moment, genre=""):
+    """Posting package without any AI: hook line as title base, template
+    description, genre + extracted-keyword hashtags. All text is verbatim
+    from the transcript or fixed templates - nothing invented."""
+    text = " ".join(w["word"] for w in words)
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text)
+             if len(s.strip().split()) >= 3]
+
+    def _sent_score(s):
+        toks = [_clean_word(t) for t in s.split()]
+        energy = sum(1 for t in toks if t in OFFLINE_ENERGY_WORDS)
+        bang = 2 if s.endswith("!") else 1 if s.endswith("?") else 0
+        return energy * 3 + bang * 2 + min(len(toks), 20) * 0.1
+
+    ranked = sorted(sents, key=_sent_score, reverse=True)
+
+    def _trim(s, n=58):
+        s = s.strip()
+        return s if len(s) <= n else s[:n].rsplit(" ", 1)[0] + "…"
+
+    # candidate titles: best verbatim sentences, then the moment title,
+    # then the window opener - deduped AFTER trimming (what the user sees)
+    cands = [_trim(s) for s in ranked[:3]]
+    mt = (moment.get("title") or "").strip()
+    if mt:
+        cands.append(_trim(mt))
+    opener = _trim(" ".join(text.split()[:10]))
+    if opener:
+        cands.append(opener)
+    titles = []
+    for c in cands:
+        if c and c not in titles:
+            titles.append(c)
+        if len(titles) == 3:
+            break
+    while len(titles) < 3:
+        base = titles[0] if titles else "Must-watch moment"
+        titles.append(base if base.endswith("🔥") else base + " 🔥")
+    titles = titles[:3]
+
+    hook_line = ranked[0] if ranked else text[:80]
+    genre_word = {"news": "bodycam", "comedy": "comedy",
+                  "gaming": "gaming", "podcast": "podcast",
+                  "business": "business", "fitness": "fitness"}.get(
+                      genre, "viral")
+    description = (
+        f'"{_trim(hook_line, 120)}"\n\n'
+        f"This {genre_word} moment had us speechless. "
+        f"What would YOU have done in this situation? 👇")
+
+    tags = list(GENRE_HASHTAGS.get(genre, GENRE_HASHTAGS[""]))
+    seen_words = set()
+    for w in words:
+        cw = _clean_word(w["word"])
+        if (cw in OFFLINE_ENERGY_WORDS and cw not in seen_words
+                and len(cw) > 2):
+            seen_words.add(cw)
+            tags.append("#" + cw)
+        if len(tags) >= 8:
+            break
+    # de-dupe, keep order, cap at 8
+    hashtags = list(dict.fromkeys(tags))[:8]
+
+    return {
+        "titles": titles,
+        "description": description,
+        "hashtags": hashtags,
+        "mode": "extractive",
+        "note": ("Auto-generated on this PC (no AI key): titles are "
+                 "verbatim lines from the clip."),
+    }
+
+
+def generate_posting_package(words, moment, genre="", api_key=None):
+    """Per-clip posting package: 3 titles, FB description, hashtags.
+
+    With a Gemini key -> real AI copy ("ai" mode). Without -> extractive
+    fallback on this PC ("extractive" mode). If the AI call fails, falls
+    back to extractive and says so honestly. "mode" always reports which
+    produced the copy.
+    """
+    moment = moment or {}
+    if api_key:
+        try:
+            text = " ".join(w["word"] for w in words)[:6000]
+            data = _gemini_call(
+                POSTING_PROMPT_TEMPLATE.format(transcript=text), api_key)
+            titles = [str(t)[:70] for t in data.get("titles", [])[:3]]
+            desc = str(data.get("description", ""))[:600]
+            tags = []
+            for h in data.get("hashtags", [])[:8]:
+                h = str(h).strip()
+                if not h.startswith("#"):
+                    h = "#" + h
+                h = re.sub(r"[^#a-zA-Z0-9_]", "", h)
+                if len(h) > 1:
+                    tags.append(h.lower())
+            if titles and desc:
+                return {
+                    "titles": (titles + ["Clip"] * 3)[:3],
+                    "description": desc,
+                    "hashtags": tags or GENRE_HASHTAGS.get(
+                        genre, GENRE_HASHTAGS[""])[:8],
+                    "mode": "ai",
+                    "note": "Written by AI (Gemini) from the clip transcript.",
+                }
+        except Exception as e:  # noqa: BLE001 - honest fallback
+            fb = _extractive_posting_package(words, moment, genre)
+            fb["note"] = ("AI request failed (%s) - fell back to the "
+                          "on-PC extractive version." % str(e)[:80])
+            return fb
+    return _extractive_posting_package(words, moment, genre)
+
+
+# ---------------------------------------------------------------------------
 # ASS caption builder (karaoke word highlight + hook overlay)
 # ---------------------------------------------------------------------------
 
@@ -659,22 +832,49 @@ def _group_lines(words):
 
 
 def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
-              res=(1080, 1920), emojis=False, highlight=False):
+              res=(1080, 1920), emojis=False, highlight=False,
+              speaker_colors=None, hook_overlay=True, cta_text=None,
+              safe_zone=False):
     """Write an ASS subtitle file for one clip window.
 
     res: (width, height) of the rendered clip - fonts and positions scale.
     emojis: append a relevant emoji after high-energy words.
     highlight: paint keyword/capitalized words in lime green.
+    speaker_colors: (color1, color2) ASS colors - when set, each word is
+        painted by its "speaker" field (Speaker 1/2), overriding the
+        highlight color. Words without a speaker field count as Speaker 1.
+    hook_overlay: show the hook text as an animated overlay in the first
+        ~2.5s (top safe zone). False suppresses it entirely.
+    cta_text: when set, shown as a faded overlay in the last 2 seconds
+        (top safe zone).
+    safe_zone: nudge captions/hook inside Reels UI safe areas (captions
+        above the bottom caption zone, hook below the top bar).
     """
     st = _get_style(style_name)
     W, H = int(res[0]), int(res[1])
     sx, sy = W / 1080.0, H / 1920.0
     cap_font = max(24, int(60 * sx))
     hook_font = max(22, int(54 * sx))
-    cap_margin_v = int(240 * sy)
-    hook_margin_v = int(150 * sy)
+    # safe-zone: captions clear the Reels bottom UI (~20% of height),
+    # hook clears the top bar
+    cap_margin_v = int((360 if safe_zone else 240) * sy)
+    hook_margin_v = int((230 if safe_zone else 150) * sy)
     win = [w for w in words if w["end"] > start_s and w["start"] < end_s]
     win.sort(key=lambda w: w["start"])
+
+    # sanitize speaker colors: must be 2 ASS &HAABBGGRR colors
+    spk_cols = None
+    if speaker_colors:
+        try:
+            c1, c2 = list(speaker_colors)[:2]
+
+            def _ok(c):
+                return isinstance(c, str) and re.fullmatch(
+                    r"&H[0-9A-Fa-f]{8}", c) is not None
+            if _ok(c1) and _ok(c2):
+                spk_cols = (c1.upper(), c2.upper())
+        except (TypeError, ValueError):
+            spk_cols = None
 
     def ts(s):
         s = max(0, s)
@@ -685,13 +885,21 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
     body = []
     box_events = []
     use_box = bool(st.get("box"))
-    # hook overlay at the top, first 4 seconds
-    if hook_text:
-        hook_end = min(start_s + 4, end_s)
+    # hook overlay at the top, first ~2.5s (animated fade)
+    if hook_text and hook_overlay:
+        hook_end = min(start_s + 2.5, end_s)
         layer = 1 if use_box else 0
         body.append(
             f"Dialogue: {layer},{ts(start_s)},{ts(hook_end)},Hook,,0,0,0,,"
-            f"{_esc(hook_text.upper())}")
+            f"{{\\fad(250,250)}}{_esc(hook_text.upper())}")
+    # CTA overlay: last 2 seconds, top safe zone, faded
+    if cta_text:
+        cta_start = max(start_s, end_s - 2.0)
+        if cta_start < end_s - 0.2:
+            layer = 1 if use_box else 0
+            body.append(
+                f"Dialogue: {layer},{ts(cta_start)},{ts(end_s)},"
+                f"CTA,,0,0,0,,{{\\fad(300,300)}}{_esc(cta_text)}")
 
     prim_col = st["primary"]  # ASS &HAABBGGRR, e.g. &H0000FFFF
     for line in _group_lines(win):
@@ -703,8 +911,13 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
                 em = EMOJI_MAP.get(_clean_word(w["word"]))
                 if em:
                     txt += em
-            col = "&H002EFFC8" if (
-                highlight and _is_highlight_word(w["word"])) else prim_col
+            if spk_cols is not None:
+                # speaker colors win over highlight - that IS the feature
+                col = spk_cols[w.get("speaker", 0) % 2]
+            elif highlight and _is_highlight_word(w["word"]):
+                col = "&H002EFFC8"
+            else:
+                col = prim_col
             parts.append(f"{{\\k{cs}\\1c{col}&}}{txt}")
         layer = 1 if use_box else 0
         body.append(
@@ -748,6 +961,7 @@ ScaledBorderAndShadow: yes
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Caption,Arial,{cap_font},{st['primary']},{st['secondary']},{st['outline']},&H99000000,{st['bold']},0,0,0,100,100,0,0,{border_style},{outline_w},{shadow_w},2,40,40,{cap_margin_v},1
 Style: Hook,Arial,{hook_font},&H0000FFFF,&H00FFFFFF,&H00000000,&HCC000000,1,0,0,0,100,100,0,0,3,2,0,8,40,40,{hook_margin_v},1
+Style: CTA,Arial,{hook_font},&H00FFFFFF,&H00FFFFFF,&H00000000,&HCC000000,1,0,0,0,100,100,0,0,3,2,0,8,40,40,{hook_margin_v},1
 Style: Box,Arial,10,&HCC000000,&HCC000000,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
 
 [Events]
@@ -837,8 +1051,10 @@ def remap_words_to_kept(words, removed):
         if any(s <= mid <= e for s, e in removed):
             continue
         shift = sum(e - s for s, e in removed if e <= mid)
-        out.append({"start": w["start"] - shift,
-                    "end": w["end"] - shift, "word": w["word"]})
+        nw = dict(w)  # keep extra keys (e.g. "speaker") through the remap
+        nw["start"] = w["start"] - shift
+        nw["end"] = w["end"] - shift
+        out.append(nw)
     return out
 
 
@@ -1392,10 +1608,16 @@ def _kept_audio_filter(start, end, removed):
 # ---------------------------------------------------------------------------
 
 def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
-                    W, H, ratio, out_path, progress_cb=None):
+                    W, H, ratio, out_path, progress_cb=None,
+                    punch_zoom=False):
     """Face-tracked render: per-frame crop follows the smoothed face
     trajectory (or stays centered), frames piped to ffmpeg."""
-    import cv2  # noqa: F401
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "Face tracking needs opencv-python - "
+            "reinstall with Install.bat")
     from facetrack import (FaceTracker, sample_face_centers,
                            smooth_trajectory, interpolate_x)
 
@@ -1444,12 +1666,20 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
         raise RuntimeError("audio cut failed: " + r_.stderr[-1200:])
 
     # encode: pipe cropped frames -> ffmpeg + subtitles + audio
+    vf_parts = []
+    if punch_zoom:
+        vf_parts.append(
+            "zoompan=z='min(1+0.0008*min(on\\,90)"
+            "+0.00004*max(0\\,on-90)\\,1.16)'"
+            ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f":d=1:s={W}x{H}:fps={fps:.3f}")
+    vf_parts.append(f"subtitles={_ffmpeg_ass_path(ass_path)}")
     enc = ["ffmpeg", "-y", "-v", "error",
            "-f", "rawvideo", "-pix_fmt", "bgr24",
            "-s", f"{W}x{H}", "-framerate", f"{fps:.3f}",
            "-i", "pipe:0",
            "-i", audio_tmp,
-           "-vf", f"subtitles={_ffmpeg_ass_path(ass_path)}",
+           "-vf", ",".join(vf_parts),
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
            "-movflags", "+faststart", "-shortest", out_path]
@@ -1507,12 +1737,32 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
 
 
 def _render_plain(video_path, start, end, keep_segs, ass_path,
-                  W, H, ratio, out_path, progress_cb=None):
+                  W, H, ratio, out_path, progress_cb=None,
+                  punch_zoom=False, enhance_clarity=False):
     """ffmpeg-only render: crop/scale/captions, optional silence/filler
-    cuts via filter_complex segment concat."""
+    cuts via filter_complex segment concat.
+
+    punch_zoom: subtle zoom-punch on the hook (~1.0x -> ~1.07x over the
+        first 3s) then a slow drift, capped at 1.16x (zoompan, 1:1 frames).
+    enhance_clarity: light denoise + unsharp ("enhance" - NOT an AI
+        upscale; honest naming is deliberate).
+    """
     crop = crop_filter(ratio)
-    vf_tail = (f"{crop},scale={W}:{H},"
-               f"subtitles={_ffmpeg_ass_path(ass_path)}")
+    vf = [crop, f"scale={W}:{H}"]
+    if punch_zoom:
+        # zoompan d=1 keeps a 1:1 frame mapping; fps is pinned to the
+        # source fps so A/V stays in sync.
+        _pw, _ph, _fps = probe_video(video_path)
+        _fps = _fps or 30.0
+        vf.append(
+            "zoompan=z='min(1+0.0008*min(on\\,90)"
+            "+0.00004*max(0\\,on-90)\\,1.16)'"
+            ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f":d=1:s={W}x{H}:fps={_fps:.3f}")
+    if enhance_clarity:
+        vf.append("hqdn3d=4:3:6:4.5,unsharp=5:5:0.7:5:5:0.0")
+    vf.append(f"subtitles={_ffmpeg_ass_path(ass_path)}")
+    vf_tail = ",".join(vf)
     single = (len(keep_segs) == 1
               and abs(keep_segs[0][0] - start) < 0.01
               and abs(keep_segs[0][1] - end) < 0.01)
@@ -1556,11 +1806,44 @@ def _render_plain(video_path, start, end, keep_segs, ass_path,
     return out_path
 
 
+def _overlay_logo(clip_path, logo_path):
+    """Corner logo watermark (top-left, ~14% of clip width).
+
+    Timing-neutral post-pass: video re-encoded once, audio copied.
+    Best-effort: raises RuntimeError on failure so the caller can decide
+    whether to keep the unbranded clip."""
+    if not logo_path or not os.path.isfile(logo_path):
+        raise RuntimeError("logo file not found: " + str(logo_path)[:120])
+    cw, _ch, _fps = probe_video(clip_path)
+    lw = max(48, int((cw or 540) * 0.14))
+    tmp = clip_path + ".logo.mp4"
+    fc = (f"[1:v]scale={lw}:-2:flags=lanczos[logo];"
+          f"[0:v][logo]overlay=28:28:format=auto[vout]")
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", clip_path, "-i", logo_path,
+           "-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+           "-pix_fmt", "yuv420p", "-c:a", "copy",
+           "-movflags", "+faststart", "-shortest", tmp]
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0 or not os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise RuntimeError("logo overlay failed: " + r.stderr[-600:])
+    os.replace(tmp, clip_path)
+    return clip_path
+
+
 def render_clip(video_path, moment, words, style_name, out_path,
                 progress_cb=None, face_track=False, remove_fillers=False,
                 remove_silences=False, auto_censor=False, emojis=False,
                 highlight=False, ratio="9:16", quality="1080p",
-                custom_styles=None, edited_words=None):
+                custom_styles=None, edited_words=None,
+                speaker_colors=None, hook_overlay=True, cta_text=None,
+                safe_zone=False, punch_zoom=False, enhance_clarity=False,
+                logo_path=None):
     """Cut + reframe + burned captions + hook. Returns out_path.
 
     face_track=True -> per-frame face-following crop (OpenCV pipe).
@@ -1569,6 +1852,16 @@ def render_clip(video_path, moment, words, style_name, out_path,
     auto_censor -> beep over profanity (timing-neutral second pass).
     emojis / highlight -> caption magic. ratio/quality pick output size.
     edited_words -> caption word list from the caption editor.
+    speaker_colors -> (color1, color2) ASS colors: each caption word is
+        painted by its heuristic speaker (Speaker 1/2 labels, honest -
+        no identity claims). Overrides the highlight color.
+    hook_overlay -> show the hook text overlay in the first ~2.5s.
+    cta_text -> when set, shown as a faded overlay in the last 2s.
+    safe_zone -> nudge captions/hook inside Reels UI safe areas.
+    punch_zoom -> subtle zoom-punch on the hook + slow drift.
+    enhance_clarity -> light denoise + sharpen (honest "enhance",
+        never "AI upscale").
+    logo_path -> corner logo PNG watermarked top-left (brand kit).
     """
     start, end = float(moment["start"]), float(moment["end"])
     W, H = ratio_dims(ratio, quality)
@@ -1578,6 +1871,10 @@ def render_clip(video_path, moment, words, style_name, out_path,
     cap_src = edited_words if edited_words is not None else words
     win_words = [w for w in cap_src if w["end"] > start and w["start"] < end]
     win_words.sort(key=lambda w: w["start"])
+    if speaker_colors:
+        # heuristic 2-speaker split before any cutting so colors follow
+        # words through the filler/silence remap
+        win_words = diarize_heuristic(win_words)
 
     # removed ranges (source-relative), merged
     removed = []
@@ -1608,19 +1905,33 @@ def render_clip(video_path, moment, words, style_name, out_path,
     ass_fd, ass_path = tempfile.mkstemp(suffix=".ass", prefix="clip_")
     os.close(ass_fd)
     build_ass(cap_words, 0, total_dur, style_name, moment.get("hook", ""),
-              ass_path, res=(W, H), emojis=emojis, highlight=highlight)
+              ass_path, res=(W, H), emojis=emojis, highlight=highlight,
+              speaker_colors=speaker_colors, hook_overlay=hook_overlay,
+              cta_text=cta_text, safe_zone=safe_zone)
     try:
         if face_track:
             _render_tracked(video_path, start, end, keep_segs, removed,
-                            ass_path, W, H, ratio, out_path, progress_cb)
+                            ass_path, W, H, ratio, out_path, progress_cb,
+                            punch_zoom=punch_zoom)
         else:
             _render_plain(video_path, start, end, keep_segs, ass_path,
-                          W, H, ratio, out_path, progress_cb)
+                          W, H, ratio, out_path, progress_cb,
+                          punch_zoom=punch_zoom,
+                          enhance_clarity=enhance_clarity)
     finally:
         try:
             os.remove(ass_path)
         except OSError:
             pass
+
+    if logo_path:
+        # brand-kit corner logo: best-effort - a failed overlay must not
+        # lose the finished clip
+        try:
+            _overlay_logo(out_path, logo_path)
+        except Exception as e:  # noqa: BLE001
+            if progress_cb:
+                progress_cb(100, "Logo skipped: " + str(e)[:80])
 
     if auto_censor:
         ranges = find_censor_ranges(cap_words)
