@@ -25,14 +25,22 @@ if not _os.path.exists("icon.ico"):
         _f.write(_b64.b64decode(_ICO_B64))
 _icon = "icon.ico"
 
+# pythonnet / clr_loader: pywebview loads the .NET runtime through
+# clr_loader, whose native ClrLoader.dll is NOT auto-detected by
+# PyInstaller. Without it the exe dies at startup with
+# "Failed to resolve Python.Runtime.Loader.Initialize".
+from PyInstaller.utils.hooks import collect_all as _collect_all
+_clr_datas, _clr_binaries, _clr_hidden = _collect_all("clr_loader")
+_pn_datas, _pn_binaries, _pn_hidden = _collect_all("pythonnet")
+
 a = Analysis(
     ["app.py"],
     pathex=[],
-    binaries=[],
+    binaries=_clr_binaries + _pn_binaries,
     datas=[
         ("ui", "ui"),
         ("models", "models"),  # YuNet face-detection model for face tracking
-    ],
+    ] + _clr_datas + _pn_datas,
     hiddenimports=[
         "faster_whisper",
         "ctranslate2",
@@ -42,7 +50,9 @@ a = Analysis(
         "webview",
         "cv2",
         "numpy",
-    ],
+        "clr",          # pythonnet's top-level module (pywebview -> pythonnet -> clr)
+        "pythonnet",
+    ] + _clr_hidden + _pn_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
