@@ -68,7 +68,7 @@ this automatically).
 
 | File | What it does |
 |---|---|
-| `app.py` | Desktop window (pywebview) + job management |
+| `app.py` | Localhost server + desktop-style window (Chrome/Edge --app) + job management |
 | `pipeline.py` | Download, transcribe, detect moments, render |
 | `facetrack.py` | Face detection + smoothed crop trajectory |
 | `models/` | Bundled YuNet face-detection model (no download needed) |
