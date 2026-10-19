@@ -4,6 +4,7 @@ let pollTimer = null;
 let selectedMoments = [];
 let lastMomentsSig = "";
 let lastRendersSig = "";
+let detectModeReady = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -79,6 +80,7 @@ async function poll() {
     reveal($("step2"));
     setStep(2);
     $("importBtn").disabled = false;
+    if (!detectModeReady) { detectModeReady = true; initDetectMode(); }
   }
   if (st.status === "error") {
     hide($("importProgress"));
@@ -87,8 +89,9 @@ async function poll() {
     $("importBtn").disabled = false;
     toast("Import failed", true);
   }
-  // detect progress
-  if (st.status === "working" && st.stage.startsWith("AI analyzing")) {
+  // detect progress (AI or offline)
+  if (st.status === "working" && (st.stage.startsWith("AI analyzing")
+      || st.stage.startsWith("Scanning transcript"))) {
     show($("detectProgress"));
     hide($("detectError"));
     $("detectBar").style.width = st.progress + "%";
@@ -169,10 +172,11 @@ function renderMoments(moments) {
     div.className = "moment";
     div.style.animationDelay = Math.min(i * 70, 420) + "ms";
     const edited = m.caption_edited ? ' <span class="edited-tag">edited</span>' : "";
+    const srcTag = m.offline ? ' <span class="edited-tag">offline</span>' : "";
     div.innerHTML = `
       <input type="checkbox" data-i="${i}" checked aria-label="Select clip">
       <div class="moment-body">
-        <div class="moment-title">${escapeHtml(m.title)}${edited}</div>
+        <div class="moment-title">${escapeHtml(m.title)}${edited}${srcTag}</div>
         <div class="moment-meta">${fmtTime(m.start)} → ${fmtTime(m.end)} · ${Math.round(m.end - m.start)}s</div>
         <div class="moment-hook">${escapeHtml(m.hook)}</div>
         <div class="vbreak">
@@ -317,6 +321,7 @@ $("importBtn").addEventListener("click", async () => {
   $("moments").innerHTML = ""; $("renders").innerHTML = "";
   show($("momentsEmpty")); show($("rendersEmpty"));
   lastMomentsSig = ""; lastRendersSig = ""; mergeSelected = [];
+  detectModeReady = false;
   hide($("renderRow"));
   show($("importProgress"));
   $("importBar").style.width = "0%";
@@ -327,9 +332,45 @@ $("importBtn").addEventListener("click", async () => {
   startPoll();
 });
 
+// -- detection mode (AI vs offline) ------------------------------------------
+function currentDetectMode() {
+  const on = document.querySelector("#detectModeSeg .seg.on");
+  return on ? on.dataset.value : "ai";
+}
+function syncDetectModeSub(mode) {
+  const sub = $("detectModeSub");
+  if (!sub) return;
+  sub.textContent = mode === "offline"
+    ? "Offline mode scans the transcript on your PC — no key, no internet. Scores are heuristic (energy + speech density), not AI."
+    : "AI mode needs your free Gemini API key (Settings). Every clip is scored 0–100 for virality.";
+}
+async function initDetectMode() {
+  // default to Offline when no API key is saved
+  let mode = "offline";
+  try {
+    const s = await window.pywebview.api.get_settings();
+    if (s.api_key && String(s.api_key).trim()) mode = "ai";
+  } catch (e) { /* default offline */ }
+  document.querySelectorAll("#detectModeSeg .seg").forEach((p) => {
+    p.classList.toggle("on", p.dataset.value === mode);
+  });
+  syncDetectModeSub(mode);
+}
+document.querySelectorAll("#detectModeSeg .seg").forEach((p) => {
+  p.addEventListener("click", () => {
+    document.querySelectorAll("#detectModeSeg .seg").forEach((x) =>
+      x.classList.remove("on"));
+    p.classList.add("on");
+    syncDetectModeSub(p.dataset.value);
+  });
+});
+
 $("detectBtn").addEventListener("click", async () => {
   hide($("detectError"));
-  const res = await window.pywebview.api.detect(jobId, 8);
+  const mode = currentDetectMode();
+  const res = mode === "offline"
+    ? await window.pywebview.api.detect_offline(jobId, 8)
+    : await window.pywebview.api.detect(jobId, 8);
   if (!res.ok) {
     if (res.error === "no_api_key") openSettings();
     $("detectError").textContent = res.message || res.error;
@@ -364,6 +405,7 @@ $("openFolderBtn").addEventListener("click", async () => {
 $("newVideoBtn").addEventListener("click", () => {
   stopPoll(); jobId = null;
   lastMomentsSig = ""; lastRendersSig = ""; mergeSelected = [];
+  detectModeReady = false;
   $("urlInput").value = "";
   ["step2", "step3"].forEach((s) => hide($(s)));
   hide($("videoInfo")); hide($("importProgress")); hide($("importError"));
