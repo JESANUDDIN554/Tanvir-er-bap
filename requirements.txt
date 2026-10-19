@@ -1,8 +1,6 @@
 # ClipMaker PC dependencies
 # Install on Windows with: pip install -r requirements.txt
-pywebview>=5.1
-pythonnet==3.0.3  # pinned: known-good with Python 3.11; pywebview's .NET bridge
-pyinstaller-hooks-contrib  # extra PyInstaller hooks (clr_loader etc.) for the exe build
+waitress>=2.1.2  # pure-python localhost HTTP server (serves the UI; no native/window deps)
 faster-whisper>=1.1.0
 yt-dlp>=2024.8.6
 requests>=2.32.0
