@@ -1,4 +1,5 @@
-/* ClipMaker PC - UI logic. Talks to Python via pywebview js_api. */
+/* ClipMaker PC - UI logic. Talks to the Python backend over HTTP
+   (localhost server); `api.<method>(...args)` POSTs to /api/<method>. */
 let jobId = null;
 let pollTimer = null;
 let selectedMoments = [];
@@ -7,6 +8,18 @@ let lastRendersSig = "";
 let detectModeReady = false;
 
 const $ = (id) => document.getElementById(id);
+
+/* HTTP bridge to the Python backend (replaces the old pywebview js_api). */
+const api = new Proxy({}, {
+  get: (_t, method) => async (...args) => {
+    const r = await fetch("/api/" + method, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ args }),
+    });
+    return r.json();
+  },
+});
 
 function fmtTime(s) {
   const m = Math.floor(s / 60), sec = Math.floor(s % 60);
@@ -62,7 +75,7 @@ async function poll() {
   if (!jobId) return;
   let st;
   try {
-    st = await window.pywebview.api.job_status(jobId);
+    st = await api.job_status(jobId);
   } catch (e) { return; }
   if (st.status === "missing") return;
 
@@ -244,7 +257,7 @@ function renderRenders(renders) {
   });
   box.querySelectorAll(".srtBtn").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const res = await window.pywebview.api.export_srt(
+      const res = await api.export_srt(
         jobId, parseInt(btn.dataset.i, 10));
       if (res.ok) {
         btn.textContent = "✓ SRT";
@@ -264,7 +277,7 @@ let editingIndex = null;
 async function openCaptionEditor(i) {
   editingIndex = i;
   $("captionMsg").textContent = "";
-  const res = await window.pywebview.api.get_caption_words(jobId, i);
+  const res = await api.get_caption_words(jobId, i);
   if (!res.ok) { alert(res.error); return; }
   $("captionModalTitle").textContent = res.title || "";
   $("captionText").value = res.words || "";
@@ -273,7 +286,7 @@ async function openCaptionEditor(i) {
 
 $("saveCaptionBtn").addEventListener("click", async () => {
   if (editingIndex === null) return;
-  const res = await window.pywebview.api.save_caption_words(
+  const res = await api.save_caption_words(
     jobId, editingIndex, $("captionText").value);
   if (res.ok) {
     $("captionMsg").textContent = `✓ Saved (${res.word_count} words). Re-render the clip to bake in corrections.`;
@@ -285,7 +298,7 @@ $("saveCaptionBtn").addEventListener("click", async () => {
 });
 $("resetCaptionBtn").addEventListener("click", async () => {
   if (editingIndex === null) return;
-  const res = await window.pywebview.api.reset_caption_words(jobId, editingIndex);
+  const res = await api.reset_caption_words(jobId, editingIndex);
   if (res.ok) { hide($("captionModal")); toast("Captions reset"); poll(); }
 });
 $("closeCaptionBtn").addEventListener("click", () => hide($("captionModal")));
@@ -294,7 +307,7 @@ $("closeCaptionBtn").addEventListener("click", () => hide($("captionModal")));
 $("mergeBtn").addEventListener("click", async () => {
   if (mergeSelected.length < 2) return;
   $("mergeBtn").disabled = true;
-  const res = await window.pywebview.api.merge_selected(jobId, mergeSelected);
+  const res = await api.merge_selected(jobId, mergeSelected);
   $("mergeBtn").disabled = false;
   if (res.ok) {
     mergeSelected = [];
@@ -327,7 +340,7 @@ $("importBtn").addEventListener("click", async () => {
   $("importBar").style.width = "0%";
   $("importBtn").disabled = true;
   setStep(1);
-  const res = await window.pywebview.api.import_url(url);
+  const res = await api.import_url(url);
   jobId = res.job_id;
   startPoll();
 });
@@ -348,7 +361,7 @@ async function initDetectMode() {
   // default to Offline when no API key is saved
   let mode = "offline";
   try {
-    const s = await window.pywebview.api.get_settings();
+    const s = await api.get_settings();
     if (s.api_key && String(s.api_key).trim()) mode = "ai";
   } catch (e) { /* default offline */ }
   document.querySelectorAll("#detectModeSeg .seg").forEach((p) => {
@@ -369,8 +382,8 @@ $("detectBtn").addEventListener("click", async () => {
   hide($("detectError"));
   const mode = currentDetectMode();
   const res = mode === "offline"
-    ? await window.pywebview.api.detect_offline(jobId, 8)
-    : await window.pywebview.api.detect(jobId, 8);
+    ? await api.detect_offline(jobId, 8)
+    : await api.detect(jobId, 8);
   if (!res.ok) {
     if (res.error === "no_api_key") openSettings();
     $("detectError").textContent = res.message || res.error;
@@ -385,7 +398,7 @@ $("detectBtn").addEventListener("click", async () => {
 $("renderSelBtn").addEventListener("click", async () => {
   if (!selectedMoments.length) return;
   hide($("renderError"));
-  await window.pywebview.api.render(jobId, selectedMoments);
+  await api.render(jobId, selectedMoments);
   show($("step3")); show($("renderProgress"));
   startPoll();
 });
@@ -394,13 +407,13 @@ $("renderAllBtn").addEventListener("click", async () => {
   const all = [...boxes].map((cb) => parseInt(cb.dataset.i, 10));
   if (!all.length) return;
   hide($("renderError"));
-  await window.pywebview.api.render(jobId, all);
+  await api.render(jobId, all);
   show($("step3")); show($("renderProgress"));
   startPoll();
 });
 
 $("openFolderBtn").addEventListener("click", async () => {
-  await window.pywebview.api.open_folder(jobId);
+  await api.open_folder(jobId);
 });
 $("newVideoBtn").addEventListener("click", () => {
   stopPoll(); jobId = null;
@@ -448,7 +461,7 @@ $("keyToggle").addEventListener("click", () => {
 
 function openSettings() { show($("settingsModal")); }
 $("settingsBtn").addEventListener("click", async () => {
-  const s = await window.pywebview.api.get_settings();
+  const s = await api.get_settings();
   $("apiKeyInput").value = s.api_key || "";
   $("apiKeyInput").type = "password";
   $("keyToggle").textContent = "Show";
@@ -462,7 +475,7 @@ $("settingsBtn").addEventListener("click", async () => {
 });
 $("closeSettingsBtn").addEventListener("click", () => hide($("settingsModal")));
 $("saveSettingsBtn").addEventListener("click", async () => {
-  await window.pywebview.api.save_settings({
+  await api.save_settings({
     api_key: $("apiKeyInput").value.trim(),
     clip_length: $("clipLenSelect").value,
     caption_style: $("captionStyleSelect").value,
@@ -474,7 +487,6 @@ $("saveSettingsBtn").addEventListener("click", async () => {
 });
 $("keyHelp").addEventListener("click", (e) => {
   e.preventDefault();
-  window.pywebview.api.open_folder(null); // noop keeps pywebview happy
   alert("Get a free key at:\nhttps://aistudio.google.com/app/apikey\n\nPaste it here and press Save.");
 });
 
