@@ -1,6 +1,8 @@
 """ClipMaker PC - desktop entry point.
 
-Opens a real desktop window (pywebview) serving the local UI.
+Runs a localhost HTTP server for the local UI and opens it in a
+desktop-style Chrome/Edge app window. Zero native dependencies
+(no pywebview / .NET needed).
 All video work runs on this machine; only viral-moment detection
 calls the Google Gemini API with the user's own free key.
 """
@@ -372,18 +374,177 @@ class Api:
         return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Localhost server + desktop-style window (no pywebview / .NET needed)
+# ---------------------------------------------------------------------------
+import socket
+import subprocess
+
+_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml",
+}
+
+
+def _wsgi_response(start_response, status, content_type, body):
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    start_response(status, [("Content-Type", content_type),
+                            ("Content-Length", str(len(body)))])
+    return [body]
+
+
+def make_wsgi_app(api):
+    ui_dir = os.path.abspath(os.path.join(BASE_DIR, "ui"))
+
+    def app(environ, start_response):
+        method = environ.get("REQUEST_METHOD", "GET")
+        path = environ.get("PATH_INFO", "/") or "/"
+
+        # --- API: POST /api/<method> {"args": [...]} ---------------------
+        if method == "POST" and path.startswith("/api/"):
+            name = path[len("/api/"):]
+            fn = getattr(api, name, None)
+            if not callable(fn) or name.startswith("_"):
+                return _wsgi_response(
+                    start_response, "404 Not Found", "application/json",
+                    json.dumps({"ok": False, "error": "unknown method"}))
+            try:
+                length = int(environ.get("CONTENT_LENGTH") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            raw = environ["wsgi.input"].read(length) if length > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except ValueError:
+                return _wsgi_response(
+                    start_response, "400 Bad Request", "application/json",
+                    json.dumps({"ok": False, "error": "bad json"}))
+            args = payload.get("args") or []
+            try:
+                result = fn(*args)
+            except TypeError as e:
+                return _wsgi_response(
+                    start_response, "400 Bad Request", "application/json",
+                    json.dumps({"ok": False,
+                                "error": "bad args: " + str(e)[:160]}))
+            except Exception as e:  # noqa: BLE001 - surfaced to UI
+                return _wsgi_response(
+                    start_response, "500 Server Error", "application/json",
+                    json.dumps({"ok": False, "error": str(e)[:300]}))
+            if not isinstance(result, dict):
+                result = {"result": result}
+            return _wsgi_response(start_response, "200 OK",
+                                  "application/json",
+                                  json.dumps(result, default=str))
+
+        # --- static files from ui/ --------------------------------------
+        rel = path.lstrip("/") or "index.html"
+        fpath = os.path.normpath(os.path.join(ui_dir, rel))
+        if not fpath.startswith(ui_dir + os.sep) or not os.path.isfile(fpath):
+            return _wsgi_response(start_response, "404 Not Found",
+                                  "text/plain", "not found")
+        try:
+            with open(fpath, "rb") as f:
+                data = f.read()
+        except OSError:
+            return _wsgi_response(start_response, "404 Not Found",
+                                  "text/plain", "not found")
+        ctype = _MIME.get(os.path.splitext(fpath)[1].lower(),
+                          "application/octet-stream")
+        return _wsgi_response(start_response, "200 OK", ctype, data)
+
+    return app
+
+
+def _free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _find_chrome_or_edge():
+    """Chrome/Edge executable for the --app window (Windows)."""
+    if sys.platform == "win32":
+        candidates = [
+            os.path.expandvars(
+                r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(
+                r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(
+                r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(
+                r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(
+                r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+        ]
+        for c in candidates:
+            if c and os.path.isfile(c):
+                return c
+    return None
+
+
+def _launch_window(url):
+    """Open the UI in a desktop-style window.
+
+    Returns the browser Popen handle when we own the window process,
+    else None (fell back to a normal browser tab).
+    """
+    exe = _find_chrome_or_edge()
+    if exe:
+        profile = os.path.join(os.path.expanduser("~"),
+                               ".clipmaker_pc_profile")
+        os.makedirs(profile, exist_ok=True)
+        try:
+            return subprocess.Popen(
+                [exe, "--app=" + url, "--user-data-dir=" + profile,
+                 "--no-first-run", "--no-default-browser-check"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+    import webbrowser
+    webbrowser.open(url)
+    return None
+
+
 def main():
-    import webview
+    from waitress import serve
 
     api = Api()
-    ui_path = os.path.join(BASE_DIR, "ui", "index.html")
-    window = webview.create_window(
-        "ClipMaker PC", f"file:///{ui_path.replace(os.sep, '/')}",
-        js_api=api, width=1080, height=760, min_size=(900, 620))
-    webview.start(debug=False)
+    port = _free_port()
+    url = "http://127.0.0.1:%d/" % port
+    print("ClipMaker PC running at " + url, flush=True)
+
+    server_thread = threading.Thread(
+        target=serve,
+        kwargs={"app": make_wsgi_app(api), "host": "127.0.0.1",
+                "port": port, "threads": 8},
+        daemon=True)
+    server_thread.start()
+
+    time.sleep(0.6)  # let the server bind before opening the window
+    proc = _launch_window(url)
+    if proc is not None:
+        # When the user closes the app window, shut the server down too.
+        try:
+            proc.wait()
+        except KeyboardInterrupt:
+            pass
+        os._exit(0)
+    # Fallback (normal browser tab): keep serving until killed.
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
     main()
-
-# UI v2.1 premium overhaul - single clean rebuild trigger
