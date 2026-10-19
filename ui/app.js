@@ -168,6 +168,7 @@ async function poll() {
   if (st.status === "moments") {
     hide($("detectProgress"));
     hide($("detectSkeleton"));
+    hide($("detectError"));   // clear any stale error from a previous failed run
     const sig = JSON.stringify(st.moments.map((m) =>
       [m.title, m.start, m.end, m.virality, !!m.caption_edited, m.matched || ""]));
     if (sig !== lastMomentsSig) {
@@ -192,6 +193,7 @@ async function poll() {
   }
   if (st.status === "done") {
     hide($("renderProgress"));
+    hide($("renderError"));   // clear any stale error from a previous failed run
     const sig = JSON.stringify((st.renders || []).map((r) => r.path));
     if (sig !== lastRendersSig) {
       lastRendersSig = sig;
@@ -243,7 +245,8 @@ function selectJob(id) {
   controlsInitFor = null; thumbLoadedFor = null;
   $("moments").innerHTML = ""; $("renders").innerHTML = "";
   show($("momentsEmpty")); show($("rendersEmpty"));
-  hide($("renderRow")); hide($("mergeBtn"));
+  hide($("renderRow")); hide($("mergeBtn")); hide($("momentsBar"));
+  hide($("detectError")); hide($("renderError"));
   renderPrompts();
   startPoll();
   poll();
@@ -256,12 +259,13 @@ function resetForNewImport() {
   lastMoments = []; mergeSelected = []; prompts = [];
   controlsInitFor = null; thumbLoadedFor = null;
   detectModeReadyReset();
-  hide($("importError")); hide($("videoInfo")); hide($("longVideoWarn"));
+  hide($("importError")); hide($("detectError")); hide($("renderError"));
+  hide($("videoInfo")); hide($("longVideoWarn"));
   hide($("videoThumb")); show($("videoThumbFallback"));
   hide($("step2")); hide($("step3"));
   $("moments").innerHTML = ""; $("renders").innerHTML = "";
   show($("momentsEmpty")); show($("rendersEmpty"));
-  hide($("renderRow")); hide($("mergeBtn"));
+  hide($("renderRow")); hide($("mergeBtn")); hide($("momentsBar"));
   renderPrompts();
   show($("importProgress"));
   $("importBar").style.width = "0%";
@@ -276,9 +280,17 @@ $("importBtn").addEventListener("click", async () => {
   const url = $("urlInput").value.trim();
   if (!url) return;
   resetForNewImport();
-  const res = await api.import_url(url, $("cookiesCheck").checked, $("langSelect").value);
-  jobId = res.job_id;
-  startPoll();
+  try {
+    const res = await api.import_url(url, $("cookiesCheck").checked, $("langSelect").value);
+    jobId = res.job_id;
+    startPoll();
+  } catch (e) {
+    hide($("importProgress"));
+    $("importError").textContent = "Couldn't reach the local backend — is the app running?";
+    show($("importError"));
+    $("importBtn").disabled = false;
+    $("localFileBtn").disabled = false;
+  }
 });
 
 $("localFileBtn").addEventListener("click", async () => {
@@ -381,6 +393,17 @@ function initControls() {
   $("fillerCheck").checked = !!settings.remove_fillers;
   $("censorCheck").checked = !!settings.auto_censor;
   $("faceTrackCheck").checked = settings.face_track !== false;
+  $("speakerColorsCheck").checked = !!settings.speaker_colors;
+  $("hookOverlayCheck").checked = settings.hook_overlay !== false;
+  $("ctaOverlayCheck").checked = settings.cta_overlay !== false;
+  $("punchZoomCheck").checked = settings.punch_zoom !== false;
+  $("enhanceCheck").checked = !!settings.enhance_clarity;
+  $("safeZoneCheck").checked = !!settings.safe_zone;
+  $("speakerColor1").value = settings.speaker_color_1 || "#ffd166";
+  $("speakerColor2").value = settings.speaker_color_2 || "#6cc7ff";
+  $("ctaTextInput").value = settings.cta_text || "Follow for more 🔔";
+  $("brandLogoInput").value = settings.logo_path || "";
+  populateBrandKits();
   segSet("qualitySeg", settings.quality || "1080p");
   quality = segGet("qualitySeg");
 }
@@ -514,6 +537,80 @@ $("saveStyleBtn").addEventListener("click", async () => {
   toast("Custom style saved");
 });
 
+/* brand kits: caption style + colors + corner logo + intro/outro */
+function populateBrandKits() {
+  const sel = $("brandKitSelect");
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">No brand kit</option>';
+  (settings.brand_kits || []).forEach((k) => {
+    const o = document.createElement("option");
+    o.value = k.name; o.textContent = k.name;
+    sel.appendChild(o);
+  });
+  if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
+}
+
+$("saveBrandKitBtn").addEventListener("click", async () => {
+  const name = $("brandKitName").value.trim();
+  if (!name) { toast("Name the brand kit first", true); return; }
+  const kit = {
+    caption_style: captionStyle,
+    primary: $("customStylePrimary").value,
+    secondary: $("customStyleSecondary").value,
+    outline: $("customStyleOutline").value,
+    logo_path: $("brandLogoInput").value.trim(),
+    intro_path: $("brandIntroInput").value.trim(),
+    outro_path: $("brandOutroInput").value.trim(),
+  };
+  const res = await api.save_brand_kit(name, kit);
+  if (res.ok) {
+    settings.brand_kits = res.kits;
+    populateBrandKits();
+    $("brandKitSelect").value = name;
+    $("brandKitName").value = "";
+    toast(`Brand kit "${name}" saved`);
+  } else toast(res.error || "Save failed", true);
+});
+
+$("applyBrandKitBtn").addEventListener("click", async () => {
+  const name = $("brandKitSelect").value;
+  const kit = (settings.brand_kits || []).find((k) => k.name === name);
+  if (!kit) { toast("Pick a brand kit first", true); return; }
+  // kit colors become a custom caption style "Brand: <name>"
+  const styles = settings.custom_styles || [];
+  const styleName = "Brand " + kit.name;
+  const entry = {
+    name: styleName,
+    primary: hexToAss(kit.primary || "#ffffff"),
+    secondary: hexToAss(kit.secondary || "#2effc8"),
+    outline: hexToAss(kit.outline || "#000000"),
+    bold: 1,
+    primaryCss: kit.primary || "#ffffff",
+    secondaryCss: kit.secondary || "#2effc8",
+  };
+  const ix = styles.findIndex((s) => s.name.toLowerCase() === styleName.toLowerCase());
+  if (ix >= 0) styles[ix] = entry; else styles.push(entry);
+  await api.save_settings({ custom_styles: styles, logo_path: kit.logo_path || "" });
+  settings.custom_styles = styles;
+  settings.logo_path = kit.logo_path || "";
+  captionStyle = styleName.toLowerCase().replace(/\s+/g, "-");
+  renderCustomStyles(); syncStyleCards();
+  $("brandLogoInput").value = kit.logo_path || "";
+  $("brandIntroInput").value = kit.intro_path || "";
+  $("brandOutroInput").value = kit.outro_path || "";
+  $("introPathInput").value = kit.intro_path || "";
+  $("outroPathInput").value = kit.outro_path || "";
+  toast(`Brand kit "${kit.name}" applied`);
+});
+
+$("deleteBrandKitBtn").addEventListener("click", async () => {
+  const name = $("brandKitSelect").value;
+  if (!name) return;
+  const res = await api.delete_brand_kit(name);
+  if (res.ok) { settings.brand_kits = res.kits; populateBrandKits(); toast("Brand kit deleted"); }
+});
+
 /* ---------------- detection ---------------- */
 $("detectBtn").addEventListener("click", async () => {
   hide($("detectError"));
@@ -592,7 +689,14 @@ $("sortBtn").addEventListener("click", () => {
 function renderMoments(moments) {
   const box = $("moments");
   box.innerHTML = "";
+  if (!moments.length) {
+    hide($("momentsBar")); hide($("renderRow"));
+    show($("momentsEmpty"));
+    return;
+  }
   hide($("momentsEmpty"));
+  show($("momentsBar"));
+  show($("renderRow"));
   const order = [...moments].sort((a, b) => sortDesc ? b.virality - a.virality : a.virality - b.virality);
   $("momentsCount").textContent = `${moments.length} moment${moments.length === 1 ? "" : "s"}`;
   selectedMoments = moments.map((_, i) => i);
@@ -620,6 +724,8 @@ function renderMoments(moments) {
         </div>
         <div class="moment-reason">${escapeHtml(m.reason)}</div>
         <button class="ghost-btn small editCapBtn" data-i="${i}">Edit captions / trim</button>
+        <button class="ghost-btn small pkgBtn" data-i="${i}">📝 Posting package</button>
+        <div class="pkg-panel hidden" data-i="${i}"></div>
       </div>
       <div class="vbadge ${badgeClass(m.virality)}">
         <span class="vscore" data-v="${m.virality}">0</span>
@@ -640,7 +746,55 @@ function renderMoments(moments) {
   });
   box.querySelectorAll(".editCapBtn").forEach((btn) =>
     btn.addEventListener("click", () => openCaptionEditor(parseInt(btn.dataset.i, 10))));
-  show($("renderRow"));
+  box.querySelectorAll(".pkgBtn").forEach((btn) =>
+    btn.addEventListener("click", () => togglePostingPackage(parseInt(btn.dataset.i, 10), btn)));
+}
+
+/* posting package panel per moment */
+function copyText(t, label) {
+  const done = () => toast((label || "Copied") + " ✓");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(done).catch(() => fallbackCopy(t, done));
+  } else fallbackCopy(t, done);
+}
+function fallbackCopy(t, done) {
+  const ta = document.createElement("textarea");
+  ta.value = t;
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); done(); } catch (e) { toast("Copy failed", true); }
+  ta.remove();
+}
+
+async function togglePostingPackage(i, btn) {
+  const panel = document.querySelector(`.pkg-panel[data-i="${i}"]`);
+  if (!panel) return;
+  if (!panel.classList.contains("hidden")) { hide(panel); return; }
+  panel.innerHTML = '<div class="stage">Writing posting package…</div>';
+  show(panel);
+  const res = await api.posting_package(jobId, i);
+  if (!res.ok) {
+    panel.innerHTML = `<div class="stage">⚠ ${escapeHtml(res.error || "Failed")}</div>`;
+    return;
+  }
+  const p = res.package;
+  const modeLabel = p.mode === "ai" ? "🤖 AI-written" : "⚙️ Auto (on this PC)";
+  const modeCls = p.mode === "ai" ? "" : "extractive";
+  panel.innerHTML = `
+    <div class="pkg-head"><span class="pkg-title">Posting package</span>
+      <span class="pkg-mode ${modeCls}">${modeLabel}</span></div>
+    <div class="pkg-note">${escapeHtml(p.note || "")}</div>
+    <div class="pkg-sec">Title options</div>
+    <ul class="pkg-titles">${(p.titles || []).map((t) =>
+      `<li><span class="t">${escapeHtml(t)}</span><button class="copy-btn" data-copy="${escapeHtml(t)}">Copy</button></li>`).join("")}</ul>
+    <div class="pkg-sec">Description</div>
+    <div class="pkg-desc">${escapeHtml(p.description || "")}</div>
+    <button class="copy-btn" data-copy="${escapeHtml(p.description || "")}" style="margin-bottom:4px">Copy description</button>
+    <div class="pkg-sec">Hashtags</div>
+    <div class="pkg-tags">${(p.hashtags || []).map((h) => `<span class="pkg-tag">${escapeHtml(h)}</span>`).join("")}
+      <button class="copy-btn" data-copy="${escapeHtml((p.hashtags || []).join(" "))}">Copy all</button></div>`;
+  panel.querySelectorAll(".copy-btn").forEach((b) =>
+    b.addEventListener("click", (e) => { e.stopPropagation(); copyText(b.dataset.copy, "Copied"); }));
 }
 
 /* caption editor + trim */
@@ -697,8 +851,32 @@ function collectRenderOptions() {
     auto_censor: $("censorCheck").checked,
     emojis: $("emojisCheck").checked,
     highlight: $("highlightCheck").checked,
+    speaker_colors: $("speakerColorsCheck").checked,
+    hook_overlay: $("hookOverlayCheck").checked,
+    cta_overlay: $("ctaOverlayCheck").checked,
+    cta_text: $("ctaTextInput").value.trim(),
+    safe_zone: $("safeZoneCheck").checked,
+    punch_zoom: $("punchZoomCheck").checked,
+    enhance_clarity: $("enhanceCheck").checked,
+    logo_path: $("brandLogoInput").value.trim(),
   };
 }
+
+/* speaker color + CTA text + logo path persist with the rest of settings */
+["speakerColor1", "speakerColor2"].forEach((id) =>
+  $(id).addEventListener("change", async () => {
+    settings.speaker_color_1 = $("speakerColor1").value;
+    settings.speaker_color_2 = $("speakerColor2").value;
+    try { await api.save_settings({ speaker_color_1: settings.speaker_color_1, speaker_color_2: settings.speaker_color_2 }); } catch (e) { /* offline */ }
+  }));
+$("ctaTextInput").addEventListener("change", async () => {
+  settings.cta_text = $("ctaTextInput").value;
+  try { await api.save_settings({ cta_text: settings.cta_text }); } catch (e) { /* offline */ }
+});
+$("brandLogoInput").addEventListener("change", async () => {
+  settings.logo_path = $("brandLogoInput").value.trim();
+  try { await api.save_settings({ logo_path: settings.logo_path }); } catch (e) { /* offline */ }
+});
 
 async function startRender(indices) {
   if (!indices.length) { toast("Select at least one moment", true); return; }
@@ -750,6 +928,10 @@ function renderRenders(renders) {
         <input type="text" class="trim-s" data-i="${i}" inputmode="decimal" placeholder="Start s" title="Trim start (seconds)">
         <input type="text" class="trim-e" data-i="${i}" inputmode="decimal" placeholder="End s" title="Trim end (seconds)">
         <button class="ghost-btn small reRenderBtn" data-i="${i}" data-m="${r.moment_index}">Re-render</button>
+      </div>
+      <div class="plan-row">
+        <input type="datetime-local" class="plan-when" data-i="${i}" title="Schedule this clip">
+        <button class="ghost-btn small planBtn" data-i="${i}">🗓 Plan</button>
       </div>`;
     box.appendChild(div);
   });
@@ -796,21 +978,67 @@ function renderRenders(renders) {
       }
       startRender([mi]);
     }));
+  box.querySelectorAll(".planBtn").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      const i = parseInt(btn.dataset.i, 10);
+      const when = box.querySelector(`.plan-when[data-i="${i}"]`).value;
+      if (!when) { toast("Pick a date and time first", true); return; }
+      const res = await api.add_planner_entry(jobId, i, when);
+      if (res.ok) { toast("Scheduled ✓"); refreshPlanner(); }
+      else toast(res.error || "Schedule failed", true);
+    }));
   renderRenders._list = renders;
+  refreshPlanner();
+}
+
+/* posting planner (local schedule queue - no auto-posting) */
+async function refreshPlanner() {
+  try {
+    const res = await api.get_planner();
+    renderPlanner(res.planner || []);
+  } catch (e) { /* offline */ }
+}
+function renderPlanner(entries) {
+  const box = $("plannerList");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!entries.length) {
+    box.innerHTML = '<div class="empty-sub">Nothing scheduled yet — set a date/time on a clip above and hit “Plan”.</div>';
+    return;
+  }
+  entries.forEach((e) => {
+    const div = document.createElement("div");
+    div.className = "planner-item" + (e.done ? " done" : "");
+    div.innerHTML = `
+      <input type="checkbox" class="planner-check" ${e.done ? "checked" : ""} title="Mark as posted">
+      <span class="planner-title">${escapeHtml(e.title)}</span>
+      <span class="planner-when">🗓 ${escapeHtml((e.scheduled || "").replace("T", " "))}</span>
+      <span class="planner-export">${escapeHtml(e.export_name || "")}</span>
+      <button class="copy-btn plan-copy">Copy name</button>
+      <button class="copy-btn plan-del" title="Remove">✕</button>`;
+    div.querySelector(".planner-check").addEventListener("change", async (ev) => {
+      await api.update_planner_entry(e.id, { done: ev.target.checked });
+      refreshPlanner();
+    });
+    div.querySelector(".plan-copy").addEventListener("click", () => copyText(e.export_name || "", "Export name copied"));
+    div.querySelector(".plan-del").addEventListener("click", async () => {
+      await api.delete_planner_entry(e.id);
+      refreshPlanner();
+    });
+    box.appendChild(div);
+  });
 }
 
 function openPreview(title, url) {
   $("previewTitle").textContent = title || "Preview";
   const v = $("previewVideo");
   v.src = url;
+  const guide = $("safeZoneGuideCheck") && $("safeZoneGuideCheck").checked;
+  $("safeZoneOverlay").classList.toggle("hidden", !guide);
   show($("previewModal"));
   v.play().catch(() => {});
 }
-$("closePreviewBtn").addEventListener("click", () => {
-  $("previewVideo").pause();
-  $("previewVideo").removeAttribute("src");
-  hide($("previewModal"));
-});
+$("closePreviewBtn").addEventListener("click", () => closeModal("previewModal"));
 
 /* composer */
 $("mergeBtn").addEventListener("click", async () => {
@@ -854,8 +1082,10 @@ $("newVideoBtn").addEventListener("click", () => {
   $("batchUrls").value = ""; $("batchStatus").textContent = "";
   ["step2", "step3"].forEach((s) => hide($(s)));
   hide($("videoInfo")); hide($("longVideoWarn")); hide($("importProgress")); hide($("importError"));
+  hide($("detectError")); hide($("renderError"));
   hide($("videoThumb")); show($("videoThumbFallback"));
   show($("momentsEmpty")); show($("rendersEmpty"));
+  hide($("momentsBar"));
   $("importBtn").disabled = false; $("localFileBtn").disabled = false;
   renderPrompts();
   setStep(1);
@@ -865,11 +1095,15 @@ $("newVideoBtn").addEventListener("click", () => {
 /* ---------------- settings ---------------- */
 function openSettings() { show($("settingsModal")); }
 $("settingsBtn").addEventListener("click", async () => {
-  const s = await api.get_settings();
-  settings = s;
-  $("apiKeyInput").value = s.api_key || "";
+  try {
+    const s = await api.get_settings();
+    settings = s || {};
+  } catch (e) { settings = settings || {}; }
+  $("apiKeyInput").value = settings.api_key || "";
   $("apiKeyInput").type = "password";
   $("keyToggle").textContent = "Show";
+  segSet("themeSeg", settings.theme === "light" ? "light" : "dark");
+  $("accentPick").value = settings.accent || "#2effc8";
   openSettings();
 });
 $("closeSettingsBtn").addEventListener("click", () => hide($("settingsModal")));
@@ -890,6 +1124,63 @@ $("keyHelp").addEventListener("click", (e) => {
   toast("Get a free key at aistudio.google.com/app/apikey");
 });
 
+/* ---------------- theme (Dark default = web-app look) ---------------- */
+function hexToRgb(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || "");
+  if (!m) return null;
+  return [parseInt(m[1].slice(0, 2), 16), parseInt(m[1].slice(2, 4), 16),
+          parseInt(m[1].slice(4, 6), 16)];
+}
+function applyTheme() {
+  const theme = settings.theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = theme;
+  const accent = (settings.accent || "#2effc8").trim() || "#2effc8";
+  const rgb = hexToRgb(accent) || [46, 255, 200];
+  const root = document.documentElement.style;
+  root.setProperty("--accent", accent);
+  root.setProperty("--accent-rgb", rgb.join(", "));
+  const d2 = rgb.map((c) => Math.round(c * 0.78));
+  root.setProperty("--accent2", `rgb(${d2.join(", ")})`);
+  root.setProperty("--accent-dim", `rgba(${rgb.join(", ")}, 0.10)`);
+  root.setProperty("--accent-glow", `rgba(${rgb.join(", ")}, 0.22)`);
+}
+document.querySelectorAll("#themeSeg .seg").forEach((b) =>
+  b.addEventListener("click", async () => {
+    segSet("themeSeg", b.dataset.value);
+    settings.theme = b.dataset.value;
+    applyTheme();
+    try { await api.save_settings({ theme: settings.theme }); } catch (e) { /* offline */ }
+  }));
+$("accentPick").addEventListener("input", async () => {
+  settings.accent = $("accentPick").value;
+  applyTheme();
+  try { await api.save_settings({ accent: settings.accent }); } catch (e) { /* offline */ }
+});
+$("accentReset").addEventListener("click", async () => {
+  settings.accent = "#2effc8";
+  $("accentPick").value = "#2effc8";
+  applyTheme();
+  try { await api.save_settings({ accent: settings.accent }); } catch (e) { /* offline */ }
+});
+
+/* ---------------- modals: Esc + backdrop click ---------------- */
+function closeModal(id) {
+  if (id === "previewModal") {
+    $("previewVideo").pause();
+    $("previewVideo").removeAttribute("src");
+  }
+  hide($(id));
+}
+["captionModal", "previewModal", "settingsModal"].forEach((id) => {
+  $(id).addEventListener("click", (e) => { if (e.target.id === id) closeModal(id); });
+});
+window.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  ["captionModal", "previewModal", "settingsModal"].forEach((id) => {
+    if (!$(id).classList.contains("hidden")) closeModal(id);
+  });
+});
+
 /* ---------------- init ---------------- */
 window.addEventListener("DOMContentLoaded", async () => {
   setStep(1);
@@ -906,6 +1197,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     sel.value = settings.language || "auto";
     $("cookiesCheck").checked = !!settings.use_cookies;
   } catch (e) { /* offline-safe defaults below */ }
+  applyTheme();
   setTimeout(() => {
     const sp = document.getElementById("splash");
     if (sp) { sp.classList.add("gone"); setTimeout(() => sp.remove(), 600); }
