@@ -1,1 +1,97 @@
-IyBDbGlwTWFrZXIgUEMKCkEgcmVhbCBkZXNrdG9wIGFwcCBmb3IgV2luZG93czogcGFzdGUgYSB2aWRlbyBsaW5rLCBnZXQgdmlyYWwtcmVhZHkgY2xpcHMKd2l0aCBidXJuZWQtaW4gd29yZC1oaWdobGlnaHQgY2FwdGlvbnMg4oCUIGFsbCByZW5kZXJlZCBvbiB5b3VyIG93biBQQy4KU2FtZSAzLXN0ZXAgd29ya2Zsb3cgYXMgdGhlIENsaXAgTWFrZXIgd2ViIGFwcDogKipJbXBvcnQg4oaSIEN1c3RvbWl6ZSDihpIgQ2xpcHMqKi4KCioqUGlwZWxpbmU6KiogeXQtZGxwIChkb3dubG9hZCwgd2l0aCBZb3VUdWJlIGJvdC1jaGVjayByZXRyaWVzKSDihpIKZmFzdGVyLXdoaXNwZXIgKGxvY2FsIHRyYW5zY3JpcHRpb24sIDI1IGxhbmd1YWdlcykg4oaSIHZpcmFsLW1vbWVudCBkZXRlY3Rpb24KKCoqT2ZmbGluZSoqIGhldXJpc3RpYyBtb2RlIG5lZWRzIG5vIGtleSwgb3IgKipBSSoqIG1vZGUgd2l0aCB5b3VyIGZyZWUKR2VtaW5pIGtleSkgKyAw4oCTOTkgdmlyYWxpdHkgc2NvcmVzIOKGkiBmZm1wZWcgKDk6MTYgLyAxNjo5IC8gMToxIC8gNDo1IHJlZnJhbWUsCjcyMHAvMTA4MHAsIGthcmFva2UgY2FwdGlvbnMsIGhvb2sgb3ZlcmxheSkg4oaSIE1QNCBmaWxlcyBpbiBhIGxvY2FsIGZvbGRlci4KCiMjIFF1aWNrIHN0YXJ0IChXaW5kb3dzIDEwLzExKQoKMS4gVW56aXAgKipDbGlwTWFrZXJQQy13aW42NC56aXAqKiAoZnJvbQogICBbUmVsZWFzZXNdKGh0dHBzOi8vZ2l0aHViLmNvbS9KRVNBTlVERElONTU0L1RhbnZpci1lci1iYXAvcmVsZWFzZXMpKSwKICAgZG91YmxlLWNsaWNrICoqQ2xpcE1ha2VyUEMuZXhlKiouIChTbWFydFNjcmVlbiBtYXkgd2FybiBiZWNhdXNlIHRoZSBleGUKICAgaXMgdW5zaWduZWQg4oCUICJNb3JlIGluZm8iIOKGkiAiUnVuIGFueXdheSIuKQoyLiAqKlN0ZXAgMSDigJQgSW1wb3J0OioqIHBhc3RlIGEgWW91VHViZS9WaW1lby9SdW1ibGUvVHdpdGNoL0RyaXZlL2RpcmVjdCBsaW5rLAogICBvciB1c2UgYSB2aWRlbyBmaWxlIGFscmVhZHkgb24geW91ciBQQy4gSWYgWW91VHViZSBzaG93cyBhIGJvdCBjaGVjaywKICAgdHVybiBvbiAqKiJVc2UgbXkgYnJvd3NlcidzIFlvdVR1YmUgbG9naW4iKiogKGxvZyBpbnRvIFlvdVR1YmUgaW4KICAgQ2hyb21lL0VkZ2UgZmlyc3QpLgozLiAqKlN0ZXAgMiDigJQgQ3VzdG9taXplOioqIHBpY2sgZGV0ZWN0aW9uIG1vZGUgKE9mZmxpbmUgbmVlZHMgbm8gQVBJIGtleSksCiAgIGFzcGVjdCByYXRpbywgY2xpcCBsZW5ndGgsIGdlbnJlIHRlbXBsYXRlLCBjYXB0aW9uIHN0eWxlLCBhbmQgdG9nZ2xlcwogICAoZW1vamlzLCBrZXl3b3JkIGhpZ2hsaWdodCwgc2lsZW5jZS9maWxsZXIgcmVtb3ZhbCwgYXV0by1jZW5zb3IpLgogICBVc2UgKipGaW5kIGNsaXAgbW9tZW50KiogdG8ganVtcCB0byBhIGRlc2NyaWJlZCBtb21lbnQuCjQuICoqU3RlcCAzIOKAlCBDbGlwczoqKiBnZW5lcmF0ZSwgcHJldmlldywgdHJpbSArIHJlLXJlbmRlciwgZXhwb3J0CiAgIFNSVC9WVFQsIGRvd25sb2FkIGV2ZXJ5dGhpbmcgYXMgWklQLCBvciBtZXJnZSBjbGlwcyBpbiBDbGlwIENvbXBvc2VyLgoKTm8gQVBJIGtleSBpcyBuZWVkZWQgZm9yIE9mZmxpbmUgbW9kZS4gRm9yIEFJIGRldGVjdGlvbiwgcGFzdGUgeW91ciBmcmVlCkdlbWluaSBrZXkgZnJvbSBodHRwczovL2Fpc3R1ZGlvLmdvb2dsZS5jb20vYXBwL2FwaWtleSBpbiDimpkgU2V0dGluZ3MuCgojIyBXaGF0J3MgbmV3IGluIHYzICh3ZWItYXBwIHBhcml0eSkKCi0gKiozLXN0ZXAgd2l6YXJkKiogKEltcG9ydCDihpIgQ3VzdG9taXplIOKGkiBDbGlwcykgbWlycm9yaW5nIHRoZSB3ZWIgYXBwLgotICoqQXNwZWN0IHJhdGlvcyoqIDk6MTYgLyAxNjo5IC8gMToxIC8gNDo1IHdpdGggdmlzdWFsIHBpY2tlciwgKio3MjBwLzEwODBwKiouCi0gKipDbGlwIGxlbmd0aCBwcmVzZXRzKiogMTVz4oCTMTVtaW4gKyBjdXN0b20gc2Vjb25kczsgKipjbGlwIGNvdW50KiogNC84LzEyLzE2L01heCAoNDApLgotICoqNiBnZW5yZSB0ZW1wbGF0ZXMqKiAoUG9kY2FzdCwgQ29tZWR5LCBHYW1pbmcsIE5ld3MvQm9keWNhbSwgQnVzaW5lc3MsIEZpdG5lc3MpLgotICoqQ2FwdGlvbiBtYWdpYyB0b2dnbGVzKio6IGFkZCBlbW9qaXMsIGhpZ2hsaWdodCBrZXl3b3JkcywgcmVtb3ZlIHNpbGVuY2VzLAogIHJlbW92ZSBmaWxsZXIgd29yZHMsIGF1dG8tY2Vuc29yIGJlZXAuCi0gKipDdXN0b20gY2FwdGlvbiBzdHlsZXMqKiDigJQgZGVzaWduIGFuZCBzYXZlIHlvdXIgb3duLCBwZXJzaXN0ZWQuCi0gKipGaW5kIGNsaXAgbW9tZW50Kiog4oCUIG5hdHVyYWwtbGFuZ3VhZ2Ugc2VhcmNoIG92ZXIgdGhlIHRyYW5zY3JpcHQKICAoZWFjaCBoaXQgc3RhbXBlZCDwn46vIE1hdGNoZWQ7IG1pc3NlcyByZXBvcnRlZCBob25lc3RseSkuCi0gKipCYXRjaCBpbXBvcnQqKiB1cCB0byAxMCBVUkxzLCAqKmxvY2FsIGZpbGUqKiBpbXBvcnQsICoqU1JULWFzLXRyYW5zY3JpcHQqKi4KLSAqKlBlci1jbGlwIHRyaW0gKyByZS1yZW5kZXIqKiwgY2FwdGlvbnMtb25seSBwcmV2aWV3LCAqKkRvd25sb2FkLWFsbCBaSVAqKiwKICAqKlNSVC9WVFQgZXhwb3J0KiosICoqUHJlbWllcmUvRGFWaW5jaSBYTUwgdGltZWxpbmUqKiwgKipDbGlwIENvbXBvc2VyKioKICAobWVyZ2UgKyBpbnRyby9vdXRybyArIGN1dC9jcm9zc2ZhZGUpLgotICoqWW91VHViZSBib3QtY2hlY2sgcmVzaWxpZW5jZSoqOiBhbmRyb2lkLWNsaWVudCArIGJyb3dzZXItY29va2llIHJldHJ5CiAgY2hhaW4sIG9uZS1jbGljayBjb29raWUgdG9nZ2xlLCBhdXRvIHl0LWRscCB1cGRhdGVzIGF0IHN0YXJ0dXAuCi0gMjUgdHJhbnNjcmlwdGlvbiBsYW5ndWFnZXM7IDJoKyBsb25nLXZpZGVvIHdhcm5pbmc7IHRodW1ibmFpbCBwcmV2aWV3cy4KCiMjIEJ1aWxkIHRoZSAuZXhlIHlvdXJzZWxmIChvcHRpb25hbCkKClRoZSByZWxlYXNlIGFib3ZlIGlzIGJ1aWx0IGF1dG9tYXRpY2FsbHkgYnkgR2l0SHViIEFjdGlvbnMKKGAuZ2l0aHViL3dvcmtmbG93cy9idWlsZC1leGUueW1sYCkgb24gZXZlcnkgcHVzaCB0byBgbWFpbmAuIFRvIGJ1aWxkCmxvY2FsbHkgb24geW91ciBvd24gV2luZG93cyBQQyBpbnN0ZWFkOgoKYGBgCnBpcCBpbnN0YWxsIC1yIHJlcXVpcmVtZW50cy50eHQKcGlwIGluc3RhbGwgcHlpbnN0YWxsZXIKcHlpbnN0YWxsZXIgQ2xpcE1ha2VyUEMuc3BlYwpgYGAKClRoZSBwcm9ncmFtIGlzIGBkaXN0L0NsaXBNYWtlclBDL0NsaXBNYWtlclBDLmV4ZWAg4oCUIHNoaXAgdGhlIHdob2xlCmBDbGlwTWFrZXJQQ2AgZm9sZGVyICh0aGUgZXhlIG5lZWRzIGl0cyBgX2ludGVybmFsYCBmb2xkZXIgbmV4dCB0byBpdCksCnBsdXMgYGZmbXBlZy5leGVgL2BmZnByb2JlLmV4ZWAgbmV4dCB0byB0aGUgZXhlICh0aGUgcmVsZWFzZSBidWlsZCBkb2VzCnRoaXMgYXV0b21hdGljYWxseSkuCgojIyBXaGF0J3MgaW5zaWRlCgp8IEZpbGUgfCBXaGF0IGl0IGRvZXMgfAp8LS0tfC0tLXwKfCBgYXBwLnB5YCB8IExvY2FsaG9zdCBzZXJ2ZXIgKyBkZXNrdG9wLXN0eWxlIHdpbmRvdyAoQ2hyb21lL0VkZ2UgLS1hcHApICsgam9iIG1hbmFnZW1lbnQgfAp8IGBwaXBlbGluZS5weWAgfCBEb3dubG9hZCAoYm90LWNoZWNrIHJldHJ5IGNoYWluKSwgdHJhbnNjcmliZSwgZGV0ZWN0IG1vbWVudHMsIHJlbmRlciB8CnwgYGZhY2V0cmFjay5weWAgfCBGYWNlIGRldGVjdGlvbiArIHNtb290aGVkIGNyb3AgdHJhamVjdG9yeSB8CnwgYG1vZGVscy9gIHwgQnVuZGxlZCBZdU5ldCBmYWNlLWRldGVjdGlvbiBtb2RlbCAobm8gZG93bmxvYWQgbmVlZGVkKSB8CnwgYHVpL2AgfCBMb2NhbCB3ZWIgaW50ZXJmYWNlIChpbmRleC5odG1sLCBzdHlsZS5jc3MsIGFwcC5qcykgfAp8IGByZXF1aXJlbWVudHMudHh0YCB8IFB5dGhvbiBkZXBlbmRlbmNpZXMgfAp8IGBDbGlwTWFrZXJQQy5zcGVjYCB8IFB5SW5zdGFsbGVyIGJ1aWxkIHJlY2lwZSB8CnwgYEluc3RhbGwuYmF0YCB8IE9uZS1jbGljayBpbnN0YWxsZXIvbGF1bmNoZXIgfAoKIyMgTm90ZXMgJiBsaW1pdHMKCi0gVGhlIHRyYW5zY3JpcHRpb24gbW9kZWwgKGBiYXNlYCwgfjE1MCBNQikgZG93bmxvYWRzIGF1dG9tYXRpY2FsbHkgb24gZmlyc3QKICB1c2UgYW5kIGlzIGNhY2hlZCBhZnRlcndhcmRzLgotIEZpcnN0IGxhdW5jaCBhbHNvIGRvd25sb2FkcyBub3RoaW5nIGVsc2UgYmlnIOKAlCBldmVyeXRoaW5nIGVsc2UgaXMgcGlwLgogIFRoZSBmYWNlLWRldGVjdGlvbiBtb2RlbCBzaGlwcyBpbnNpZGUgdGhlIGBtb2RlbHMvYCBmb2xkZXIgKG5vIGRvd25sb2FkKS4KLSBMb25nIHZpZGVvcyB0YWtlIGEgd2hpbGU6IFlvdVR1YmUgdGhyb3R0bGVzIGRvd25sb2FkcywgYW5kIHRyYW5zY3JpcHRpb24KICBydW5zIGF0IH4wLjPDlyByZWFsdGltZSBvbiBDUFUuIEZhY2UgdHJhY2tpbmcgYWRkcyB+MS0yIG1pbiBwZXIgY2xpcCBvbiBDUFUKICAoaXQgc2NhbnMgdGhlIHZpZGVvIGZvciBmYWNlcyBmaXJzdCkg4oCUIHR1cm4gaXQgb2ZmIGluIFNldHRpbmdzIGZvciBzcGVlZC4KLSBUaGUgOToxNiByZWZyYW1lIGZvbGxvd3MgZmFjZXMgaW4gdjIgKHRvZ2dsZSBpbiBTZXR0aW5ncyk7IHdpdGggdGhlIHRvZ2dsZQogIG9mZiwgb3Igd2hlbiBubyBmYWNlIGlzIGZvdW5kLCBpdCB1c2VzIGEgc21hcnQgY2VudGVyIGNyb3AuCi0gRmlsbGVyLXdvcmQgcmVtb3ZhbCBjdXRzIHRoZSBmaWxsZXIgc2VnbWVudHMgZnJvbSBhdWRpbywgdmlkZW8gYW5kIGNhcHRpb25zOwogIHRoZSBjbGlwIGdldHMgc2hvcnRlciBieSBleGFjdGx5IHRoZSByZW1vdmVkIGFtb3VudC4KLSBZb3VyIEdlbWluaSBrZXkgaXMgc3RvcmVkIG9ubHkgaW4gYCVVU0VSUFJPRklMRSVcLmNsaXBtYWtlcl9wY19zZXR0aW5ncy5qc29uYAogIG9uIHlvdXIgUEMg4oCUIGl0IG5ldmVyIGxlYXZlcyB5b3VyIG1hY2hpbmUgZXhjZXB0IHRvIGNhbGwgR29vZ2xlJ3MgQVBJLgotIEFsbCBjb2RlIGluIHRoaXMgZm9sZGVyIGlzIG9yaWdpbmFsIGFuZCB3cml0dGVuIGZvciB0aGlzIHByb2plY3QuCg==
+# ClipMaker PC
+
+A real desktop app for Windows: paste a video link, get viral-ready clips
+with burned-in word-highlight captions — all rendered on your own PC.
+Same 3-step workflow as the Clip Maker web app: **Import → Customize → Clips**.
+
+**Pipeline:** yt-dlp (download, with YouTube bot-check retries) →
+faster-whisper (local transcription, 25 languages) → viral-moment detection
+(**Offline** heuristic mode needs no key, or **AI** mode with your free
+Gemini key) + 0–99 virality scores → ffmpeg (9:16 / 16:9 / 1:1 / 4:5 reframe,
+720p/1080p, karaoke captions, hook overlay) → MP4 files in a local folder.
+
+## Quick start (Windows 10/11)
+
+1. Unzip **ClipMakerPC-win64.zip** (from
+   [Releases](https://github.com/JESANUDDIN554/Tanvir-er-bap/releases)),
+   double-click **ClipMakerPC.exe**. (SmartScreen may warn because the exe
+   is unsigned — "More info" → "Run anyway".)
+2. **Step 1 — Import:** paste a YouTube/Vimeo/Rumble/Twitch/Drive/direct link,
+   or use a video file already on your PC. If YouTube shows a bot check,
+   turn on **"Use my browser's YouTube login"** (log into YouTube in
+   Chrome/Edge first).
+3. **Step 2 — Customize:** pick detection mode (Offline needs no API key),
+   aspect ratio, clip length, genre template, caption style, and toggles
+   (emojis, keyword highlight, silence/filler removal, auto-censor).
+   Use **Find clip moment** to jump to a described moment.
+4. **Step 3 — Clips:** generate, preview, trim + re-render, export
+   SRT/VTT, download everything as ZIP, or merge clips in Clip Composer.
+
+No API key is needed for Offline mode. For AI detection, paste your free
+Gemini key from https://aistudio.google.com/app/apikey in ⚙ Settings.
+
+## What's new in v3 (web-app parity)
+
+- **3-step wizard** (Import → Customize → Clips) mirroring the web app.
+- **Aspect ratios** 9:16 / 16:9 / 1:1 / 4:5 with visual picker, **720p/1080p**.
+- **Clip length presets** 15s–15min + custom seconds; **clip count** 4/8/12/16/Max (40).
+- **6 genre templates** (Podcast, Comedy, Gaming, News/Bodycam, Business, Fitness).
+- **Caption magic toggles**: add emojis, highlight keywords, remove silences,
+  remove filler words, auto-censor beep.
+- **Custom caption styles** — design and save your own, persisted.
+- **Find clip moment** — natural-language search over the transcript
+  (each hit stamped 🎯 Matched; misses reported honestly).
+- **Batch import** up to 10 URLs, **local file** import, **SRT-as-transcript**.
+- **Per-clip trim + re-render**, captions-only preview, **Download-all ZIP**,
+  **SRT/VTT export**, **Premiere/DaVinci XML timeline**, **Clip Composer**
+  (merge + intro/outro + cut/crossfade).
+- **YouTube bot-check resilience**: android-client + browser-cookie retry
+  chain, one-click cookie toggle, auto yt-dlp updates at startup.
+- 25 transcription languages; 2h+ long-video warning; thumbnail previews.
+
+## Build the .exe yourself (optional)
+
+The release above is built automatically by GitHub Actions
+(`.github/workflows/build-exe.yml`) on every push to `main`. To build
+locally on your own Windows PC instead:
+
+```
+pip install -r requirements.txt
+pip install pyinstaller
+pyinstaller ClipMakerPC.spec
+```
+
+The program is `dist/ClipMakerPC/ClipMakerPC.exe` — ship the whole
+`ClipMakerPC` folder (the exe needs its `_internal` folder next to it),
+plus `ffmpeg.exe`/`ffprobe.exe` next to the exe (the release build does
+this automatically).
+
+## What's inside
+
+| File | What it does |
+|---|---|
+| `app.py` | Localhost server + desktop-style window (Chrome/Edge --app) + job management |
+| `pipeline.py` | Download (bot-check retry chain), transcribe, detect moments, render |
+| `facetrack.py` | Face detection + smoothed crop trajectory |
+| `models/` | Bundled YuNet face-detection model (no download needed) |
+| `ui/` | Local web interface (index.html, style.css, app.js) |
+| `requirements.txt` | Python dependencies |
+| `ClipMakerPC.spec` | PyInstaller build recipe |
+| `Install.bat` | One-click installer/launcher |
+
+## Notes & limits
+
+- The transcription model (`base`, ~150 MB) downloads automatically on first
+  use and is cached afterwards.
+- First launch also downloads nothing else big — everything else is pip.
+  The face-detection model ships inside the `models/` folder (no download).
+- Long videos take a while: YouTube throttles downloads, and transcription
+  runs at ~0.3× realtime on CPU. Face tracking adds ~1-2 min per clip on CPU
+  (it scans the video for faces first) — turn it off in Settings for speed.
+- The 9:16 reframe follows faces in v2 (toggle in Settings); with the toggle
+  off, or when no face is found, it uses a smart center crop.
+- Filler-word removal cuts the filler segments from audio, video and captions;
+  the clip gets shorter by exactly the removed amount.
+- Your Gemini key is stored only in `%USERPROFILE%\.clipmaker_pc_settings.json`
+  on your PC — it never leaves your machine except to call Google's API.
+- All code in this folder is original and written for this project.
