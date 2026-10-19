@@ -289,6 +289,209 @@ def detect_moments(words, api_key, clip_min_s, clip_max_s,
 
 
 # ---------------------------------------------------------------------------
+# OFFLINE heuristic moment detection (no API key)
+# ---------------------------------------------------------------------------
+# Finds energetic, dense, surprising segments of the transcript using only
+# local signals. Scores are labeled heuristic - they find high-energy
+# segments, not deep topic understanding. All titles/hooks are extracted
+# verbatim from the transcript; nothing is ever invented.
+
+OFFLINE_ENERGY_WORDS = {
+    "wow", "insane", "crazy", "breaking", "amazing", "unbelievable",
+    "incredible", "shocking", "shocked", "wild", "nuts", "huge",
+    "massive", "suddenly", "instantly", "watch", "look", "listen",
+    "never", "ever", "best", "worst", "secret", "exposed", "caught",
+    "busted", "exploded", "explosion", "shots", "fired", "chase",
+    "sirens", "arrested", "arrest", "gun", "police", "officer",
+    "suspect", "haha", "lol", "hilarious", "terrifying", "scary",
+    "dangerous", "stunning", "jaw-dropping",
+}
+
+_OFFLINE_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "is", "are", "was", "were",
+    "be", "been", "to", "of", "in", "on", "at", "for", "with", "as",
+    "by", "from", "about", "into", "over", "after", "it", "its",
+    "this", "that", "these", "those", "i", "you", "he", "she", "we",
+    "they", "me", "him", "her", "us", "them", "my", "your", "his",
+    "our", "their", "so", "if", "not", "no", "yes", "just", "very",
+    "really", "have", "has", "had", "do", "does", "did", "done",
+    "can", "will", "would", "could", "should", "there", "here",
+    "what", "when", "where", "who", "how", "why", "get", "got",
+    "go", "going", "come", "came", "said", "say", "like", "know",
+    "think", "want", "see", "one", "two", "all", "up", "out", "too",
+    "then", "than", "also", "well", "now", "oh", "uh", "um",
+}
+
+
+def _clean_word(w):
+    return re.sub(r"[^a-z']", "", w.lower())
+
+
+def _content_words(win_words):
+    return {_clean_word(w["word"]) for w in win_words
+            if len(_clean_word(w["word"])) > 2
+            and _clean_word(w["word"]) not in _OFFLINE_STOPWORDS}
+
+
+def _score_offline_window(win_words, prev_content, win_dur):
+    """Score one candidate window. Returns (virality, hook, flow, value,
+    reason_parts)."""
+    n = len(win_words)
+    density = n / max(win_dur, 0.1)  # words per second
+    # ~1.5 wps is calm speech, ~2.8+ is rapid/excited
+    density_score = min(100, max(0, (density - 1.2) / 2.4 * 100))
+
+    punct = sum(w["word"].count("!") + w["word"].count("?")
+                for w in win_words)
+    punct_score = min(100, punct * 25)
+
+    energy_hits = [w["word"].strip(",.!?;:") for w in win_words
+                   if _clean_word(w["word"]) in OFFLINE_ENERGY_WORDS]
+    energy_score = min(100, len(energy_hits) * 22)
+
+    caps = sum(1 for w in win_words
+               if len(w["word"]) > 2 and w["word"].isupper())
+    caps_score = min(100, caps * 20)
+
+    content = _content_words(win_words)
+    if prev_content and content:
+        union = content | prev_content
+        jaccard = len(content & prev_content) / len(union) if union else 0
+        novelty_score = (1 - jaccard) * 100
+    else:
+        novelty_score = 60.0  # neutral for the first window
+
+    # penalties: long silences and filler-word density
+    gaps = [b["start"] - a["end"]
+            for a, b in zip(win_words, win_words[1:])]
+    silence = sum(g for g in gaps if g > 1.5)
+    silence_pen = min(40, silence * 6)
+
+    filler_dur = sum(e - s for s, e in find_filler_ranges(win_words))
+    filler_pen = min(25, filler_dur / max(win_dur, 0.1) * 120)
+
+    virality = (0.30 * density_score + 0.22 * energy_score
+                + 0.18 * punct_score + 0.15 * novelty_score
+                + 0.15 * caps_score
+                - 0.5 * silence_pen - 0.3 * filler_pen)
+    virality = max(5, min(99, round(virality)))
+
+    hook = round(0.5 * energy_score + 0.3 * punct_score
+                 + 0.2 * caps_score)
+    flow = round(max(0, 0.6 * density_score + 0.4 * novelty_score
+                     - 0.4 * silence_pen))
+    value = round(0.5 * energy_score + 0.5 * novelty_score)
+
+    parts = [f"{density:.1f} words/sec",
+             f"{len(energy_hits)} energy words"
+             + (": " + ", ".join(sorted(set(energy_hits))[:4])
+                if energy_hits else ""),
+             f"{punct} exclamations/questions",
+             f"{novelty_score:.0f}% topic novelty"]
+    if silence > 1.5:
+        parts.append(f"{silence:.1f}s silence (penalty)")
+    if filler_dur > 1.0:
+        parts.append(f"{filler_dur:.1f}s fillers (penalty)")
+    return virality, hook, flow, value, "; ".join(parts)
+
+
+def _extract_title_hook(win_words):
+    """Extractive title + hook: verbatim text from the window only."""
+    text = " ".join(w["word"] for w in win_words)
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text)
+             if s.strip()]
+    punchy = next((s for s in sents
+                   if s.endswith("!") or s.endswith("?")), None)
+    title = punchy or (sents[0] if sents else "")
+    twords = title.split()
+    if len(twords) > 9:
+        title = " ".join(twords[:9])
+    title = title[:70].strip() or "Clip"
+    hook = " ".join(text.split()[:8])[:60].strip()
+    return title, hook
+
+
+def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8):
+    """Heuristic moment detection from the local transcript. No API key.
+
+    Returns list of {start, end, title, hook, virality, hook_score,
+    flow_score, value_score, reason, offline: True}. Titles and hooks are
+    extracted verbatim from the transcript - never invented.
+    """
+    if not words or clip_max_s <= 0 or max_clips <= 0:
+        return []
+    dur = words[-1]["end"]
+    win_len = min(max((clip_min_s + clip_max_s) / 2.0, 10.0), dur)
+    if win_len < clip_min_s * 0.5:
+        return []
+    step = max(3.0, win_len / 6.0)
+
+    candidates = []
+    t = 0.0
+    while t + win_len <= dur + 0.001:
+        candidates.append((t, t + win_len))
+        t += step
+    if dur > win_len and (not candidates
+                          or candidates[-1][0] < dur - win_len - 0.5):
+        candidates.append((max(0.0, dur - win_len), dur))
+
+    scored = []
+    prev_content = set()
+    for s, e in candidates:
+        win_words = [w for w in words
+                     if w["end"] > s and w["start"] < e]
+        if len(win_words) < 12:
+            prev_content = _content_words(win_words)
+            continue
+        # trim leading/trailing silence inside the window
+        s = max(s, win_words[0]["start"])
+        e = min(e, win_words[-1]["end"])
+        if e - s < 5:
+            prev_content = _content_words(win_words)
+            continue
+        virality, hook_s, flow_s, value_s, parts = _score_offline_window(
+            win_words, prev_content, e - s)
+        prev_content = _content_words(win_words)
+        scored.append((virality, s, e, win_words, hook_s, flow_s,
+                       value_s, parts))
+
+    # non-max suppression: keep best-first, drop heavy overlaps
+    scored.sort(key=lambda x: x[0], reverse=True)
+    picked = []
+    for item in scored:
+        _, s, e, *_rest = item
+        overlap = False
+        for ps, pe in [(p[1], p[2]) for p in picked]:
+            inter = max(0.0, min(e, pe) - max(s, ps))
+            if inter > 0.3 * min(e - s, pe - ps):
+                overlap = True
+                break
+        if not overlap:
+            picked.append(item)
+        if len(picked) >= max_clips:
+            break
+
+    moments = []
+    for (virality, s, e, win_words, hook_s, flow_s, value_s,
+            parts) in picked:
+        title, hook = _extract_title_hook(win_words)
+        moments.append({
+            "start": round(s, 2),
+            "end": round(e, 2),
+            "title": title,
+            "hook": hook,
+            "virality": virality,
+            "hook_score": hook_s,
+            "flow_score": flow_s,
+            "value_score": value_s,
+            "reason": "Heuristic (offline): " + parts,
+            "offline": True,
+        })
+    moments.sort(key=lambda m: m["virality"], reverse=True)
+    return moments
+
+
+# ---------------------------------------------------------------------------
 # ASS caption builder (karaoke word highlight + hook overlay)
 # ---------------------------------------------------------------------------
 
