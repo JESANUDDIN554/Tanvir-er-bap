@@ -1,7 +1,7 @@
 /* ClipMaker PC v2 — premium dark theme. Original design. */
 :root {
-  --accent: #2EFFC8;
-  --accent-dark: #12B981;
+  --accent: #00E5FF;
+  --accent-dark: #0090B3;
   --accent-dim: rgba(var(--accent-rgb), 0.10);
   --accent-glow: rgba(var(--accent-rgb), 0.22);
   --bg: #0A0E13;
@@ -13,7 +13,7 @@
   --text: #F1F5F9;
   --muted: #8B98A9;
   --muted2: #64748B;
-  --accent-rgb: 46, 255, 200;
+  --accent-rgb: 0, 229, 255;
   --accent2: #25E8B4;
   --accent-soft: #7DFFD9;
   --input: var(--input);
@@ -33,9 +33,9 @@
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 * { box-sizing: border-box; }
-html { -webkit-font-smoothing: antialiased; }
+html { -webkit-font-smoothing: antialiased; background: #0A0E13; }
 body {
-  margin: 0; background: radial-gradient(1200px 600px at 50% -10%, var(--body-hi) 0%, var(--bg) 55%) fixed, var(--bg);
+  margin: 0; min-height: 100vh; background: radial-gradient(1200px 600px at 50% -10%, var(--body-hi) 0%, var(--bg) 55%) fixed, var(--bg);
   color: var(--text); font-family: var(--font); font-size: 14.5px; line-height: 1.55;
 }
 
