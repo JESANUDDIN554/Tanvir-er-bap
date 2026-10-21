@@ -186,6 +186,7 @@ DEFAULT_SETTINGS = {
     "safe_zone": False,            # Reels-safe caption nudge + filename tag
     "punch_zoom": True,            # subtle zoom-punch + slow drift
     "enhance_clarity": False,      # sharpen + denoise ("enhance", not "AI upscale")
+    "quality_tier": "maximum",     # encode tier: maximum/balanced/fast
     "logo_path": "",               # brand-kit corner logo PNG
     "brand_kits": [],              # [{name, caption_style, primary, secondary,
                                    #   outline, logo_path, intro_path, outro_path}]
@@ -787,7 +788,7 @@ class Api:
                                     "emojis", "highlight", "speaker_colors",
                                     "hook_overlay", "cta_text", "safe_zone",
                                     "punch_zoom", "enhance_clarity",
-                                    "logo_path")}
+                                    "logo_path", "quality_tier")}
         job["status"] = "working"
         job.pop("render_error", None)  # don't ship a stale failure
         t = threading.Thread(
@@ -844,7 +845,9 @@ class Api:
                             punch_zoom=bool(opts.get("punch_zoom")),
                             enhance_clarity=bool(
                                 opts.get("enhance_clarity")),
-                            logo_path=opts.get("logo_path"))
+                            logo_path=opts.get("logo_path"),
+                            quality_tier=opts.get("quality_tier",
+                                                  "maximum"))
                 renders.append({"path": out, "title": m["title"],
                                 "virality": m["virality"],
                                 "moment_index": i,
