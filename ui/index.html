@@ -166,6 +166,15 @@
     </div>
 
     <div class="field">
+      <label class="field-label">Render quality <span class="hint">— how hard the encoder works; Maximum is sharpest</span></label>
+      <div class="quality-picker trio" id="encodePicker">
+        <button type="button" class="quality-card on" data-value="maximum"><span class="quality-name">Maximum</span><span class="quality-sub">Best picture · slower</span></button>
+        <button type="button" class="quality-card" data-value="balanced"><span class="quality-name">Balanced</span><span class="quality-sub">Great picture · normal</span></button>
+        <button type="button" class="quality-card" data-value="fast"><span class="quality-name">Fast</span><span class="quality-sub">Good picture · quickest</span></button>
+      </div>
+    </div>
+
+    <div class="field">
       <label class="field-label">Clip length</label>
       <div class="segmented wrap" id="clipLenPills">
         <button type="button" data-value="15s" class="seg">15s</button>
