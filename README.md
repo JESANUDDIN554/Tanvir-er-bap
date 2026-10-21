@@ -1,4 +1,4 @@
-# ClipMaker PC
+# Itraji Cliper
 
 A real desktop app for Windows: paste a video link, get viral-ready clips
 with burned-in word-highlight captions — all rendered on your own PC.
