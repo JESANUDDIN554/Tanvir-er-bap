@@ -1,4 +1,4 @@
-/* ClipMaker PC v3 - full Clip Maker web-app parity UI.
+/* Itraji Cliper - full Clip Maker web-app parity UI.
    Talks to the Python backend over HTTP (localhost server). */
 let jobId = null;
 let pollTimer = null;
@@ -404,8 +404,9 @@ function initControls() {
   $("ctaTextInput").value = settings.cta_text || "Follow for more 🔔";
   $("brandLogoInput").value = settings.logo_path || "";
   populateBrandKits();
-  segSet("qualitySeg", settings.quality || "1080p");
-  quality = segGet("qualitySeg");
+  quality = settings.quality || "1080p";
+  document.querySelectorAll("#qualityPicker .quality-card").forEach((c) =>
+    c.classList.toggle("on", c.dataset.value === quality));
 }
 
 function syncDetectModeSub(mode) {
@@ -446,10 +447,11 @@ $("customLenInput").addEventListener("input", () => {
   if ($("customLenInput").value.trim())
     document.querySelectorAll("#clipLenPills .seg").forEach((p) => p.classList.remove("on"));
 });
-document.querySelectorAll("#qualitySeg .seg").forEach((b) =>
-  b.addEventListener("click", () => {
-    segSet("qualitySeg", b.dataset.value);
-    quality = b.dataset.value;
+document.querySelectorAll("#qualityPicker .quality-card").forEach((c) =>
+  c.addEventListener("click", () => {
+    document.querySelectorAll("#qualityPicker .quality-card").forEach((x) => x.classList.remove("on"));
+    c.classList.add("on");
+    quality = c.dataset.value;
   }));
 
 /* genre templates apply their defaults to the controls */
@@ -1092,6 +1094,98 @@ $("newVideoBtn").addEventListener("click", () => {
   refreshQueue();
 });
 
+/* ---------------- library ---------------- */
+let libraryOpen = false;
+
+function libStatusText(j) {
+  if (j.clips > 0) return `Done - ${j.clips} clip${j.clips > 1 ? "s" : ""} rendered`;
+  if (j.moments > 0) return `${j.moments} moment${j.moments > 1 ? "s" : ""} found`;
+  return "Transcript ready";
+}
+
+async function refreshLibrary() {
+  let res;
+  try { res = await api.library(); } catch (e) { return; }
+  const projects = res.projects || [];
+  const grid = $("libraryGrid");
+  grid.innerHTML = "";
+  if (!projects.length) { show($("libraryEmpty")); return; }
+  hide($("libraryEmpty"));
+  projects.forEach((j) => {
+    const card = document.createElement("div");
+    card.className = "lib-card";
+    const date = j.created
+      ? new Date(j.created * 1000).toLocaleDateString(undefined,
+          { month: "short", day: "numeric", year: "numeric" })
+      : "";
+    card.innerHTML = `
+      <div class="lib-thumb">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="3"/><path d="M10 9l5 3-5 3z" fill="currentColor" stroke="none"/></svg>
+        <img src="/files/${j.job_id}/thumb.jpg" alt="" onerror="this.remove()">
+      </div>
+      <div class="lib-body">
+        <div class="lib-title" title="${escapeHtml(j.title || "Video")}">${escapeHtml(j.title || "Video")}</div>
+        <div class="lib-meta">${fmtTime(j.duration)}${date ? " · " + date : ""}</div>
+        <div class="lib-status"><span class="job-dot ${j.status}"></span><span>${escapeHtml(libStatusText(j))}</span></div>
+        <div class="lib-actions">
+          <button class="primary small lib-open">Open</button>
+          <button class="ghost-btn small lib-del">Delete</button>
+        </div>
+      </div>`;
+    card.querySelector(".lib-open").addEventListener("click",
+      () => openProject(j.job_id));
+    const del = card.querySelector(".lib-del");
+    del.addEventListener("click", async () => {
+      if (!del.dataset.armed) {
+        del.dataset.armed = "1";
+        del.textContent = "Sure?";
+        setTimeout(() => {
+          delete del.dataset.armed;
+          del.textContent = "Delete";
+        }, 2600);
+        return;
+      }
+      const res2 = await api.delete_job(j.job_id);
+      if (res2.ok) {
+        if (jobId === j.job_id) jobId = null;
+        toast("Deleted from Library");
+        refreshLibrary();
+        refreshQueue();
+      } else {
+        toast(res2.error || "Delete failed", true);
+      }
+    });
+    grid.appendChild(card);
+  });
+}
+
+function showLibrary() {
+  libraryOpen = true;
+  stopPoll();
+  hide($("step1")); hide($("step2")); hide($("step3"));
+  show($("libraryView"));
+  refreshLibrary();
+}
+
+function hideLibrary() {
+  libraryOpen = false;
+  hide($("libraryView"));
+  show($("step1"));
+  if (jobId) { startPoll(); poll(); }
+  else { setStep(1); refreshQueue(); }
+}
+
+function openProject(id) {
+  hide($("libraryView"));
+  libraryOpen = false;
+  show($("step1"));
+  if (id === jobId) { startPoll(); poll(); return; }
+  selectJob(id);
+}
+
+$("libraryBtn").addEventListener("click", showLibrary);
+$("libBackBtn").addEventListener("click", hideLibrary);
+
 /* ---------------- settings ---------------- */
 function openSettings() { show($("settingsModal")); }
 $("settingsBtn").addEventListener("click", async () => {
@@ -1200,6 +1294,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   applyTheme();
   setTimeout(() => {
     const sp = document.getElementById("splash");
-    if (sp) { sp.classList.add("gone"); setTimeout(() => sp.remove(), 600); }
-  }, 900);
+    if (sp) { sp.classList.add("gone"); setTimeout(() => sp.remove(), 750); }
+  }, 1550);
 });
