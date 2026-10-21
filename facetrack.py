@@ -1,4 +1,4 @@
-"""ClipMaker PC - face-tracked 9:16 reframe.
+"""Itraji Cliper - face-tracked 9:16 reframe.
 
 Uses YuNet (OpenCV DNN, bundled ONNX model - no download needed) to find
 faces in sampled frames, then builds a smoothed crop trajectory so the
