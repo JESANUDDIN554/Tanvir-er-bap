@@ -1,4 +1,4 @@
-"""ClipMaker PC - local video processing pipeline.
+"""Itraji Cliper - local video processing pipeline.
 
 Stages: yt-dlp download -> faster-whisper transcription ->
 Gemini (free API key) viral-moment detection -> ffmpeg 9:16 render
@@ -1353,8 +1353,8 @@ def write_xml_timeline(clips, out_path, fps=30):
                       src="file://" + str(c["path"]).replace("\\", "/"))
     total = sum(c["duration"] for c in clips) or 1
     library = ET.SubElement(fcpxml, "library")
-    event = ET.SubElement(library, "event", name="ClipMaker PC")
-    project = ET.SubElement(event, "project", name="ClipMaker PC Timeline")
+    event = ET.SubElement(library, "event", name="Itraji Cliper")
+    project = ET.SubElement(event, "project", name="Itraji Cliper Timeline")
     seq = ET.SubElement(project, "sequence", format="f1",
                         duration=stamp(total), tcStart="0s", tcFormat="NDF",
                         audioLayout="stereo", audioRate="48k")
