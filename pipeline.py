@@ -28,17 +28,36 @@ if os.name == "nt":
     _sp_run = subprocess.run
     _sp_popen = subprocess.Popen
 
+    def _force_no_window(kwargs):
+        # OR the flag in - never just a default. A caller (or a library
+        # like yt-dlp) that passes its OWN creationflags must not be able
+        # to lose the no-window bit, or a console flashes on Windows.
+        kwargs["creationflags"] = \
+            int(kwargs.get("creationflags") or 0) | _CREATE_NO_WINDOW
+
     def _run_no_window(*args, **kwargs):
-        kwargs.setdefault("creationflags", _CREATE_NO_WINDOW)
+        _force_no_window(kwargs)
         return _sp_run(*args, **kwargs)
 
     class _PopenNoWindow(_sp_popen):
         def __init__(self, *args, **kwargs):
-            kwargs.setdefault("creationflags", _CREATE_NO_WINDOW)
+            _force_no_window(kwargs)
             super().__init__(*args, **kwargs)
 
     subprocess.run = _run_no_window
     subprocess.Popen = _PopenNoWindow
+
+
+# ---------------------------------------------------------------------------
+# Encode quality tiers (Step 2 "Render quality"). The user's standing
+# preference is maximum picture quality over render speed, so "maximum"
+# is the default everywhere.
+# ---------------------------------------------------------------------------
+_ENCODE_TIERS = {
+    "maximum": ("slow", "16"),
+    "balanced": ("medium", "20"),
+    "fast": ("veryfast", "23"),
+}
 
 # ---------------------------------------------------------------------------
 # yt-dlp download (with YouTube bot-check retry chain)
@@ -73,7 +92,7 @@ def _download_once(url, out_dir, progress_cb, extra_opts, attempt_label):
                         + (f" [{attempt_label}]" if attempt_label else ""))
 
     opts = {
-        "format": "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b[height<=720]/b",
+        "format": "bv*[height<=2160][ext=mp4]+ba[ext=m4a]/b[height<=2160][ext=mp4]/b[height<=2160]/b",
         "outtmpl": out_tmpl,
         "merge_output_format": "mp4",
         "quiet": True,
@@ -1293,7 +1312,7 @@ def apply_censor_beep(clip_path, ranges, out_path, freq=1000):
           "dropout_transition=0[aout]")
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", clip_path,
            "-filter_complex", fc, "-map", "0:v", "-map", "[aout]",
-           "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+           "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
            "-movflags", "+faststart", out_path]
     r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                        stderr=subprocess.PIPE, text=True)
@@ -1525,8 +1544,8 @@ def _merge_xfade(paths, out_path, d=0.5):
         cmd += ["-i", p]
     cmd += ["-filter_complex", expr,
             "-map", f"[{last_v}]", "-map", f"[{last_a}]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+            "-c:v", "libx264", "-preset", "slow", "-crf", "17",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", out_path]
     r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                        stderr=subprocess.PIPE, text=True)
@@ -1642,7 +1661,7 @@ def _kept_audio_filter(start, end, removed):
 
 def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
                     W, H, ratio, out_path, progress_cb=None,
-                    punch_zoom=False):
+                    punch_zoom=False, enc_preset="slow", enc_crf="16"):
     """Face-tracked render: per-frame crop follows the smoothed face
     trajectory (or stays centered), frames piped to ffmpeg."""
     try:
@@ -1692,7 +1711,7 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
     afilter, alabel = _kept_audio_filter(start, end, removed)
     acmd = ["ffmpeg", "-y", "-v", "error", "-i", video_path,
             "-filter_complex", afilter, "-map", alabel,
-            "-c:a", "aac", "-b:a", "128k", audio_tmp]
+            "-c:a", "aac", "-b:a", "192k", audio_tmp]
     r_ = subprocess.run(acmd, stdout=subprocess.DEVNULL,
                         stderr=subprocess.PIPE, text=True)
     if r_.returncode != 0 or not os.path.exists(audio_tmp):
@@ -1713,8 +1732,8 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
            "-i", "pipe:0",
            "-i", audio_tmp,
            "-vf", ",".join(vf_parts),
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-           "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+           "-c:v", "libx264", "-preset", enc_preset, "-crf", enc_crf,
+           "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
            "-movflags", "+faststart", "-shortest", out_path]
     proc = subprocess.Popen(enc, stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL,
@@ -1741,8 +1760,13 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
                       else center_left)
             x_left = int(max(0, min(src_w - crop_w, x_left)))
             crop = frame[y_top:y_top + crop_h, x_left:x_left + crop_w]
-            small = cv2.resize(crop, (W, H),
-                               interpolation=cv2.INTER_AREA)
+            # INTER_AREA smears when ENLARGING (the usual case: the
+            # crop is smaller than the 1080x1920 output); Lanczos is the
+            # sharp choice for upscale, AREA stays best for downscale.
+            _interp = (cv2.INTER_LANCZOS4
+                       if crop.shape[1] < W or crop.shape[0] < H
+                       else cv2.INTER_AREA)
+            small = cv2.resize(crop, (W, H), interpolation=_interp)
             try:
                 proc.stdin.write(small.tobytes())
             except BrokenPipeError:
@@ -1771,7 +1795,8 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
 
 def _render_plain(video_path, start, end, keep_segs, ass_path,
                   W, H, ratio, out_path, progress_cb=None,
-                  punch_zoom=False, enhance_clarity=False):
+                  punch_zoom=False, enhance_clarity=False,
+                  enc_preset="slow", enc_crf="16"):
     """ffmpeg-only render: crop/scale/captions, optional silence/filler
     cuts via filter_complex segment concat.
 
@@ -1781,7 +1806,7 @@ def _render_plain(video_path, start, end, keep_segs, ass_path,
         upscale; honest naming is deliberate).
     """
     crop = crop_filter(ratio)
-    vf = [crop, f"scale={W}:{H}"]
+    vf = [crop, f"scale={W}:{H}:flags=lanczos"]
     if punch_zoom:
         # zoompan d=1 keeps a 1:1 frame mapping; fps is pinned to the
         # source fps so A/V stays in sync.
@@ -1805,9 +1830,9 @@ def _render_plain(video_path, start, end, keep_segs, ass_path,
                "-ss", str(start), "-to", str(end),
                "-i", video_path,
                "-vf", vf_tail,
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+               "-c:v", "libx264", "-preset", enc_preset, "-crf", enc_crf,
                "-pix_fmt", "yuv420p",
-               "-c:a", "aac", "-b:a", "128k",
+               "-c:a", "aac", "-b:a", "192k",
                "-movflags", "+faststart", out_path]
     else:
         vparts, aparts, vl, al = [], [], [], []
@@ -1826,9 +1851,9 @@ def _render_plain(video_path, start, end, keep_segs, ass_path,
         cmd = ["ffmpeg", "-y", "-v", "error", "-i", video_path,
                "-filter_complex", fc,
                "-map", "[vout]", "-map", "[aout]",
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+               "-c:v", "libx264", "-preset", enc_preset, "-crf", enc_crf,
                "-pix_fmt", "yuv420p",
-               "-c:a", "aac", "-b:a", "128k",
+               "-c:a", "aac", "-b:a", "192k",
                "-movflags", "+faststart", out_path]
     if progress_cb:
         progress_cb(5, "Rendering clip")
@@ -1854,7 +1879,7 @@ def _overlay_logo(clip_path, logo_path):
           f"[0:v][logo]overlay=28:28:format=auto[vout]")
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", clip_path, "-i", logo_path,
            "-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+           "-c:v", "libx264", "-preset", "slow", "-crf", "17",
            "-pix_fmt", "yuv420p", "-c:a", "copy",
            "-movflags", "+faststart", "-shortest", tmp]
     r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
@@ -1876,7 +1901,7 @@ def render_clip(video_path, moment, words, style_name, out_path,
                 custom_styles=None, edited_words=None,
                 speaker_colors=None, hook_overlay=True, cta_text=None,
                 safe_zone=False, punch_zoom=False, enhance_clarity=False,
-                logo_path=None):
+                logo_path=None, quality_tier="maximum"):
     """Cut + reframe + burned captions + hook. Returns out_path.
 
     face_track=True -> per-frame face-following crop (OpenCV pipe).
@@ -1898,6 +1923,8 @@ def render_clip(video_path, moment, words, style_name, out_path,
     """
     start, end = float(moment["start"]), float(moment["end"])
     W, H = ratio_dims(ratio, quality)
+    enc_preset, enc_crf = _ENCODE_TIERS.get(
+        quality_tier, _ENCODE_TIERS["maximum"])
     if custom_styles:
         set_custom_styles(custom_styles)
 
@@ -1953,12 +1980,14 @@ def render_clip(video_path, moment, words, style_name, out_path,
         if face_track:
             _render_tracked(video_path, start, end, keep_segs, removed,
                             ass_path, W, H, ratio, out_path, progress_cb,
-                            punch_zoom=punch_zoom)
+                            punch_zoom=punch_zoom,
+                            enc_preset=enc_preset, enc_crf=enc_crf)
         else:
             _render_plain(video_path, start, end, keep_segs, ass_path,
                           W, H, ratio, out_path, progress_cb,
                           punch_zoom=punch_zoom,
-                          enhance_clarity=enhance_clarity)
+                          enhance_clarity=enhance_clarity,
+                          enc_preset=enc_preset, enc_crf=enc_crf)
     finally:
         try:
             os.remove(ass_path)
