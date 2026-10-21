@@ -1,4 +1,4 @@
-"""ClipMaker PC - desktop entry point.
+"""Itraji Cliper - desktop entry point.
 
 Runs a localhost HTTP server for the local UI and opens it in a
 desktop-style Chrome/Edge app window. Zero native dependencies
@@ -59,6 +59,8 @@ def _prune_jobs():
     for jid, job in list(JOBS.items()):
         if job.get("status") == "working":
             continue  # never prune a job with a live thread
+        if _is_library_job(jid):
+            continue  # saved in the Library - the user deletes it, not us
         if now - job.get("created", now) > JOB_TTL_S:
             _drop_job(jid)
     if len(JOBS) > JOB_HARD_CAP:
@@ -69,7 +71,93 @@ def _prune_jobs():
                 break
             if job.get("status") == "working":
                 continue
+            if _is_library_job(jid):
+                continue
             _drop_job(jid)
+
+
+# -- Library persistence -------------------------------------------------
+# Jobs used to live only in memory: restart the app (or hit the 6h
+# prune) and every imported video vanished. Now any job that reaches a
+# stable state is written to work/<job_id>/job.json and reloaded on
+# startup, so the Library keeps projects until the user deletes them.
+_LIBRARY_STATUSES = ("transcribed", "moments", "done")
+_LIBRARY_LOADED = False
+
+
+def _is_library_job(job_id):
+    return os.path.isfile(
+        os.path.join(BASE_DIR, "work", job_id, "job.json"))
+
+
+def _save_job(job_id):
+    """Persist a job's durable state to work/<job_id>/job.json."""
+    job = JOBS.get(job_id)
+    if not job or job.get("status") not in _LIBRARY_STATUSES:
+        return
+    try:
+        data = {k: job.get(k) for k in (
+            "title", "source", "video_path", "duration", "words",
+            "moments", "renders", "status", "stage", "language",
+            "created")}
+        folder = os.path.join(BASE_DIR, "work", job_id)
+        os.makedirs(folder, exist_ok=True)
+        tmp = os.path.join(folder, "job.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, os.path.join(folder, "job.json"))
+    except Exception:  # noqa: BLE001 - persistence is best-effort
+        pass
+
+
+def _load_library():
+    """Reload saved jobs from disk into JOBS (once per process)."""
+    global _LIBRARY_LOADED
+    if _LIBRARY_LOADED:
+        return
+    _LIBRARY_LOADED = True
+    work = os.path.join(BASE_DIR, "work")
+    try:
+        names = os.listdir(work)
+    except OSError:
+        return
+    for name in names:
+        if name in JOBS:
+            continue
+        meta = os.path.join(work, name, "job.json")
+        if not os.path.isfile(meta):
+            continue
+        try:
+            with open(meta, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:  # noqa: BLE001 - skip corrupt entries
+            continue
+        video_path = data.get("video_path") or ""
+        if not video_path or not os.path.isfile(video_path):
+            continue
+        renders = [r for r in data.get("renders", [])
+                   if os.path.isfile(r.get("path", ""))]
+        moments = data.get("moments", [])
+        words = data.get("words", [])
+        if renders:
+            status = "done"
+            stage = f"Done - {len(renders)} clips rendered"
+        elif moments:
+            status = "moments"
+            stage = data.get("stage") or "Moments ready"
+        elif words:
+            status, stage = "transcribed", "Transcript ready"
+        else:
+            continue
+        JOBS[name] = {
+            "stage": stage, "progress": 100, "status": status, "error": "",
+            "video_path": video_path,
+            "title": data.get("title", ""),
+            "duration": data.get("duration", 0),
+            "words": words, "moments": moments, "renders": renders,
+            "language": data.get("language", "auto"),
+            "source": data.get("source", "url"),
+            "created": data.get("created", 0) or os.path.getmtime(meta)}
 
 DEFAULT_SETTINGS = {
     "api_key": "",
@@ -258,12 +346,48 @@ class Api:
                 "total": b["total"], "job_ids": b["job_ids"]}
 
     def list_jobs(self):
+        _load_library()
         return {"jobs": [
             {"job_id": jid, "title": j.get("title", ""),
              "status": j.get("status", ""), "stage": j.get("stage", ""),
              "progress": j.get("progress", 0),
-             "duration": j.get("duration", 0)}
+             "duration": j.get("duration", 0),
+             "clips": len(j.get("renders", [])),
+             "created": j.get("created", 0)}
             for jid, j in JOBS.items()]}
+
+    def library(self):
+        """All saved projects - persisted on disk, survive restarts."""
+        _load_library()
+        projects = []
+        for jid, j in JOBS.items():
+            if j.get("status") not in _LIBRARY_STATUSES:
+                continue
+            projects.append({
+                "job_id": jid, "title": j.get("title", ""),
+                "status": j.get("status", ""), "stage": j.get("stage", ""),
+                "duration": j.get("duration", 0),
+                "created": j.get("created", 0),
+                "source": j.get("source", ""),
+                "clips": len(j.get("renders", [])),
+                "moments": len(j.get("moments", []))})
+        projects.sort(key=lambda p: p.get("created", 0), reverse=True)
+        return {"projects": projects}
+
+    def delete_job(self, job_id):
+        """Delete a saved project and its files (Library action)."""
+        job = JOBS.get(job_id)
+        if job and job.get("status") == "working":
+            return {"ok": False,
+                    "error": "That video is still busy - wait for it "
+                             "to finish first."}
+        folder = os.path.join(BASE_DIR, "work", job_id)
+        if job is None and not os.path.isdir(folder):
+            return {"ok": False, "error": "Project not found."}
+        _drop_job(job_id)  # pops JOBS + removes the folder when loaded
+        import shutil
+        shutil.rmtree(folder, ignore_errors=True)
+        return {"ok": True}
 
     def _run_import(self, job_id, url, use_cookies, language):
         job = JOBS[job_id]
@@ -292,6 +416,7 @@ class Api:
             job["status"] = "transcribed"
             job["stage"] = "Transcript ready"
             job["progress"] = 100
+            _save_job(job_id)
         except Exception as e:  # noqa: BLE001 - surfaced to UI
             job["status"] = "error"
             job["error"] = self._friendly_error(e)
@@ -318,6 +443,7 @@ class Api:
         job["status"] = "transcribed"
         job["stage"] = f"Transcript ready ({len(words)} words from SRT)"
         job["progress"] = 100
+        _save_job(job_id)
         return {"ok": True, "word_count": len(words)}
 
     def get_thumbnail(self, job_id):
@@ -413,6 +539,7 @@ class Api:
             job["stage"] = f"Found {len(moments)} moments"
             job["progress"] = 100
             job.pop("detect_error", None)
+            _save_job(job_id)
         except Exception as e:  # noqa: BLE001
             # back to transcript state - unless keyword moments from
             # find_moments are still present, then stay on moments
@@ -463,6 +590,7 @@ class Api:
             job["stage"] = f"Found {len(moments)} moments (offline)"
             job["progress"] = 100
             job.pop("detect_error", None)
+            _save_job(job_id)
         except Exception as e:  # noqa: BLE001
             # back to transcript state - unless keyword moments from
             # find_moments are still present, then stay on moments
@@ -505,6 +633,7 @@ class Api:
             return {"ok": False, "error": "Caption text is empty."}
         m["edited_words"] = edited
         m["caption_edited"] = True
+        _save_job(job_id)
         return {"ok": True, "word_count": len(edited)}
 
     def reset_caption_words(self, job_id, index):
@@ -514,6 +643,7 @@ class Api:
         m = job["moments"][index]
         m.pop("edited_words", None)
         m.pop("caption_edited", None)
+        _save_job(job_id)
         return {"ok": True}
 
     # -- AI posting package --------------------------------------------
@@ -540,6 +670,7 @@ class Api:
         pkg = generate_posting_package(
             words, m, genre=settings.get("genre", ""), api_key=api_key)
         m["posting"] = pkg
+        _save_job(job_id)
         return {"ok": True, "package": pkg, "cached": False}
 
     # -- per-clip trim -------------------------------------------------
@@ -565,6 +696,7 @@ class Api:
         # drop edited captions - timings no longer line up after a trim
         m.pop("edited_words", None)
         m.pop("caption_edited", None)
+        _save_job(job_id)
         return {"ok": True, "start": m["start"], "end": m["end"]}
 
     # -- find clip moment (keyword search) -------------------------------
@@ -594,6 +726,7 @@ class Api:
                 # the appended moments are still visible via job_status
                 job["status"] = "moments"
             job["stage"] = f"Found {len(job['moments'])} moments"
+            _save_job(job_id)
         return {"ok": True, "found": len(fresh), "unmatched": unmatched}
 
     # -- render ----------------------------------------------------------
@@ -728,6 +861,7 @@ class Api:
             job["stage"] = "Render failed"
             # keep any clips that finished before the failure
             job["renders"] = renders
+        _save_job(job_id)
 
     # -- caption exports (SRT/VTT), ZIP, XML timeline, previews -----------
     def _render_words(self, job, render_idx):
@@ -1044,11 +1178,13 @@ class Api:
             "words": merged_words, "merged": True,
             "merged_duration": round(offset, 2),
             "url": f"/files/{job_id}/clips/{os.path.basename(out)}"})
+        _save_job(job_id)
         return {"ok": True, "path": out,
                 "url": self._download_url(job_id, out)}
 
     # -- status ----------------------------------------------------------
     def job_status(self, job_id):
+        _load_library()
         job = JOBS.get(job_id)
         if not job:
             return {"status": "missing"}
@@ -1496,7 +1632,7 @@ def main():
         api = Api()
         port = _free_port()
         url = "http://127.0.0.1:%d/" % port
-        print("ClipMaker PC running at " + url, flush=True)
+        print("Itraji Cliper running at " + url, flush=True)
 
         server_thread = threading.Thread(
             target=serve,
