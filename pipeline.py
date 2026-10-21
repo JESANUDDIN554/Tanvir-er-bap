@@ -974,9 +974,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def _ffmpeg_ass_path(path):
-    # escape for the subtitles filter on Windows and Linux
+    # Escape for the subtitles filter. ffmpeg parses the -vf string TWICE:
+    # first the filtergraph pass, then the subtitles filter's own option
+    # parser, which splits options on ':'. A single '\:' is eaten by the
+    # first pass, so on Windows the drive colon (C:) splits the path and
+    # the remainder lands in the next option slot (original_size) - the
+    # "Unable to parse original_size" render failure. Escape each special
+    # char for BOTH passes so the option parser still sees '\:' etc.
     p = path.replace("\\", "/")
-    return p.replace(":", "\\:").replace("'", "\\'").replace(",", "\\,")
+    for ch in (":", "'", ",", "[", "]", ";"):
+        p = p.replace(ch, "\\\\\\" + ch)
+    return p
 
 
 # ---------------------------------------------------------------------------
