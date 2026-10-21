@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ClipMaker PC</title>
+<title>Itraji Cliper</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -11,11 +11,15 @@
 <!-- Splash -->
 <div id="splash">
   <div class="splash-inner">
-    <svg class="splash-logo" viewBox="0 0 64 64" width="72" height="72" aria-hidden="true">
-      <rect x="4" y="4" width="56" height="56" rx="16" fill="#C8FF2E"/>
-      <text x="32" y="43" text-anchor="middle" font-size="30" font-weight="900" fill="#000000" font-family="system-ui, sans-serif">▶</text>
-    </svg>
-    <div class="splash-name">ClipMaker <span>PC</span></div>
+    <div class="splash-logo-wrap">
+      <span class="splash-ring"></span>
+      <svg class="splash-logo" viewBox="0 0 64 64" width="76" height="76" aria-hidden="true">
+        <rect x="4" y="4" width="56" height="56" rx="16" fill="#C8FF2E"/>
+        <text x="32" y="43" text-anchor="middle" font-size="30" font-weight="900" fill="#000000" font-family="system-ui, sans-serif">▶</text>
+      </svg>
+    </div>
+    <div class="splash-name">Itraji <span>Cliper</span></div>
+    <div class="splash-tag">Turn long videos into viral clips</div>
     <div class="splash-bar"><div class="splash-fill"></div></div>
   </div>
 </div>
@@ -27,7 +31,7 @@
       <text x="32" y="43" text-anchor="middle" font-size="30" font-weight="900" fill="#000000" font-family="system-ui, sans-serif">▶</text>
     </svg>
     <div class="brand-text">
-      <div class="brand-name">ClipMaker <span class="brand-pc">PC</span></div>
+      <div class="brand-name">Itraji <span class="brand-pc">Cliper</span></div>
       <div class="brand-ver">v2.0</div>
     </div>
   </div>
@@ -38,6 +42,10 @@
     <div class="step-line"></div>
     <div class="step-dot" data-step="3"><span class="dot-num">3</span><span class="dot-label">Clips</span></div>
   </div>
+  <button id="libraryBtn" class="ghost-btn icon-btn" title="Library — your saved videos">
+    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+    <span>Library</span>
+  </button>
   <button id="settingsBtn" class="ghost-btn icon-btn" title="Settings">
     <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     <span>Settings</span>
@@ -150,6 +158,14 @@
     </div>
 
     <div class="field">
+      <label class="field-label">Resolution <span class="hint">— 1080p is sharpest, 720p renders faster</span></label>
+      <div class="quality-picker" id="qualityPicker">
+        <button type="button" class="quality-card" data-value="720p"><span class="quality-name">720p</span><span class="quality-sub">HD · faster render</span></button>
+        <button type="button" class="quality-card on" data-value="1080p"><span class="quality-name">1080p</span><span class="quality-sub">Full HD · best quality</span></button>
+      </div>
+    </div>
+
+    <div class="field">
       <label class="field-label">Clip length</label>
       <div class="segmented wrap" id="clipLenPills">
         <button type="button" data-value="15s" class="seg">15s</button>
@@ -237,13 +253,6 @@
     <details class="more-options">
       <summary>▸ More options</summary>
       <div class="field">
-        <label class="field-label">Quality</label>
-        <div class="segmented" id="qualitySeg">
-          <button type="button" data-value="720p" class="seg">720p</button>
-          <button type="button" data-value="1080p" class="seg on">1080p</button>
-        </div>
-      </div>
-      <div class="field">
         <label class="field-label">Speaker colors <span class="hint">— used when “Speaker color captions” is on</span></label>
         <div class="row row-tight">
           <label class="color-pick" title="Speaker 1 color">Speaker 1 <input type="color" id="speakerColor1" value="#ffd166"></label>
@@ -328,6 +337,22 @@
       <button id="openFolderBtn" class="ghost-btn">Open clips folder</button>
       <button id="newVideoBtn" class="ghost-btn">New video</button>
     </div>
+  </section>
+
+  <!-- ============ LIBRARY ============ -->
+  <section id="libraryView" class="card step-card hidden">
+    <div class="card-kicker">Library</div>
+    <div class="row-between">
+      <h2>Your saved videos</h2>
+      <button id="libBackBtn" class="ghost-btn">← Back to studio</button>
+    </div>
+    <p class="sub">Every video you import is saved here on your PC — reopen one anytime to find more moments or render more clips, even after restarting the app.</p>
+    <div id="libraryEmpty" class="empty-state hidden">
+      <svg viewBox="0 0 64 64" width="56" height="56" fill="none" stroke="#C8FF2E" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 10h22a4 4 0 0 1 4 4v38l-8-5-8 5-8-5-6 4V14a4 4 0 0 1 4-4z"/></svg>
+      <div class="empty-title">No saved videos yet</div>
+      <div class="empty-sub">Import a video and it will live here permanently.</div>
+    </div>
+    <div id="libraryGrid" class="library-grid"></div>
   </section>
 </main>
 
