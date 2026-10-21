@@ -618,3 +618,7 @@ html[data-theme="light"] .vbar, html[data-theme="light"] .modal-box textarea {
   background: rgba(90,140,255,0.13); border-top: 2px dashed rgba(90,140,255,0.65); }
 .safe-zone-overlay span { position: absolute; top: 4px; left: 8px; font-size: 11px; font-weight: 700;
   color: rgba(255,255,255,0.9); text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
+
+/* Render quality picker: three-up variant of the resolution cards */
+.quality-picker.trio .quality-card { min-width: 150px; padding: 16px 12px; }
+.quality-picker.trio .quality-name { font-size: 19px; }
