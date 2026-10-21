@@ -1908,6 +1908,14 @@ def render_clip(video_path, moment, words, style_name, out_path,
     if not keep_segs:
         raise RuntimeError("silence/filler removal would delete the whole clip")
     cap_words = remap_words_to_kept(win_words, removed)
+    # Rebase onto the clip's 0-based output timeline. remap only strips
+    # removed filler/silence ranges - it keeps source-relative timestamps,
+    # but the rendered clip starts at t=0 and build_ass is called with the
+    # window [0, total_dur). Without this shift every word falls outside
+    # the window, the .ass gets zero caption events, and the render comes
+    # out fine but captionless for any moment past the video's start.
+    cap_words = [{**w, "start": w["start"] - start,
+                  "end": w["end"] - start} for w in cap_words]
     total_dur = kept_duration(start, end, removed)
 
     ass_fd, ass_path = tempfile.mkstemp(suffix=".ass", prefix="clip_")
