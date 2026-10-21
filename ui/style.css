@@ -1,21 +1,22 @@
 /* ClipMaker PC v2 — premium dark theme. Original design. */
 :root {
-  --accent: #00E5FF;
-  --accent-dark: #0090B3;
+  color-scheme: dark;
+  --accent: #C8FF2E;
+  --accent-dark: #9BC81E;
   --accent-dim: rgba(var(--accent-rgb), 0.10);
   --accent-glow: rgba(var(--accent-rgb), 0.22);
-  --bg: #0A0E13;
+  --bg: #0F0F13;
   --bg2: #0D1219;
   --surface: #121922;
   --surface2: #161E29;
   --border: rgba(255, 255, 255, 0.08);
   --border-strong: rgba(255, 255, 255, 0.14);
-  --text: #F1F5F9;
-  --muted: #8B98A9;
+  --text: #F4F4F0;
+  --muted: #9A9AA8;
   --muted2: #64748B;
-  --accent-rgb: 0, 229, 255;
-  --accent2: #25E8B4;
-  --accent-soft: #7DFFD9;
+  --accent-rgb: 200, 255, 46;
+  --accent2: #9BC81E;
+  --accent-soft: #E4FFB0;
   --input: var(--input);
   --hover: #1C2534;
   --track-off: #2A3442;
@@ -23,7 +24,7 @@
   --modal-from: #151C26;
   --modal-to: #10151D;
   --skel-mid: var(--skel-mid);
-  --topbar: var(--topbar);
+  --topbar: linear-gradient(180deg, #1A2A00 0%, #0F0F13 100%);
   --body-hi: var(--body-hi);
   --danger: #F87171;
   --danger-bg: rgba(248, 113, 113, 0.10);
@@ -33,7 +34,7 @@
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 * { box-sizing: border-box; }
-html { -webkit-font-smoothing: antialiased; background: #0A0E13; }
+html { -webkit-font-smoothing: antialiased; background: #0F0F13; }
 body {
   margin: 0; min-height: 100vh; background: radial-gradient(1200px 600px at 50% -10%, var(--body-hi) 0%, var(--bg) 55%) fixed, var(--bg);
   color: var(--text); font-family: var(--font); font-size: 14.5px; line-height: 1.55;
@@ -343,6 +344,7 @@ button.small { padding: 8px 14px; font-size: 13px; border-radius: 9px; }
   cursor: pointer;
 }
 .select:focus { outline: none; border-color: var(--accent); }
+.select option { background: var(--surface); color: var(--text); }
 .switch-row.inline { border-bottom: none; padding: 6px 0; flex: 1; min-width: 280px; }
 
 /* batch + job queue */
