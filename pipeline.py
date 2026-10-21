@@ -16,6 +16,31 @@ import tempfile
 import requests
 
 # ---------------------------------------------------------------------------
+# Windows: never let a child tool flash a console window. The app itself is
+# windowed (PyInstaller console=False), but ffmpeg / ffprobe / yt-dlp are
+# console programs - spawned from a windowed parent, Windows gives each one
+# its own black terminal window unless CREATE_NO_WINDOW is passed. Wrap
+# subprocess once, here, so EVERY call in the process (this module and
+# app.py, which imports it) renders and downloads fully in the background.
+# ---------------------------------------------------------------------------
+if os.name == "nt":
+    _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    _sp_run = subprocess.run
+    _sp_popen = subprocess.Popen
+
+    def _run_no_window(*args, **kwargs):
+        kwargs.setdefault("creationflags", _CREATE_NO_WINDOW)
+        return _sp_run(*args, **kwargs)
+
+    class _PopenNoWindow(_sp_popen):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("creationflags", _CREATE_NO_WINDOW)
+            super().__init__(*args, **kwargs)
+
+    subprocess.run = _run_no_window
+    subprocess.Popen = _PopenNoWindow
+
+# ---------------------------------------------------------------------------
 # yt-dlp download (with YouTube bot-check retry chain)
 # ---------------------------------------------------------------------------
 
