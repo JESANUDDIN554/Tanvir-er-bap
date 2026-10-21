@@ -1386,14 +1386,34 @@ def _find_chrome_or_edge():
     return None
 
 
-def _launch_window(url):
-    """Open the UI in a desktop-style window - at most ONE window/tab per
-    process.
+def _focus_existing_window():
+    """Bring the already-open app window to the front (Windows only).
 
-    Returns the browser Popen handle when we own the window process,
-    else None (fell back to a normal browser tab). If the --app launch
-    dies immediately, falls back to ONE normal tab. No retry loops:
-    a failed open is attempted exactly once, total.
+    A duplicate launch must NEVER open a second window or a browser tab -
+    the user asked for exactly one window. Best effort via the window
+    title; silently does nothing when the window can't be found.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.user32.FindWindowW(None, "Itraji Cliper")
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001 - focusing is a courtesy, never fatal
+        pass
+
+
+def _launch_window(url):
+    """Open the UI in a desktop-style window - exactly ONE window.
+
+    A successful Popen IS a successful launch: Chrome/Edge hand off to
+    their browser process so fast that the launcher can exit within
+    milliseconds while the window opens fine. (The old instant-death
+    check misread that handoff as a failure and ALSO opened a normal
+    browser tab - the "two windows" bug.) The plain-tab fallback now
+    runs only when no app window could be started at all.
     """
     exe = _find_chrome_or_edge()
     if exe:
@@ -1401,19 +1421,10 @@ def _launch_window(url):
                                ".clipmaker_pc_profile")
         os.makedirs(profile, exist_ok=True)
         try:
-            proc = subprocess.Popen(
+            return subprocess.Popen(
                 [exe, "--app=" + url, "--user-data-dir=" + profile,
                  "--no-first-run", "--no-default-browser-check"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # instant-death check (costs nothing: the window is already
-            # opening while we poll) - a dead launch falls back to one tab
-            deadline = time.time() + 0.5
-            while time.time() < deadline:
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.05)
-            else:
-                return proc
         except OSError:
             pass
     import webbrowser
@@ -1598,19 +1609,14 @@ def _wait_port_open(port, timeout=5.0):
 def main():
     from waitress import serve
 
-    # Single instance: a repeated launch never starts a second server.
-    # --app mode owner: exit silently (the desktop window is the UI).
-    # fallback-mode owner (plain browser tab): the server can outlive a
-    # closed tab, so a duplicate opens the existing instance's URL
-    # exactly ONCE, then exits. (This also fixes the "100 browser tabs"
-    # pile-up: every extra launch used to start its own server+window.)
-    owned, owner_mode = _acquire_single_instance()
+    # Single instance: a repeated launch never starts a second server and
+    # never opens anything - no second window, no browser tab, ever. It
+    # just brings the one existing window to the front and exits. (An
+    # earlier version opened the URL in a normal browser tab here, which
+    # is how a plain Chrome tab appeared next to the app window.)
+    owned, _owner_mode = _acquire_single_instance()
     if not owned:
-        if owner_mode != "app":
-            port = (_read_lockfile() or {}).get("port")
-            if port:
-                import webbrowser
-                webbrowser.open("http://127.0.0.1:%d/" % port)
+        _focus_existing_window()
         return
 
     # Die gracefully on SIGTERM (task manager / kill): turn it into a
@@ -1647,17 +1653,22 @@ def main():
         _wait_port_open(port)
 
         proc = _launch_window(url)
-        # record the window mode so a duplicate launch behaves right:
-        # silent exit in --app mode, open-the-URL-once in fallback mode
         _update_lockfile_mode("app" if proc is not None else "fallback")
         if proc is not None:
-            # When the user closes the app window, shut the server down too.
+            # When the user closes the app window, shut the server down
+            # too. But a browser launcher can hand off to its real
+            # process and exit within a second while the window lives
+            # on - if it exits that fast, keep serving instead of
+            # killing the server under the open window.
             try:
+                launched_at = time.time()
                 proc.wait()
+                if time.time() - launched_at > 3:
+                    return
             except KeyboardInterrupt:
-                pass
-            return
-        # Fallback (normal browser tab): keep serving until killed.
+                return
+        # Fallback lifetime (plain browser tab, or an app window whose
+        # launcher handed off): keep serving until killed.
         try:
             while True:
                 time.sleep(3600)
