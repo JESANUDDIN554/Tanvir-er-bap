@@ -11,6 +11,7 @@ on:
       - 'requirements.txt'
       - 'ClipMakerPC.spec'
       - 'ui/**'
+      - 'installer.iss'
       - '.github/workflows/build-exe.yml'
   workflow_dispatch:
 
@@ -63,12 +64,24 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path dist/ClipMakerPC -DestinationPath ClipMakerPC-win64.zip
 
+      - name: Build the one-file installer (Inno Setup)
+        if: success()
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = (Get-Command ISCC.exe).Source }
+          & $iscc installer.iss
+          Get-Item ItrajiCliper-Setup.exe | Select-Object Name, Length
+
       - name: Upload build artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ClipMakerPC-win64
-          path: ClipMakerPC-win64.zip
+          path: |
+            ClipMakerPC-win64.zip
+            ItrajiCliper-Setup.exe
 
       - name: Publish GitHub Release
         if: success()
@@ -77,11 +90,15 @@ jobs:
           tag_name: v2.0.0
           name: ClipMaker PC v2.0.0
           body: |
-            Standalone Windows build - unzip and double-click `ClipMakerPC\ClipMakerPC.exe`.
-            ffmpeg/ffprobe are bundled, no install needed. Paste your free Gemini API
-            key (aistudio.google.com) in Settings. Requires WebView2 (preinstalled on Windows 10/11).
-            First transcription downloads the Whisper model (~150MB, one time).
-          files: ClipMakerPC-win64.zip
+            Easiest: download `ItrajiCliper-Setup.exe`, run it, done - it installs
+            Itraji Cliper with Start Menu + desktop shortcuts (no admin, no unzip).
+            ffmpeg/ffprobe are bundled. The zip is the same build in portable form:
+            unzip and double-click `ClipMakerPC\ClipMakerPC.exe`.
+            First transcription downloads the Whisper model (~150MB, one time);
+            the built-in AI downloads its model on first use.
+          files: |
+            ItrajiCliper-Setup.exe
+            ClipMakerPC-win64.zip
 
       - name: File failure issue with log tail
         if: failure()
