@@ -22,6 +22,7 @@ let captionStyle = "bold-pop";
 let clipLen = "60s";
 let ratio = "9:16";
 let quality = "1080p";
+let encodeTier = "maximum";
 let clipCount = 8;
 let genre = "";
 
@@ -407,6 +408,9 @@ function initControls() {
   quality = settings.quality || "1080p";
   document.querySelectorAll("#qualityPicker .quality-card").forEach((c) =>
     c.classList.toggle("on", c.dataset.value === quality));
+  encodeTier = settings.quality_tier || "maximum";
+  document.querySelectorAll("#encodePicker .quality-card").forEach((c) =>
+    c.classList.toggle("on", c.dataset.value === encodeTier));
 }
 
 function syncDetectModeSub(mode) {
@@ -452,6 +456,14 @@ document.querySelectorAll("#qualityPicker .quality-card").forEach((c) =>
     document.querySelectorAll("#qualityPicker .quality-card").forEach((x) => x.classList.remove("on"));
     c.classList.add("on");
     quality = c.dataset.value;
+  }));
+document.querySelectorAll("#encodePicker .quality-card").forEach((c) =>
+  c.addEventListener("click", async () => {
+    document.querySelectorAll("#encodePicker .quality-card").forEach((x) => x.classList.remove("on"));
+    c.classList.add("on");
+    encodeTier = c.dataset.value;
+    settings.quality_tier = encodeTier;
+    try { await api.save_settings({ quality_tier: encodeTier }); } catch (e) { /* offline */ }
   }));
 
 /* genre templates apply their defaults to the controls */
@@ -846,7 +858,7 @@ $("closeCaptionBtn").addEventListener("click", () => hide($("captionModal")));
 function collectRenderOptions() {
   return {
     caption_style: captionStyle,
-    ratio, quality,
+    ratio, quality, quality_tier: encodeTier,
     face_track: $("faceTrackCheck").checked,
     remove_fillers: $("fillerCheck").checked,
     remove_silences: $("silencesCheck").checked,
