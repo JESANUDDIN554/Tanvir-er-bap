@@ -63,3 +63,5 @@ sizes = [(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)]
 icos = [master.resize(sz, Image.LANCZOS) for sz in sizes]
 icos[0].save(os.path.join(outdir, "icon.ico"), sizes=[(sz[0], sz[1]) for sz in sizes])
 print("clapperboard icon.ico + PNGs written")
+
+# build stamp: mega-build final tree (fonts + face model + sealed corepack)
