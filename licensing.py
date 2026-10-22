@@ -309,13 +309,20 @@ def verify_integrity(base_dir):
     blob = json.dumps(manifest, sort_keys=True).encode("utf-8")
     if not ed25519.verify(bytes.fromhex(PUBLIC_KEY_HEX), blob, sig):
         return (False, "integrity.py")
+    _TEXT_EXTS = (".html", ".js", ".css", ".md", ".txt", ".json")
     for rel, want in manifest.items():
         p = os.path.join(base_dir, rel)
         try:
             with open(p, "rb") as f:
-                got = hashlib.sha256(f.read()).hexdigest()
+                data = f.read()
         except OSError:
             return (False, rel)
-        if got != want:
+        if rel.lower().endswith(_TEXT_EXTS):
+            # Windows build checkouts rewrite text files with CRLF line
+            # endings; the signed manifest is over the LF originals, so
+            # normalize line endings before hashing text files. Real
+            # content edits still change the hash and fail the check.
+            data = data.replace(b"\r\n", b"\n")
+        if hashlib.sha256(data).hexdigest() != want:
             return (False, rel)
     return (True, None)
