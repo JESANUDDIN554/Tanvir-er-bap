@@ -1,7 +1,7 @@
 """Itraji Cliper - local video processing pipeline.
 
 Stages: yt-dlp download -> faster-whisper transcription ->
-Gemini (free API key) viral-moment detection -> ffmpeg 9:16 render
+Built-in AI (local model) viral-moment detection -> ffmpeg 9:16 render
 with karaoke captions and hook overlay.
 
 All code is original, written for this project.
@@ -284,125 +284,176 @@ def transcript_text(words):
 
 
 # ---------------------------------------------------------------------------
-# Gemini viral-moment detection (free API key)
+# Moment-detection prompt (shared by the Built-in AI detector below)
 # ---------------------------------------------------------------------------
 
-GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/models/"
-              "gemini-2.0-flash:generateContent")
+PROMPT_TEMPLATE = None  # @corepack (loaded at unlock)
 
-PROMPT_TEMPLATE = """You are a viral short-form video editor. Below is a transcript of a video,
-with [mm:ss] timestamps marking when each line starts.
+# ---------------------------------------------------------------------------
+# Core pack: the AI prompts, caption styles and hashtag sets live in
+# corepack.enc, sealed with a key only a genuine license carries (see
+# licensing.py). Until unlock, detection and rendering refuse honestly
+# instead of running - patching the activation screen cannot help,
+# because the content itself is not in the clear anywhere.
+# ---------------------------------------------------------------------------
 
-RULES - follow strictly:
-- Only pick moments from things ACTUALLY said in the transcript. Never invent events, quotes, or timestamps.
-- Each clip must be between {min_s} and {max_s} seconds long.
-- start/end are seconds (numbers) matching the timestamp markers.
-- Score virality 0-100: hook strength of the first 3 seconds, emotional peak, quotability.
-- Also score three sub-dimensions 0-100: "hook" (do the first 3 seconds stop
-  the scroll?), "flow" (does the moment hold attention start to finish?),
-  "value" (does the viewer leave with something: laugh, shock, knowledge?).
-- Return at most {max_clips} moments, best first.
-- Return ONLY valid JSON, no other text.
+_COREPACK_LOADED = False
 
-Transcript:
-{transcript}
-
-JSON format:
-{{"moments": [{{"start": 12, "end": 45, "title": "Short punchy title",
-"hook": "Opening on-screen text, under 8 words",
-"virality": 87, "hook_score": 90, "flow_score": 84, "value_score": 85,
-"reason": "One sentence why this will perform"}}]}}"""
+_LOCKED_MSG = ("This copy is locked - activate it with your license "
+               "key first.")
 
 
-def _gemini_call(prompt, api_key):
-    r = requests.post(
-        GEMINI_URL,
-        params={"key": api_key},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json",
-                                 "temperature": 0.7},
-        },
-        timeout=120,
-    )
-    r.raise_for_status()
-    data = r.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
-    # strip possible markdown fences
-    text = re.sub(r"^```[a-z]*\n?", "", text.strip())
-    text = re.sub(r"\n?```$", "", text.strip())
-    return json.loads(text)
+def load_corepack(pack):
+    global PROMPT_TEMPLATE, POSTING_PROMPT_TEMPLATE, STYLES
+    global GENRE_HASHTAGS, _COREPACK_LOADED
+    PROMPT_TEMPLATE = pack["prompt_template"]
+    POSTING_PROMPT_TEMPLATE = pack["posting_prompt_template"]
+    STYLES = pack["styles"]
+    GENRE_HASHTAGS = pack["genre_hashtags"]
+    _COREPACK_LOADED = True
 
 
-def detect_moments(words, api_key, clip_min_s, clip_max_s,
-                   max_clips=8, progress_cb=None):
-    """Use Gemini to find viral moments. Returns list of moment dicts."""
-    if not api_key:
-        raise RuntimeError("no_api_key")
-    full = transcript_text(words)
-    # chunk long transcripts so each request stays in context
-    chunks, cur = [], []
-    for line in full.split("\n"):
-        cur.append(line)
-        if sum(len(x) for x in cur) > 20000:
-            chunks.append("\n".join(cur))
-            cur = []
+def corepack_loaded():
+    return _COREPACK_LOADED
+
+
+# Built-in AI moment detection (local LLM via llama.cpp)
+# ---------------------------------------------------------------------------
+# Same contract as the moment detectors: same prompt, same JSON
+# schema, same validation. The model runs on this machine instead -
+# see local_ai.py. Long transcripts are split into time-ordered word
+# chunks whose rendered transcript keeps the whole prompt < ~55k
+# chars, detected per chunk, then merged + overlap-deduped.
+
+_LOCAL_TRANSCRIPT_BUDGET = 48000  # rendered transcript chars per chunk
+
+
+def _local_transcript_chunks(words, max_chars=_LOCAL_TRANSCRIPT_BUDGET):
+    """Split words into consecutive spans whose transcript_text()
+    rendering stays within max_chars. Splits only on the same 12-word
+    line boundaries transcript_text() itself uses, so the [mm:ss]
+    markers stay exact."""
+    chunks, cur, cur_len = [], [], 0
+    for i in range(0, len(words), 12):
+        group = words[i:i + 12]
+        start = group[0]["start"]
+        line = (f"[{int(start // 60):02d}:{int(start % 60):02d}] "
+                + " ".join(w["word"] for w in group))
+        add = len(line) + 1
+        if cur and cur_len + add > max_chars:
+            chunks.append(cur)
+            cur, cur_len = [], 0
+        cur.extend(group)
+        cur_len += add
     if cur:
-        chunks.append("\n".join(cur))
+        chunks.append(cur)
+    return chunks
 
+
+def _parse_local_moments(data, clip_max_s):
+    """Validate/normalize one reply's moments - same field rules as
+    detect_moments(); virality capped at 99 like the offline path."""
+    out = []
+    for m in data.get("moments", []):
+        try:
+            start = float(m["start"])
+            end = float(m["end"])
+            if end <= start or start < 0:
+                continue
+            # clamp to clip-length bounds
+            if end - start > clip_max_s:
+                end = start + clip_max_s
+            v = max(0, min(99, int(m.get("virality", 50))))
+
+            def _sub(key):
+                try:
+                    return max(0, min(100, int(m.get(key, v))))
+                except (TypeError, ValueError):
+                    return v
+
+            out.append({
+                "start": start,
+                "end": end,
+                "title": str(m.get("title", "Untitled"))[:80],
+                "hook": str(m.get("hook", ""))[:60],
+                "virality": v,
+                "hook_score": _sub("hook_score"),
+                "flow_score": _sub("flow_score"),
+                "value_score": _sub("value_score"),
+                "reason": str(m.get("reason", ""))[:160],
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def detect_moments_local(words, clip_min_s, clip_max_s,
+                         max_clips=8, progress_cb=None):
+    """Find viral moments with the built-in local AI.
+
+    Mirrors detect_moments() inputs and output shape, but the model
+    (Qwen2.5-14B via llama.cpp, see local_ai.py) runs on this machine -
+    no key. Raises RuntimeError with a plain message when the model
+    is not downloaded yet or the engine fails; never invents moments.
+    """
+    import local_ai
+
+    if not PROMPT_TEMPLATE:
+        raise RuntimeError(_LOCKED_MSG)
+    if not words:
+        return []
+    if not local_ai.model_ready():
+        raise RuntimeError(
+            "Built-in AI model is not downloaded yet. In Step 2 pick "
+            "'Built-in AI (no key)' and click 'Download Built-in AI' "
+            "(one-time download, ~9 GB), then try again.")
+    if progress_cb:
+        progress_cb(2, "Starting Built-in AI")
+    local_ai.ensure_server(progress_cb)
+
+    chunks = _local_transcript_chunks(words)
     moments = []
-    for i, chunk in enumerate(chunks):
+    for i, cwords in enumerate(chunks):
         if progress_cb:
-            progress_cb(int(i / max(len(chunks), 1) * 90),
-                        f"AI analyzing transcript ({i + 1}/{len(chunks)})")
+            progress_cb(int(10 + i / max(len(chunks), 1) * 85),
+                        f"Built-in AI analyzing transcript "
+                        f"({i + 1}/{len(chunks)})")
         prompt = PROMPT_TEMPLATE.format(
             min_s=clip_min_s, max_s=clip_max_s,
-            max_clips=max_clips, transcript=chunk)
+            max_clips=max_clips, transcript=transcript_text(cwords))
+        reply = local_ai.chat(
+            [{"role": "user", "content": prompt}], progress_cb)
         try:
-            data = _gemini_call(prompt, api_key)
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code in (400, 403):
-                raise RuntimeError("bad_api_key")
-            raise RuntimeError("gemini_error")
-        for m in data.get("moments", []):
-            try:
-                start = float(m["start"])
-                end = float(m["end"])
-                if end <= start or start < 0:
-                    continue
-                # clamp to clip-length bounds
-                if end - start > clip_max_s:
-                    end = start + clip_max_s
-                v = max(0, min(100, int(m.get("virality", 50))))
+            data = local_ai.extract_json(reply)
+        except ValueError as e:
+            raise RuntimeError(
+                "Built-in AI returned an answer that could not be "
+                f"read ({e}). Please run detection again.") from e
+        moments.extend(_parse_local_moments(data, clip_max_s))
 
-                def _sub(key):
-                    try:
-                        return max(0, min(100, int(m.get(key, v))))
-                    except (TypeError, ValueError):
-                        return v
-
-                moments.append({
-                    "start": start,
-                    "end": end,
-                    "title": str(m.get("title", "Untitled"))[:80],
-                    "hook": str(m.get("hook", ""))[:60],
-                    "virality": v,
-                    "hook_score": _sub("hook_score"),
-                    "flow_score": _sub("flow_score"),
-                    "value_score": _sub("value_score"),
-                    "reason": str(m.get("reason", ""))[:160],
-                })
-            except (KeyError, TypeError, ValueError):
-                continue
-
+    # merge: best first, drop moments overlapping a picked one by
+    # >30% of the shorter clip (same rule as the offline detector)
     moments.sort(key=lambda m: m["virality"], reverse=True)
+    picked = []
+    for m in moments:
+        s, e = m["start"], m["end"]
+        overlap = False
+        for p in picked:
+            inter = max(0.0, min(e, p["end"]) - max(s, p["start"]))
+            if inter > 0.3 * min(e - s, p["end"] - p["start"]):
+                overlap = True
+                break
+        if not overlap:
+            picked.append(m)
+        if len(picked) >= max_clips:
+            break
     if progress_cb:
-        progress_cb(100, f"Found {len(moments[:max_clips])} moments")
-    return moments[:max_clips]
+        progress_cb(100, f"Found {len(picked)} moments")
+    return picked
 
 
 # ---------------------------------------------------------------------------
-# OFFLINE heuristic moment detection (no API key)
+# OFFLINE heuristic moment detection (no model needed)
 # ---------------------------------------------------------------------------
 # Finds energetic, dense, surprising segments of the transcript using only
 # local signals. Scores are labeled heuristic - they find high-energy
@@ -525,7 +576,7 @@ def _extract_title_hook(win_words):
 
 
 def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8):
-    """Heuristic moment detection from the local transcript. No API key.
+    """Heuristic moment detection from the local transcript. No model needed.
 
     Returns list of {start, end, title, hook, virality, hook_score,
     flow_score, value_score, reason, offline: True}. Titles and hooks are
@@ -534,39 +585,56 @@ def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8):
     if not words or clip_max_s <= 0 or max_clips <= 0:
         return []
     dur = words[-1]["end"]
-    win_len = min(max((clip_min_s + clip_max_s) / 2.0, 10.0), dur)
-    if win_len < clip_min_s * 0.5:
-        return []
-    step = max(3.0, win_len / 6.0)
-
-    candidates = []
-    t = 0.0
-    while t + win_len <= dur + 0.001:
-        candidates.append((t, t + win_len))
-        t += step
-    if dur > win_len and (not candidates
-                          or candidates[-1][0] < dur - win_len - 0.5):
-        candidates.append((max(0.0, dur - win_len), dur))
+    # Candidate window lengths spanning the requested RANGE - the old
+    # code used one fixed midpoint length, so every moment came out
+    # the same size. Windows at min / mid / max lengths are scored
+    # together and compete in the single NMS pass below, so picked
+    # durations genuinely vary inside [clip_min_s, clip_max_s].
+    raw_lengths = {float(clip_min_s), (clip_min_s + clip_max_s) / 2.0,
+                   float(clip_max_s)}
+    lengths = sorted(L for L in raw_lengths if 5.0 <= L <= dur)
+    if not lengths:
+        if dur < max(5.0, clip_min_s * 0.5):
+            return []
+        lengths = [dur]
 
     scored = []
-    prev_content = set()
-    for s, e in candidates:
-        win_words = [w for w in words
-                     if w["end"] > s and w["start"] < e]
-        if len(win_words) < 12:
+    for win_len in lengths:
+        step = max(3.0, win_len / 6.0)
+        candidates = []
+        t = 0.0
+        while t + win_len <= dur + 0.001:
+            candidates.append((t, t + win_len))
+            t += step
+        if dur > win_len and (not candidates
+                              or candidates[-1][0] < dur - win_len - 0.5):
+            candidates.append((max(0.0, dur - win_len), dur))
+        prev_content = set()
+        for ws, we in candidates:
+            win_words = [w for w in words
+                         if w["end"] > ws and w["start"] < we]
+            if len(win_words) < 12:
+                prev_content = _content_words(win_words)
+                continue
+            # trim leading/trailing silence inside the window
+            s = max(ws, win_words[0]["start"])
+            e = min(we, win_words[-1]["end"])
+            if e - s < clip_min_s:
+                # speech fills only part of the window: stretch back
+                # toward the window bounds so the moment still lands
+                # inside the requested range when the window allows it
+                need = clip_min_s - (e - s)
+                grow_l = min(need / 2.0, s - ws)
+                s -= grow_l
+                e = min(we, e + (need - grow_l))
+            if e - s < 5:
+                prev_content = _content_words(win_words)
+                continue
+            virality, hook_s, flow_s, value_s, parts = _score_offline_window(
+                win_words, prev_content, e - s)
             prev_content = _content_words(win_words)
-            continue
-        # trim leading/trailing silence inside the window
-        s = max(s, win_words[0]["start"])
-        e = min(e, win_words[-1]["end"])
-        if e - s < 5:
-            prev_content = _content_words(win_words)
-            continue
-        virality, hook_s, flow_s, value_s, parts = _score_offline_window(
-            win_words, prev_content, e - s)
-        prev_content = _content_words(win_words)
-        scored.append((virality, s, e, win_words, hook_s, flow_s,
-                       value_s, parts))
+            scored.append((virality, s, e, win_words, hook_s, flow_s,
+                           value_s, parts))
 
     # non-max suppression: keep best-first, drop heavy overlaps
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -634,33 +702,8 @@ def diarize_heuristic(words):
 SPEAKER_LABELS = ("Speaker 1", "Speaker 2")
 
 # Hashtag seeds per genre for posting packages (extractive fallback).
-GENRE_HASHTAGS = {
-    "podcast": ["#podcast", "#podcastclips", "#interview", "#podcasting"],
-    "comedy": ["#comedy", "#funny", "#memes", "#laugh"],
-    "gaming": ["#gaming", "#gamer", "#gameclips", "#twitch"],
-    "news": ["#bodycam", "#police", "#cops", "#caughtoncamera"],
-    "business": ["#business", "#entrepreneur", "#money", "#success"],
-    "fitness": ["#fitness", "#gym", "#workout", "#gymlife"],
-    "": ["#reels", "#viral", "#shorts", "#fyp"],
-}
-
-POSTING_PROMPT_TEMPLATE = """You are writing a Facebook Reels posting package for a short clip.
-Below is the clip's transcript - verbatim words actually said in the clip.
-
-RULES - follow strictly:
-- Only use words, claims and people from the transcript. Never invent events, quotes, or people.
-- Titles under 60 characters, punchy, no clickbait lies.
-- Description: 2-3 sentences, Facebook-ready, ends with a question to drive comments.
-- Up to 8 hashtags, lowercase, no spaces.
-- Return ONLY valid JSON, no other text.
-
-Transcript:
-{transcript}
-
-JSON format:
-{{"titles": ["Title option 1", "Title option 2", "Title option 3"],
-"description": "Two to three sentences with a line break, ending in a question",
-"hashtags": ["#tag1", "#tag2"]}}"""
+GENRE_HASHTAGS = {"": []}  # @corepack (loaded at unlock)
+POSTING_PROMPT_TEMPLATE = None  # @corepack (loaded at unlock)
 
 
 def _extractive_posting_package(words, moment, genre=""):
@@ -736,20 +779,29 @@ def _extractive_posting_package(words, moment, genre=""):
     }
 
 
-def generate_posting_package(words, moment, genre="", api_key=None):
+def generate_posting_package(words, moment, genre=""):
     """Per-clip posting package: 3 titles, FB description, hashtags.
 
-    With a Gemini key -> real AI copy ("ai" mode). Without -> extractive
-    fallback on this PC ("extractive" mode). If the AI call fails, falls
-    back to extractive and says so honestly. "mode" always reports which
-    produced the copy.
+    Written by the Built-in AI when its model is downloaded ("ai"
+    mode). Otherwise -> extractive fallback on this PC ("extractive"
+    mode). If the AI call fails, falls back to extractive and says so
+    honestly. "mode" always reports which produced the copy.
     """
     moment = moment or {}
-    if api_key:
+    try:
+        import local_ai
+        ready = bool(POSTING_PROMPT_TEMPLATE) \
+            and local_ai.model_ready()
+    except Exception:  # noqa: BLE001 - local AI unavailable
+        ready = False
+    if ready:
         try:
             text = " ".join(w["word"] for w in words)[:6000]
-            data = _gemini_call(
-                POSTING_PROMPT_TEMPLATE.format(transcript=text), api_key)
+            raw = local_ai.chat([{
+                "role": "user",
+                "content": POSTING_PROMPT_TEMPLATE.format(
+                    transcript=text)}])
+            data = local_ai.extract_json(raw)
             titles = [str(t)[:70] for t in data.get("titles", [])[:3]]
             desc = str(data.get("description", ""))[:600]
             tags = []
@@ -767,12 +819,15 @@ def generate_posting_package(words, moment, genre="", api_key=None):
                     "hashtags": tags or GENRE_HASHTAGS.get(
                         genre, GENRE_HASHTAGS[""])[:8],
                     "mode": "ai",
-                    "note": "Written by AI (Gemini) from the clip transcript.",
+                    "note": "Written by the Built-in AI from the clip "
+                            "transcript.",
                 }
+            raise RuntimeError("the model returned no usable copy")
         except Exception as e:  # noqa: BLE001 - honest fallback
             fb = _extractive_posting_package(words, moment, genre)
-            fb["note"] = ("AI request failed (%s) - fell back to the "
-                          "on-PC extractive version." % str(e)[:80])
+            fb["note"] = ("Built-in AI request failed (%s) - fell back "
+                          "to the on-PC extractive version."
+                          % str(e)[:80])
             return fb
     return _extractive_posting_package(words, moment, genre)
 
@@ -781,60 +836,9 @@ def generate_posting_package(words, moment, genre="", api_key=None):
 # ASS caption builder (karaoke word highlight + hook overlay)
 # ---------------------------------------------------------------------------
 
-STYLES = {
-    "bold-pop": {
-        "label": "Bold Pop",
-        "primary": "&H0000FFFF",    # yellow
-        "secondary": "&H00FFFFFF",  # white sweep base
-        "outline": "&H00000000",
-        "bold": 1,
-    },
-    "lime-punch": {
-        "label": "Lime Punch",
-        "primary": "&H002EFFC8",    # lime
-        "secondary": "&H00FFFFFF",
-        "outline": "&H00000000",
-        "bold": 1,
-    },
-    "clean": {
-        "label": "Clean White",
-        "primary": "&H00FFFFFF",    # white
-        "secondary": "&H00FFE500",  # cyan sweep
-        "outline": "&H80000000",
-        "bold": 0,
-    },
-    "neon-glow": {
-        "label": "Neon Glow",
-        "primary": "&H00FFFF00",    # neon cyan
-        "secondary": "&H00FFFFFF",  # white sweep
-        "outline": "&H00000000",
-        "bold": 1,
-        "glow": 1,                 # thick outline + shadow = glow feel
-    },
-    "hollow": {
-        "label": "Hollow Outline",
-        "primary": "&HFF000000",    # fully transparent fill
-        "secondary": "&HFF000000",  # sweep stays invisible too
-        "outline": "&H00FFFFFF",    # solid white outline
-        "bold": 1,
-        "hollow": 1,               # extra-thick outline, no shadow
-    },
-    "boxed": {
-        "label": "Boxed Pop",
-        "primary": "&H00FFFFFF",    # white text
-        "secondary": "&H0000FFFF",  # yellow sweep
-        "outline": "&HFF000000",    # opaque black box behind text
-        "bold": 1,
-        "box": 1,                  # BorderStyle 3 = opaque box
-    },
-}
+STYLES = {}  # @corepack (loaded at unlock)
 
 
-def _esc(text):
-    return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
-
-
-# User-saved custom caption styles (persisted in settings, merged at render).
 CUSTOM_STYLES = {}
 
 
@@ -853,6 +857,10 @@ def set_custom_styles(styles):
             "outline": str(s.get("outline", "&H00000000")),
             "bold": int(s.get("bold", 1)),
         }
+
+
+def _esc(text):
+    return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
 
 
 def _get_style(name):
@@ -875,10 +883,182 @@ def _group_lines(words):
     return lines
 
 
+# ---------------------------------------------------------------------------
+# Caption Studio parameters: captions generalized from named styles to
+# a parameter bundle. The named Step-2 styles stay as-is (legacy path);
+# the studio's presets below are bundles of these params, and a render
+# carrying explicit caption_params renders through them instead.
+# ---------------------------------------------------------------------------
+
+FONTS_DIR = ""  # app.py points this at the app's fonts/ folder
+
+CAPTION_FONT_FILES = {
+    "anton": "Anton-Regular.ttf",
+    "bebas-neue": "BebasNeue-Regular.ttf",
+    "montserrat": "Montserrat-ExtraBold.ttf",
+    "poppins": "Poppins-Bold.ttf",
+    "archivo-black": "ArchivoBlack-Regular.ttf",
+}
+CAPTION_FONTS = [
+    {"id": "default", "name": "Default (Arial)", "font_name": "Arial"},
+    {"id": "anton", "name": "Anton", "font_name": "Anton"},
+    {"id": "bebas-neue", "name": "Bebas Neue", "font_name": "Bebas Neue"},
+    {"id": "montserrat", "name": "Montserrat", "font_name": "Montserrat"},
+    {"id": "poppins", "name": "Poppins", "font_name": "Poppins"},
+    {"id": "archivo-black", "name": "Archivo Black",
+     "font_name": "Archivo Black"},
+]
+CAPTION_SIZES = {"xs": 0.7, "s": 0.85, "m": 1.0, "l": 1.2,
+                 "xl": 1.45, "xxl": 1.7}
+
+
+def _preset(**kw):
+    base = {"uppercase": True, "dim_inactive": 55, "position": "bottom",
+            "size": "l", "one_word": False, "animation": "none",
+            "font": "default", "text_color": "#FFFFFF",
+            "highlight_color": "#C8FF2E", "border": 3,
+            "outline_color": "#000000", "bold": 1}
+    base.update(kw)
+    return base
+
+
+CAPTION_PRESETS = {
+    "default": _preset(),
+    "one-word": _preset(one_word=True, size="xl", animation="pop"),
+    "clean": _preset(uppercase=False, dim_inactive=0, size="m", border=2,
+                     highlight_color="#FFFFFF"),
+    "pill": _preset(animation="box", size="m", dim_inactive=35),
+    "lime-box": _preset(animation="box"),
+    "hormozi": _preset(font="montserrat", size="xl", border=4,
+                       highlight_color="#FFE135", dim_inactive=60),
+    "karaoke": _preset(uppercase=False, dim_inactive=45, size="m"),
+    "beast": _preset(font="anton", size="xxl", border=5,
+                     highlight_color="#FF3131"),
+    "neon": _preset(animation="glow", border=2, text_color="#E8FFFF",
+                    highlight_color="#00E5FF"),
+    "gold-glow": _preset(animation="glow", text_color="#FFF6D8",
+                         highlight_color="#FFC400"),
+    "cyber": _preset(font="bebas-neue", size="xl", dim_inactive=65,
+                     highlight_color="#00FF9D"),
+    "boxed": _preset(animation="box", size="m", dim_inactive=30,
+                     highlight_color="#FFFFFF"),
+    "minimal": _preset(uppercase=False, dim_inactive=0, size="s",
+                       border=1, highlight_color="#FFFFFF"),
+    "classic": _preset(uppercase=False, dim_inactive=20, size="m",
+                       text_color="#FFFF00", highlight_color="#FFFF00"),
+    "royal-blue": _preset(animation="pop",
+                          highlight_color="#4D7CFE"),
+    "mint": _preset(animation="glow", highlight_color="#3DFFB0"),
+    "fire": _preset(font="archivo-black", size="xl", animation="pop",
+                    border=4, highlight_color="#FF6A00"),
+    "bubble": _preset(font="poppins", animation="pop", dim_inactive=40,
+                      highlight_color="#FF8FDC"),
+    "ghost": _preset(dim_inactive=75, border=1, size="m",
+                     text_color="#EDEDED", highlight_color="#FFFFFF"),
+    "shorts-pop": _preset(font="poppins", animation="pop", size="xl",
+                          dim_inactive=50),
+}
+
+_STYLE_TO_PRESET = {"bold-pop": "default", "lime-punch": "lime-box",
+                    "clean": "clean", "neon-glow": "neon",
+                    "hollow": "ghost", "boxed": "boxed"}
+
+
+def hex_to_ass(hex_color, alpha="00"):
+    """'#RRGGBB' -> ASS '&HAABBGGRR'."""
+    h = str(hex_color or "#FFFFFF").lstrip("#")
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", h):
+        h = "FFFFFF"
+    return ("&H" + alpha + h[4:6] + h[2:4] + h[0:2]).upper()
+
+
+def _dim_ass(ass_color, dim_pct):
+    """Dim an ASS color toward black by dim_pct (0-100)."""
+    f = 1.0 - 0.8 * (max(0, min(100, dim_pct)) / 100.0)
+    bb = int(int(ass_color[4:6], 16) * f)
+    gg = int(int(ass_color[6:8], 16) * f)
+    rr = int(int(ass_color[8:10], 16) * f)
+    return "&H00%02X%02X%02X" % (bb, gg, rr)
+
+
+def _font_available(font_id):
+    if font_id == "default":
+        return True
+    fname = CAPTION_FONT_FILES.get(font_id)
+    return bool(fname and FONTS_DIR
+                and os.path.isfile(os.path.join(FONTS_DIR, fname)))
+
+
+def _font_name(font_id):
+    """ASS FontName for a font id; falls back to Arial when the named
+    font's file isn't bundled (never fail a render over a font)."""
+    if font_id != "default" and _font_available(font_id):
+        for f in CAPTION_FONTS:
+            if f["id"] == font_id:
+                return f["font_name"]
+    return "Arial"
+
+
+def _fontsdir_opt():
+    """ffmpeg subtitles-filter fontsdir option for the bundled fonts,
+    escaped for the filtergraph's double parse (same scheme as
+    _ffmpeg_ass_path). Empty when no fonts folder is wired."""
+    if not FONTS_DIR or not os.path.isdir(FONTS_DIR):
+        return ""
+    p = FONTS_DIR.replace("\\", "/")
+    for ch in (":", "'", ",", "[", "]", ";"):
+        p = p.replace(ch, "\\\\\\" + ch)
+    return ":fontsdir=" + p
+
+
+def normalize_caption_params(params=None, style_name=None):
+    """Effective caption params: a preset bundle (chosen by
+    params['preset'] or seeded from the legacy style name) overlaid
+    with the explicit params, sanitized. Returns None when params is
+    None - the caller then uses the legacy named-style path."""
+    if params is None:
+        return None
+    params = dict(params or {})
+    preset_id = params.get("preset") or _STYLE_TO_PRESET.get(
+        style_name or "", "default")
+    if preset_id not in CAPTION_PRESETS:
+        preset_id = "default"
+    eff = dict(CAPTION_PRESETS[preset_id])
+    eff["preset"] = preset_id
+    for k, v in params.items():
+        if v is not None and k in eff:
+            eff[k] = v
+    try:
+        eff["dim_inactive"] = max(0, min(100, int(eff["dim_inactive"])))
+    except (TypeError, ValueError):
+        eff["dim_inactive"] = 0
+    try:
+        eff["border"] = max(0, min(8, int(eff["border"])))
+    except (TypeError, ValueError):
+        eff["border"] = 3
+    if eff["size"] not in CAPTION_SIZES:
+        eff["size"] = "m"
+    if eff["position"] not in ("top", "middle", "bottom"):
+        eff["position"] = "bottom"
+    if eff["animation"] not in ("pop", "glow", "box", "none"):
+        eff["animation"] = "none"
+    if eff["font"] != "default" and eff["font"] not in CAPTION_FONT_FILES:
+        eff["font"] = "default"
+    eff["uppercase"] = bool(eff["uppercase"])
+    eff["one_word"] = bool(eff["one_word"])
+    eff["bold"] = 1 if eff.get("bold", 1) else 0
+    for ck, dflt in (("text_color", "#FFFFFF"),
+                     ("highlight_color", "#C8FF2E"),
+                     ("outline_color", "#000000")):
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", str(eff.get(ck, ""))):
+            eff[ck] = dflt
+    return eff
+
+
 def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
               res=(1080, 1920), emojis=False, highlight=False,
               speaker_colors=None, hook_overlay=True, cta_text=None,
-              safe_zone=False):
+              safe_zone=False, caption_params=None):
     """Write an ASS subtitle file for one clip window.
 
     res: (width, height) of the rendered clip - fonts and positions scale.
@@ -894,7 +1074,18 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
     safe_zone: nudge captions/hook inside Reels UI safe areas (captions
         above the bottom caption zone, hook below the top bar).
     """
+    if not STYLES:
+        raise RuntimeError(_LOCKED_MSG)
     st = _get_style(style_name)
+    # "none": no word captions at all. The hook and CTA overlays above
+    # are separate features with their own toggles and still apply.
+    no_captions = (style_name == "none")
+    # Caption Studio: explicit params take over caption rendering
+    # entirely (including reviving captions on a "none"-styled clip -
+    # applying studio params IS the user's intent to have captions).
+    eff = normalize_caption_params(caption_params, style_name)
+    if eff is not None:
+        no_captions = False
     W, H = int(res[0]), int(res[1])
     sx, sy = W / 1080.0, H / 1920.0
     cap_font = max(24, int(60 * sx))
@@ -945,55 +1136,170 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
                 f"Dialogue: {layer},{ts(cta_start)},{ts(end_s)},"
                 f"CTA,,0,0,0,,{{\\fad(300,300)}}{_esc(cta_text)}")
 
-    prim_col = st["primary"]  # ASS &HAABBGGRR, e.g. &H0000FFFF
-    for line in _group_lines(win):
-        parts = []
-        for w in line:
-            cs = max(1, int((w["end"] - w["start"]) * 100))
-            txt = _esc(w["word"])
+    if eff is not None:
+        # ---- Caption Studio params mode --------------------------
+        p_font = _font_name(eff["font"])
+        p_size = max(20, int(cap_font * CAPTION_SIZES[eff["size"]]))
+        p_prim = hex_to_ass(eff["text_color"])
+        p_hl = hex_to_ass(eff["highlight_color"])
+        p_dim = _dim_ass(p_prim, eff["dim_inactive"])
+        p_out = hex_to_ass(eff["outline_color"])
+        if eff["position"] == "top":
+            p_align, p_marginv = 8, int(150 * sy)
+        elif eff["position"] == "middle":
+            p_align, p_marginv = 5, 0
+        else:
+            p_align, p_marginv = 2, cap_margin_v
+        p_shadow = 3 if eff["animation"] == "glow" else 1
+        p_box = eff["animation"] == "box"
+
+        def _p_word(w):
+            t = w["word"].upper() if eff["uppercase"] else w["word"]
+            t = _esc(t)
             if emojis:
                 em = EMOJI_MAP.get(_clean_word(w["word"]))
                 if em:
-                    txt += em
-            if spk_cols is not None:
-                # speaker colors win over highlight - that IS the feature
-                col = spk_cols[w.get("speaker", 0) % 2]
-            elif highlight and _is_highlight_word(w["word"]):
-                col = "&H002EFFC8"
-            else:
-                col = prim_col
-            parts.append(f"{{\\k{cs}\\1c{col}&}}{txt}")
-        layer = 1 if use_box else 0
-        body.append(
-            f"Dialogue: {layer},{ts(line[0]['start'])},{ts(line[-1]['end'])},"
-            f"Caption,,0,0,0,,{' '.join(parts)}")
-        if use_box:
-            # opaque rounded-ish box behind the line, drawn with vector
-            # graphics at absolute script coords (top-left origin)
-            text = " ".join(w["word"] for w in line)
-            est_w = (sum(20 if c == " " else
-                         24 if c in "ilj.,!;:'\"" else 36 for c in text)
-                     + 56) * sx
-            cx = W / 2.0
-            x0, x1 = cx - est_w / 2, cx + est_w / 2
-            y0, y1 = int(1592 * sy), int(1700 * sy)
-            box_events.append(
-                f"Dialogue: 0,{ts(line[0]['start'])},{ts(line[-1]['end'])},"
-                f"Box,,0,0,0,,{{\\an7\\pos(0,0)\\p1}}"
-                f"m {x0:.0f} {y0} l {x1:.0f} {y0} "
-                f"l {x1:.0f} {y1} l {x0:.0f} {y1}{{\\p0}}")
+                    t += em
+            return t
 
-    # style variants: glow = thick outline + shadow, hollow = thick
-    # outline only, box = opaque box drawn behind the text via {\p1}
-    # (this libass build ignores BorderStyle 3, so the box is vector-drawn)
-    if st.get("glow"):
-        border_style, outline_w, shadow_w = 1, 4, 2
-    elif st.get("hollow"):
-        border_style, outline_w, shadow_w = 1, 6, 0
-    elif st.get("box"):
-        border_style, outline_w, shadow_w = 1, 2, 0
+        def _p_anim_tags():
+            if eff["animation"] == "pop":
+                return ("{\\fscx118\\fscy118"
+                        "\\t(0,140,\\fscx100\\fscy100)}")
+            if eff["animation"] == "glow":
+                return "{\\shad5\\4c" + p_hl + "&}"
+            return ""
+
+        def _p_box_event(line_words, active_idx, ev_start, ev_end):
+            u = p_size / 60.0
+
+            def ew(t):
+                return sum(20 if c == " " else 24
+                           if c in "ilj.,!;:'\"" else 36
+                           for c in t) * u
+            texts = [_p_word(w) for w in line_words]
+            line_w = ew(" ".join(texts)) + 56 * u
+            off = 0.0
+            for jx in range(active_idx):
+                off += ew(texts[jx]) + 20 * u
+            word_w = ew(texts[active_idx])
+            cx = W / 2.0
+            x0 = max(4.0, cx - line_w / 2 + off - 14 * u)
+            x1 = min(W - 4.0, x0 + word_w + 28 * u)
+            bh = int(p_size * 1.7)
+            if eff["position"] == "top":
+                y0 = max(0, p_marginv - int(p_size * 0.2))
+                y1 = y0 + bh
+            elif eff["position"] == "middle":
+                y0 = int(H / 2 - bh / 2 + p_size * 0.35)
+                y1 = y0 + bh
+            else:
+                y1 = H - p_marginv - int(p_size * 0.1)
+                y0 = y1 - bh
+            return (
+                f"Dialogue: 0,{ts(ev_start)},{ts(ev_end)},Box,,0,0,0,,"
+                f"{{\\an7\\pos(0,0)\\p1}}"
+                f"m {x0:.0f} {y0:.0f} l {x1:.0f} {y0:.0f} "
+                f"l {x1:.0f} {y1:.0f} l {x0:.0f} {y1:.0f}{{\\p0}}")
+
+        if eff["one_word"]:
+            for w in win:
+                body.append(
+                    f"Dialogue: {1 if p_box else 0},"
+                    f"{ts(w['start'])},{ts(w['end'])},Caption,,0,0,0,,"
+                    f"{{\\1c{p_prim}&}}{_p_anim_tags()}{_p_word(w)}")
+                if p_box:
+                    box_events.append(
+                        _p_box_event([w], 0, w["start"], w["end"]))
+        else:
+            for line in _group_lines(win):
+                for k, w in enumerate(line):
+                    ev_end = (line[k + 1]["start"] if k + 1 < len(line)
+                              else line[-1]["end"])
+                    parts = []
+                    for jx, wj in enumerate(line):
+                        if jx == k:
+                            parts.append(
+                                "{\\1c" + p_hl + "&}" + _p_anim_tags()
+                                + _p_word(wj)
+                                + ("{\\fscx100\\fscy100}"
+                                   if eff["animation"] == "pop" else ""))
+                        else:
+                            parts.append(
+                                "{\\1c" + p_dim + "&}" + _p_word(wj))
+                    body.append(
+                        f"Dialogue: {1 if p_box else 0},"
+                        f"{ts(w['start'])},{ts(ev_end)},Caption,,0,0,0,,"
+                        + " ".join(parts))
+                    if p_box:
+                        box_events.append(
+                            _p_box_event(line, k, w["start"], ev_end))
+        cap_style_line = (
+            f"Style: Caption,{p_font},{p_size},{p_prim},{p_hl},{p_out},"
+            f"&H99000000,{eff['bold']},0,0,0,100,100,0,0,1,"
+            f"{eff['border']},{p_shadow},{p_align},40,40,{p_marginv},1")
+        _box_fill = hex_to_ass(eff["highlight_color"], "40")
+        box_style_line = (
+            f"Style: Box,Arial,10,{_box_fill},{_box_fill},"
+            "&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1")
     else:
-        border_style, outline_w, shadow_w = 1, 3, 1
+        prim_col = st["primary"]  # ASS &HAABBGGRR, e.g. &H0000FFFF
+        for line in ([] if no_captions else _group_lines(win)):
+            parts = []
+            for w in line:
+                cs = max(1, int((w["end"] - w["start"]) * 100))
+                txt = _esc(w["word"])
+                if emojis:
+                    em = EMOJI_MAP.get(_clean_word(w["word"]))
+                    if em:
+                        txt += em
+                if spk_cols is not None:
+                    # speaker colors win over highlight - that IS the feature
+                    col = spk_cols[w.get("speaker", 0) % 2]
+                elif highlight and _is_highlight_word(w["word"]):
+                    col = "&H002EFFC8"
+                else:
+                    col = prim_col
+                parts.append(f"{{\\k{cs}\\1c{col}&}}{txt}")
+            layer = 1 if use_box else 0
+            body.append(
+                f"Dialogue: {layer},{ts(line[0]['start'])},{ts(line[-1]['end'])},"
+                f"Caption,,0,0,0,,{' '.join(parts)}")
+            if use_box:
+                # opaque rounded-ish box behind the line, drawn with vector
+                # graphics at absolute script coords (top-left origin)
+                text = " ".join(w["word"] for w in line)
+                est_w = (sum(20 if c == " " else
+                             24 if c in "ilj.,!;:'\"" else 36 for c in text)
+                         + 56) * sx
+                cx = W / 2.0
+                x0, x1 = cx - est_w / 2, cx + est_w / 2
+                y0, y1 = int(1592 * sy), int(1700 * sy)
+                box_events.append(
+                    f"Dialogue: 0,{ts(line[0]['start'])},{ts(line[-1]['end'])},"
+                    f"Box,,0,0,0,,{{\\an7\\pos(0,0)\\p1}}"
+                    f"m {x0:.0f} {y0} l {x1:.0f} {y0} "
+                    f"l {x1:.0f} {y1} l {x0:.0f} {y1}{{\\p0}}")
+
+        # style variants: glow = thick outline + shadow, hollow = thick
+        # outline only, box = opaque box drawn behind the text via {\p1}
+        # (this libass build ignores BorderStyle 3, so the box is vector-drawn)
+        if st.get("glow"):
+            border_style, outline_w, shadow_w = 1, 4, 2
+        elif st.get("hollow"):
+            border_style, outline_w, shadow_w = 1, 6, 0
+        elif st.get("box"):
+            border_style, outline_w, shadow_w = 1, 2, 0
+        else:
+            border_style, outline_w, shadow_w = 1, 3, 1
+        cap_style_line = (
+            f"Style: Caption,Arial,{cap_font},{st['primary']},"
+            f"{st['secondary']},{st['outline']},&H99000000,{st['bold']},"
+            f"0,0,0,100,100,0,0,{border_style},{outline_w},{shadow_w},"
+            f"2,40,40,{cap_margin_v},1")
+        box_style_line = (
+            "Style: Box,Arial,10,&HCC000000,&HCC000000,&H00000000,"
+            "&H00000000,1,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1")
 
     ass = f"""[Script Info]
 ScriptType: v4.00+
@@ -1003,10 +1309,10 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Caption,Arial,{cap_font},{st['primary']},{st['secondary']},{st['outline']},&H99000000,{st['bold']},0,0,0,100,100,0,0,{border_style},{outline_w},{shadow_w},2,40,40,{cap_margin_v},1
+{cap_style_line}
 Style: Hook,Arial,{hook_font},&H0000FFFF,&H00FFFFFF,&H00000000,&HCC000000,1,0,0,0,100,100,0,0,3,2,0,8,40,40,{hook_margin_v},1
 Style: CTA,Arial,{hook_font},&H00FFFFFF,&H00FFFFFF,&H00000000,&HCC000000,1,0,0,0,100,100,0,0,3,2,0,8,40,40,{hook_margin_v},1
-Style: Box,Arial,10,&HCC000000,&HCC000000,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
+{box_style_line}
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -1725,7 +2031,8 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
             "+0.00004*max(0\\,on-90)\\,1.16)'"
             ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
             f":d=1:s={W}x{H}:fps={fps:.3f}")
-    vf_parts.append(f"subtitles={_ffmpeg_ass_path(ass_path)}")
+    vf_parts.append(f"subtitles={_ffmpeg_ass_path(ass_path)}"
+                         f"{_fontsdir_opt()}")
     enc = ["ffmpeg", "-y", "-v", "error",
            "-f", "rawvideo", "-pix_fmt", "bgr24",
            "-s", f"{W}x{H}", "-framerate", f"{fps:.3f}",
@@ -1819,7 +2126,8 @@ def _render_plain(video_path, start, end, keep_segs, ass_path,
             f":d=1:s={W}x{H}:fps={_fps:.3f}")
     if enhance_clarity:
         vf.append("hqdn3d=4:3:6:4.5,unsharp=5:5:0.7:5:5:0.0")
-    vf.append(f"subtitles={_ffmpeg_ass_path(ass_path)}")
+    vf.append(f"subtitles={_ffmpeg_ass_path(ass_path)}"
+                    f"{_fontsdir_opt()}")
     vf_tail = ",".join(vf)
     single = (len(keep_segs) == 1
               and abs(keep_segs[0][0] - start) < 0.01
@@ -1901,7 +2209,8 @@ def render_clip(video_path, moment, words, style_name, out_path,
                 custom_styles=None, edited_words=None,
                 speaker_colors=None, hook_overlay=True, cta_text=None,
                 safe_zone=False, punch_zoom=False, enhance_clarity=False,
-                logo_path=None, quality_tier="maximum"):
+                logo_path=None, quality_tier="maximum",
+                caption_params=None):
     """Cut + reframe + burned captions + hook. Returns out_path.
 
     face_track=True -> per-frame face-following crop (OpenCV pipe).
@@ -1975,7 +2284,8 @@ def render_clip(video_path, moment, words, style_name, out_path,
     build_ass(cap_words, 0, total_dur, style_name, moment.get("hook", ""),
               ass_path, res=(W, H), emojis=emojis, highlight=highlight,
               speaker_colors=speaker_colors, hook_overlay=hook_overlay,
-              cta_text=cta_text, safe_zone=safe_zone)
+              cta_text=cta_text, safe_zone=safe_zone,
+              caption_params=caption_params)
     try:
         if face_track:
             _render_tracked(video_path, start, end, keep_segs, removed,
@@ -2027,3 +2337,348 @@ def render_clip_tracked(video_path, moment, words, style_name, out_path,
     return render_clip(video_path, moment, words, style_name, out_path,
                        progress_cb=progress_cb, face_track=face_track,
                        remove_fillers=remove_fillers, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Caption Remover - strip captions already burned into the pixels
+# ---------------------------------------------------------------------------
+# Three honest methods:
+#   crop - cut the band out and scale back to the original frame size
+#   fill - replace the band with a strong blur + grain sampled from the
+#          band itself (texture-filled, never a flat bar)
+#   ai   - LaMa inpainting (ONNX, via the bundled onnxruntime) applied
+#          to the band only; model downloads once on first use
+
+LAMA_MODEL_URL = ("https://huggingface.co/Carve/LaMa-ONNX/resolve/main/"
+                  "lama_fp32.onnx")
+LAMA_MODEL_FILE = "lama_fp32.onnx"
+LAMA_MODEL_SIZE = 208_044_816  # bytes, per the HuggingFace blob listing
+
+
+def _remover_band(region, height):
+    """Validate a region dict -> (top_px, bottom_px) inside the frame.
+
+    region = {"top_pct": float, "bottom_pct": float}: the caption band
+    spans top_pct%..bottom_pct% of the frame height, full width.
+    """
+    try:
+        top = float((region or {}).get("top_pct", 82.0))
+        bot = float((region or {}).get("bottom_pct", 100.0))
+    except (TypeError, ValueError):
+        raise ValueError("Caption region needs numeric top/bottom "
+                         "percentages.")
+    top = min(max(top, 0.0), 100.0)
+    bot = min(max(bot, 0.0), 100.0)
+    if bot - top < 2.0:
+        raise ValueError("Caption region is too thin (under 2% of the "
+                         "frame height) - widen the band.")
+    y0 = int(round(height * top / 100.0))
+    y1 = int(round(height * bot / 100.0))
+    y0 = max(0, min(y0, height - 2))
+    y1 = max(y0 + 2, min(y1, height))
+    return y0, y1
+
+
+def _encode_args(quality_tier):
+    preset, crf = _ENCODE_TIERS.get(quality_tier or "maximum",
+                                    _ENCODE_TIERS["maximum"])
+    return ["-c:v", "libx264", "-preset", preset, "-crf", crf,
+            "-pix_fmt", "yuv420p"]
+
+
+def lama_model_path():
+    import local_ai
+    os.makedirs(local_ai.MODELS_DIR, exist_ok=True)
+    return os.path.join(local_ai.MODELS_DIR, LAMA_MODEL_FILE)
+
+
+def lama_ready():
+    try:
+        return os.path.getsize(lama_model_path()) == LAMA_MODEL_SIZE
+    except OSError:
+        return False
+
+
+def ensure_lama(progress_cb=None):
+    """Download the LaMa ONNX model once (~198 MB), like the other
+    brains. Returns the model path; RuntimeError on failure."""
+    import urllib.request
+    path = lama_model_path()
+    if lama_ready():
+        return path
+    tmp = path + ".part"
+    try:
+        req = urllib.request.Request(
+            LAMA_MODEL_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp, \
+                open(tmp, "wb") as f:
+            total = int(resp.headers.get("Content-Length")
+                        or LAMA_MODEL_SIZE)
+            got = 0
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if progress_cb and total:
+                    progress_cb(2 + int(13 * got / total),
+                                "Downloading AI inpainting model "
+                                "(one-time, ~198 MB)")
+        if got != LAMA_MODEL_SIZE:
+            raise RuntimeError(
+                f"AI model download incomplete ({got} of "
+                f"{LAMA_MODEL_SIZE} bytes) - check your connection "
+                "and retry.")
+        os.replace(tmp, path)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Could not download the AI inpainting "
+                           f"model: {e}")
+    return path
+
+
+def _run_ffmpeg_progress(cmd, duration, progress_cb, lo, hi, stage):
+    """Run ffmpeg, mapping its -progress output onto [lo, hi] percent."""
+    full = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
+    proc = subprocess.Popen(full, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            errors="replace")
+    tail = []
+    try:
+        for line in proc.stdout:
+            tail.append(line.rstrip())
+            if line.startswith("out_time_ms=") and duration:
+                try:
+                    t = int(line.split("=", 1)[1]) / 1e6
+                except ValueError:
+                    continue
+                frac = min(1.0, max(0.0, t / duration))
+                if progress_cb:
+                    progress_cb(lo + int((hi - lo) * frac), stage)
+    finally:
+        proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError("ffmpeg failed: "
+                           + " | ".join(tail[-6:])[:400])
+
+
+def remove_captions(video_path, region, mode, out_path,
+                    progress_cb=None, quality_tier="maximum"):
+    """Remove burned-in captions from a band of the frame.
+
+    region: {"top_pct": .., "bottom_pct": ..}; mode: crop|fill|ai.
+    Returns out_path. Progress via progress_cb(pct, stage_text)."""
+    if not os.path.isfile(video_path):
+        raise RuntimeError("Video file not found: " + str(video_path))
+    if mode not in ("crop", "fill", "ai"):
+        raise ValueError("Unknown caption-removal mode: " + str(mode))
+    W, H, _fps = probe_video(video_path)
+    if not W or not H:
+        raise RuntimeError("Could not read the video's dimensions.")
+    duration = probe_duration(video_path) or 0.0
+    y0, y1 = _remover_band(region, H)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)),
+                exist_ok=True)
+    if progress_cb:
+        progress_cb(2, "Preparing")
+    if mode == "crop":
+        _remove_captions_crop(video_path, out_path, W, H, y0, y1,
+                              duration, progress_cb, quality_tier)
+    elif mode == "fill":
+        _remove_captions_fill(video_path, out_path, W, H, y0, y1,
+                              duration, progress_cb, quality_tier)
+    else:
+        _remove_captions_ai(video_path, out_path, W, H, y0, y1,
+                            duration, progress_cb, quality_tier)
+    if not os.path.isfile(out_path) \
+            or os.path.getsize(out_path) < 1024:
+        raise RuntimeError("Caption removal produced no output file.")
+    if progress_cb:
+        progress_cb(100, "Done")
+    return out_path
+
+
+def _remove_captions_crop(src, out, W, H, y0, y1, duration, cb, tier):
+    parts = []
+    if y0 > 0:
+        parts.append((0, y0))
+    if y1 < H:
+        parts.append((y1, H - y1))
+    if not parts:
+        raise ValueError("The caption region covers the whole frame - "
+                         "there is nothing left to keep in Crop mode. "
+                         "Use Smart Fill or AI Inpaint instead.")
+    enc = _encode_args(tier)
+    if len(parts) == 1:
+        py, ph = parts[0]
+        vf = (f"crop={W}:{ph}:0:{py},"
+              f"scale={W}:{H}:flags=lanczos")
+        cmd = (["ffmpeg", "-y", "-i", src, "-vf", vf]
+               + enc + ["-c:a", "aac", "-b:a", "192k", out])
+    else:
+        (ay, ah), (by, bh) = parts
+        fc = (f"[0:v]split[a][b];"
+              f"[a]crop={W}:{ah}:0:{ay}[t];"
+              f"[b]crop={W}:{bh}:0:{by}[bt];"
+              f"[t][bt]vstack=inputs=2,"
+              f"scale={W}:{H}:flags=lanczos[v]")
+        cmd = (["ffmpeg", "-y", "-i", src, "-filter_complex", fc,
+                "-map", "[v]", "-map", "0:a?"]
+               + enc + ["-c:a", "aac", "-b:a", "192k", out])
+    _run_ffmpeg_progress(cmd, duration, cb, 5, 97,
+                         "Cropping the caption band out")
+
+
+def _remove_captions_fill(src, out, W, H, y0, y1, duration, cb, tier):
+    bh = y1 - y0
+    radius = max(10, min(60, bh // 3))
+    fc = (f"[0:v]split[base][tmp];"
+          f"[tmp]crop={W}:{bh}:0:{y0},"
+          f"boxblur=lr={radius}:lp=3:cr={max(6, radius // 2)}:cp=2,"
+          f"noise=alls=6:allf=t+u[band];"
+          f"[base][band]overlay=0:{y0}[v]")
+    cmd = (["ffmpeg", "-y", "-i", src, "-filter_complex", fc,
+            "-map", "[v]", "-map", "0:a?"]
+           + _encode_args(tier) + ["-c:a", "aac", "-b:a", "192k", out])
+    _run_ffmpeg_progress(cmd, duration, cb, 5, 97,
+                         "Filling the caption band")
+
+
+def _remove_captions_ai(src, out, W, H, y0, y1, duration, cb, tier):
+    import cv2
+    import numpy as np
+    import onnxruntime as ort
+
+    model = ensure_lama(cb)
+    if cb:
+        cb(16, "Loading AI inpainting model")
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = os.cpu_count() or 2
+    sess = ort.InferenceSession(model, sess_options=opts,
+                                providers=["CPUExecutionProvider"])
+    inputs = {i.name: i for i in sess.get_inputs()}
+    img_name = next((n for n in inputs if "image" in n.lower()
+                     or "img" in n.lower()), sess.get_inputs()[0].name)
+    mask_name = next((n for n in inputs if "mask" in n.lower()),
+                     sess.get_inputs()[-1].name)
+    fixed = inputs[img_name].shape  # fixed HxW if the export is static
+
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open the video for AI inpainting.")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    # Working crop: the band plus an equal amount of clean context.
+    pad = max(16, y1 - y0)
+    cy0 = max(0, y0 - pad)
+    cy1 = min(H, y1 + pad)
+    ch = cy1 - cy0
+    if isinstance(fixed[2], int) and isinstance(fixed[3], int):
+        wh, ww = fixed[2], fixed[3]
+    else:
+        scale = min(1.0, 768.0 / W)
+        ww = max(64, (int(round(W * scale)) // 8) * 8)
+        wh = max(64, (int(round(ch * scale)) // 8) * 8)
+    # band rows inside the working crop
+    by0 = int(round((y0 - cy0) * wh / ch))
+    by1 = max(by0 + 1, int(round((y1 - cy0) * wh / ch)))
+    mask = np.zeros((1, 1, wh, ww), dtype=np.float32)
+    mask[:, :, max(0, by0 - 2):min(wh, by1 + 2), :] = 1.0
+
+    log_path = out + ".ffmpeg.log"
+    logf = open(log_path, "wb")
+    proc = subprocess.Popen(
+        ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+         "-s", f"{W}x{H}", "-r", f"{fps:.3f}", "-i", "-",
+         "-i", src, "-map", "0:v", "-map", "1:a?",
+         ] + _encode_args(tier) + [
+         "-c:a", "aac", "-b:a", "192k", "-shortest", out],
+        stdin=subprocess.PIPE, stdout=logf, stderr=logf)
+    n = 0
+    inpainted = 0
+    last_small = None   # last working-crop frame that was inpainted
+    last_band = None    # its inpainted band, at full resolution
+    since_inpaint = 0
+    pipe_broken = False
+    try:
+        if cb:
+            cb(18, "AI inpainting frames")
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            crop = frame[cy0:cy1]
+            small = cv2.resize(crop, (ww, wh),
+                               interpolation=cv2.INTER_AREA)
+            # Temporal reuse: burned captions (and the scene behind
+            # them) usually sit still for stretches. If the working
+            # crop barely changed since the last inpainted frame,
+            # reuse that inpaint; force a fresh one every 30 frames.
+            reuse = False
+            if last_small is not None and since_inpaint < 30:
+                diff = float(np.abs(
+                    small.astype(np.int16)
+                    - last_small.astype(np.int16)).mean())
+                reuse = diff < 2.0
+            if reuse:
+                band = last_band
+                since_inpaint += 1
+            else:
+                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                inp = (rgb.astype(np.float32)
+                       / 255.0).transpose(2, 0, 1)[None]
+                res = sess.run(None, {img_name: inp,
+                                      mask_name: mask})[0]
+                o = np.asarray(res)[0].transpose(1, 2, 0)
+                if float(o.max()) <= 1.5:
+                    o = o * 255.0
+                o = np.clip(o, 0, 255).astype(np.uint8)
+                back = cv2.resize(cv2.cvtColor(o, cv2.COLOR_RGB2BGR),
+                                  (W, ch), interpolation=cv2.INTER_LINEAR)
+                band = back[y0 - cy0:y1 - cy0]
+                last_small = small
+                last_band = band
+                since_inpaint = 0
+                inpainted += 1
+            frame[y0:y1] = band
+            try:
+                proc.stdin.write(frame.tobytes())
+            except (BrokenPipeError, OSError):
+                pipe_broken = True
+                break
+            n += 1
+            if cb and total and n % 5 == 0:
+                cb(18 + int(77 * n / total),
+                   f"AI inpainting frames ({n}/{total})")
+    finally:
+        cap.release()
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=120)
+        except Exception:
+            proc.kill()
+        logf.close()
+    if pipe_broken:
+        raise RuntimeError("AI inpainting failed: the video encoder "
+                           "stopped early.")
+    if proc.returncode != 0 or n == 0:
+        tail = ""
+        try:
+            with open(log_path, errors="replace") as f:
+                tail = f.read()[-300:]
+        except OSError:
+            pass
+        raise RuntimeError("AI inpainting failed. " + tail)
+    if cb:
+        cb(97, f"AI inpainting done ({inpainted} of {n} frames "
+               f"newly inpainted)")
+    try:
+        os.remove(log_path)
+    except OSError:
+        pass

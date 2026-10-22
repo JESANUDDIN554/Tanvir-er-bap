@@ -1,0 +1,7 @@
+# NEVER push the license tooling or keys (private key lives here)
+tools/
+
+# runtime data
+work/
+__pycache__/
+*.pyc

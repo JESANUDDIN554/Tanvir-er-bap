@@ -4,14 +4,25 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Itraji Cliper</title>
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
+<link rel="shortcut icon" type="image/png" href="icon-192.png">
 <link rel="stylesheet" href="style.css">
+<style>
+  /* Caption Studio preview fonts (bundled OFL fonts, served by the app) */
+  @font-face { font-family: "Anton"; src: url("fonts/Anton-Regular.ttf"); }
+  @font-face { font-family: "Bebas Neue"; src: url("fonts/BebasNeue-Regular.ttf"); }
+  @font-face { font-family: "Montserrat"; src: url("fonts/Montserrat-ExtraBold.ttf"); }
+  @font-face { font-family: "Poppins"; src: url("fonts/Poppins-Bold.ttf"); }
+  @font-face { font-family: "Archivo Black"; src: url("fonts/ArchivoBlack-Regular.ttf"); }
+</style>
 </head>
 <body>
 
 <!-- Splash -->
 <div id="splash">
   <div class="splash-inner">
-    <div class="splash-logo-wrap">
+    <div class="splash-logo-wrap home-link" title="Home" role="button" tabindex="0" aria-label="Home — back to the start screen">
       <span class="splash-ring"></span>
       <svg class="splash-logo" viewBox="0 0 64 64" width="76" height="76" aria-hidden="true">
         <rect x="4" y="4" width="56" height="56" rx="16" fill="#C8FF2E"/>
@@ -25,7 +36,7 @@
 </div>
 
 <header class="topbar">
-  <div class="brand">
+  <div class="brand home-link" id="brandHome" title="Home" role="button" tabindex="0" aria-label="Home — back to the start screen">
     <svg class="brand-logo" viewBox="0 0 64 64" width="34" height="34" aria-hidden="true">
       <rect x="4" y="4" width="56" height="56" rx="16" fill="#C8FF2E"/>
       <text x="32" y="43" text-anchor="middle" font-size="30" font-weight="900" fill="#000000" font-family="system-ui, sans-serif">▶</text>
@@ -35,16 +46,24 @@
       <div class="brand-ver">v2.0</div>
     </div>
   </div>
+  <button id="backBtn" class="ghost-btn icon-btn nav-back" title="Back to the previous screen" disabled>
+    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+    <span>Back</span>
+  </button>
   <div class="steps-indicator">
-    <div class="step-dot" data-step="1"><span class="dot-num">1</span><span class="dot-label">Import</span></div>
+    <div class="step-dot" data-step="1" title="Step 1 — Import"><span class="dot-num">1</span><span class="dot-label">Import</span></div>
     <div class="step-line"></div>
-    <div class="step-dot" data-step="2"><span class="dot-num">2</span><span class="dot-label">Customize</span></div>
+    <div class="step-dot" data-step="2" title="Step 2 — Customize"><span class="dot-num">2</span><span class="dot-label">Customize</span></div>
     <div class="step-line"></div>
-    <div class="step-dot" data-step="3"><span class="dot-num">3</span><span class="dot-label">Clips</span></div>
+    <div class="step-dot" data-step="3" title="Step 3 — Clips"><span class="dot-num">3</span><span class="dot-label">Clips</span></div>
   </div>
   <button id="libraryBtn" class="ghost-btn icon-btn" title="Library — your saved videos">
     <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
     <span>Library</span>
+  </button>
+  <button id="removerBtn" class="ghost-btn icon-btn" title="Caption Remover — strip captions already burned into a video">
+    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20H8L3.7 15.7a2.4 2.4 0 0 1 0-3.4L12 3.6a2.4 2.4 0 0 1 3.4 0l5.3 5.3a2.4 2.4 0 0 1 0 3.4L13 20"/><path d="M7.5 10.5l6 6"/></svg>
+    <span>Caption Remover</span>
   </button>
   <button id="settingsBtn" class="ghost-btn icon-btn" title="Settings">
     <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -115,6 +134,51 @@
     </div>
   </section>
 
+  <!-- ============ LIVE ANALYSIS (during-processing view) ============ -->
+  <section id="livePanel" class="card step-card hidden">
+    <div class="row-between">
+      <h2><span class="live-dot" id="liveDot"></span> Live Analysis</h2>
+      <span id="liveBadge" class="live-badge processing">PROCESSING</span>
+    </div>
+    <div class="live-grid">
+      <div class="live-main">
+        <div class="live-frame" id="liveFrame">
+          <img id="liveThumb" class="hidden" alt="video thumbnail">
+          <div id="liveThumbFallback" class="live-thumb-fallback">
+            <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="3"/><path d="M10 9l5 3-5 3z" fill="currentColor" stroke="none"/></svg>
+          </div>
+          <div class="live-grid-overlay"></div>
+          <div class="live-scanline" id="liveScanline"></div>
+          <span class="live-corner tl"></span><span class="live-corner tr"></span>
+          <span class="live-corner bl"></span><span class="live-corner br"></span>
+          <span id="livePhaseChip" class="live-chip left">SCANNING CONTENT</span>
+          <span id="liveStateChip" class="live-chip right">PROCESSING</span>
+        </div>
+        <div class="live-readouts">
+          <div class="live-line" id="liveLine1">&gt; AUDIO_TRANSCRIPT: —</div>
+          <div class="live-line" id="liveLine2">&gt; ANALYSIS: —</div>
+          <div class="live-eq" id="liveEq" aria-hidden="true">
+            <span></span><span></span><span></span><span></span>
+            <span></span><span></span><span></span>
+          </div>
+        </div>
+        <details class="live-logwrap" open>
+          <summary>System log</summary>
+          <div id="liveLog" class="live-log"></div>
+        </details>
+      </div>
+      <aside class="live-rail">
+        <div class="field-label">Generated clips</div>
+        <div id="liveRailEmpty" class="live-rail-empty">
+          <div class="spinner"></div>
+          <p>Waiting for clips… they appear here one by one as each finishes rendering.</p>
+        </div>
+        <div id="liveRailList"></div>
+        <button id="liveGoClips" class="ghost-btn small hidden" type="button">Open clips &amp; tools →</button>
+      </aside>
+    </div>
+  </section>
+
   <!-- ============ STEP 2: CUSTOMIZE ============ -->
   <section id="step2" class="card step-card hidden">
     <div class="card-kicker">Step 2 · Customize</div>
@@ -125,7 +189,7 @@
 
     <div class="row row-tight">
       <div class="segmented" id="detectModeSeg">
-        <button type="button" data-value="ai" class="seg">AI (Gemini key)</button>
+        <button type="button" data-value="local" class="seg on">Built-in AI (no key)</button>
         <button type="button" data-value="offline" class="seg">Offline (no key)</button>
       </div>
       <div class="segmented" id="clipCountSeg" title="How many clips to find">
@@ -137,6 +201,16 @@
       </div>
     </div>
     <p class="sub" id="detectModeSub" style="margin-top:8px"></p>
+
+    <div id="localAiCard" class="find-box hidden" style="margin-top:10px">
+      <div class="field-label">Built-in AI <span class="hint">— a professional AI model that runs on your PC. No key, no internet.</span></div>
+      <p class="sub" id="localAiText" style="margin-top:6px">First use needs a one-time download of the AI model (~9 GB). After that it works fully offline, forever.</p>
+      <div class="bar hidden" id="localAiBarWrap" style="margin-top:10px"><div id="localAiBar" class="fill"></div></div>
+      <div class="row row-tight" style="margin-top:10px">
+        <button id="localAiDownloadBtn" class="ghost-btn" type="button">Download Built-in AI (~9 GB)</button>
+        <span class="hint" id="localAiPct"></span>
+      </div>
+    </div>
 
     <div class="find-box">
       <div class="field-label">Find clip moment <span class="hint">— describe a moment, e.g. "the explosion" or "funny reaction"</span></div>
@@ -177,19 +251,18 @@
     <div class="field">
       <label class="field-label">Clip length</label>
       <div class="segmented wrap" id="clipLenPills">
-        <button type="button" data-value="15s" class="seg">15s</button>
-        <button type="button" data-value="30s" class="seg">30s</button>
-        <button type="button" data-value="60s" class="seg on">60s</button>
-        <button type="button" data-value="90s" class="seg">90s</button>
-        <button type="button" data-value="2min" class="seg">2min</button>
-        <button type="button" data-value="3min" class="seg">3min</button>
-        <button type="button" data-value="5min" class="seg">5min</button>
-        <button type="button" data-value="10min" class="seg">10min</button>
-        <button type="button" data-value="15min" class="seg">15min</button>
+        <button type="button" data-value="15-30" class="seg">15–30s</button>
+        <button type="button" data-value="30-60" class="seg on">30–60s</button>
+        <button type="button" data-value="60-90" class="seg">60–90s</button>
+        <button type="button" data-value="90-120" class="seg">90s–2m</button>
+        <button type="button" data-value="120-180" class="seg">2–3m</button>
+        <button type="button" data-value="180-300" class="seg">3–5m</button>
+        <button type="button" data-value="300-600" class="seg">5–10m</button>
+        <button type="button" data-value="600-900" class="seg">10–15m</button>
       </div>
       <div class="row row-tight" style="margin-top:10px">
-        <input id="customLenInput" type="text" inputmode="numeric" placeholder="Custom seconds, e.g. 45" style="max-width:220px">
-        <span class="hint">Custom overrides the presets above.</span>
+        <input id="customLenInput" type="text" placeholder="Custom range, e.g. 30-60 — or one number for exact" style="max-width:320px">
+        <span class="hint">Custom overrides the ranges above.</span>
       </div>
     </div>
 
@@ -226,6 +299,7 @@
     <div class="field">
       <label class="field-label">Caption style</label>
       <div class="style-grid" id="styleCards">
+        <button type="button" class="style-card" data-value="none"><span class="style-preview sp-none">No captions</span><span class="style-name">No Captions</span></button>
         <button type="button" class="style-card" data-value="bold-pop"><span class="style-preview sp-bold">YOUR <em>WORDS</em> POP</span><span class="style-name">Bold Pop</span></button>
         <button type="button" class="style-card" data-value="lime-punch"><span class="style-preview sp-lime">YOUR <em>WORDS</em> POP</span><span class="style-name">Lime Punch</span></button>
         <button type="button" class="style-card" data-value="clean"><span class="style-preview sp-clean">YOUR <em>WORDS</em> POP</span><span class="style-name">Clean White</span></button>
@@ -363,6 +437,77 @@
     </div>
     <div id="libraryGrid" class="library-grid"></div>
   </section>
+
+  <!-- ============ CAPTION REMOVER ============ -->
+  <section id="removerView" class="card step-card hidden">
+    <div class="card-kicker">Caption Remover</div>
+    <div class="row-between">
+      <h2>Remove captions burned into a video</h2>
+      <button id="removerBackBtn" class="ghost-btn">← Back to studio</button>
+    </div>
+    <p class="sub">For videos that already have captions baked into the picture. Pick the video, mark the band where the captions sit, choose a method, and run — the rest of the frame stays untouched.</p>
+
+    <div class="field">
+      <label class="field-label" for="removerUrl">Video link</label>
+      <input id="removerUrl" type="text" placeholder="https://youtube.com/watch?v=…">
+    </div>
+    <div class="field">
+      <label class="field-label" for="removerPath">…or a file on this PC</label>
+      <input id="removerPath" type="text" placeholder="C:\Videos\clip.mp4">
+    </div>
+
+    <div class="field">
+      <label class="field-label">Caption region</label>
+      <div class="segmented" id="removerRegionSeg">
+        <button type="button" data-value="bottom" class="seg on">Bottom band</button>
+        <button type="button" data-value="top" class="seg">Top band</button>
+        <button type="button" data-value="custom" class="seg">Custom</button>
+      </div>
+      <div id="removerSliders" class="hidden" style="margin-top:12px">
+        <div class="row row-tight">
+          <label class="hint" style="min-width:86px">Region top <span id="removerTopVal">82%</span></label>
+          <input id="removerTop" type="range" min="0" max="98" value="82" style="flex:1">
+        </div>
+        <div class="row row-tight">
+          <label class="hint" style="min-width:86px">Region bottom <span id="removerBotVal">100%</span></label>
+          <input id="removerBot" type="range" min="2" max="100" value="100" style="flex:1">
+        </div>
+      </div>
+      <div class="remover-stage" id="removerStage">
+        <div class="remover-stage-label" id="removerStageLabel">Region preview — the highlighted band is what gets cleaned</div>
+        <div class="remover-region" id="removerRegionBox"></div>
+        <video id="removerVideo" class="hidden" controls playsinline></video>
+      </div>
+    </div>
+
+    <div class="field">
+      <label class="field-label">Method</label>
+      <div class="mode-grid" id="removerModePicker">
+        <button type="button" class="mode-card on" data-value="crop"><span class="mode-name">Crop Band</span><span class="mode-desc">Cuts the band out and stretches the frame back to full size. Instant, zero artifacts — the picture gets slightly taller-looking.</span></button>
+        <button type="button" class="mode-card" data-value="fill"><span class="mode-name">Smart Fill</span><span class="mode-desc">Fills the band with a texture blend sampled from the band itself. Fast, keeps the framing — soft where captions were.</span></button>
+        <button type="button" class="mode-card" data-value="ai"><span class="mode-name">AI Inpaint</span><span class="mode-desc">A LaMa AI model rebuilds what's behind the captions. Best quality, slowest. First use downloads the model once (~198 MB).</span></button>
+      </div>
+    </div>
+
+    <div class="row">
+      <button id="removerRunBtn" class="primary-btn">Remove captions</button>
+    </div>
+    <div id="removerProgress" class="hidden" style="margin-top:14px">
+      <div class="bar"><div id="removerBar" class="fill"></div></div>
+      <div class="hint" id="removerStageText" style="margin-top:6px">Starting…</div>
+    </div>
+    <p id="removerError" class="error hidden"></p>
+    <details class="live-logwrap hidden" id="removerLogWrap">
+      <summary>System log</summary>
+      <div id="removerLog" class="live-log"></div>
+    </details>
+    <div id="removerResult" class="hidden" style="margin-top:14px">
+      <div class="row">
+        <a id="removerDownload" class="primary-btn" href="#" download="cleaned-video.mp4">Download cleaned video</a>
+        <span class="hint">The preview above is the cleaned video.</span>
+      </div>
+    </div>
+  </section>
 </main>
 
 <!-- caption editor + trim modal -->
@@ -389,6 +534,88 @@
   </div>
 </div>
 
+<!-- ============ CAPTION STUDIO ============ -->
+<div id="captionStudioModal" class="modal hidden">
+  <div class="modal-box studio-box">
+    <div class="row-between">
+      <h2>Caption Studio</h2>
+      <button id="studioClose" class="ghost-btn small" type="button">✕ Close</button>
+    </div>
+    <p class="sub" id="studioClipTitle"></p>
+    <div class="studio-grid">
+      <div class="studio-left">
+        <div class="studio-frame">
+          <video id="studioVideo" muted playsinline preload="auto"></video>
+          <div id="studioOverlay" class="studio-overlay pos-bottom">
+            <div id="studioLine" class="studio-line"></div>
+          </div>
+        </div>
+        <p class="hint">Preview — final render may differ slightly.</p>
+        <details class="studio-edit">
+          <summary>Edit caption text</summary>
+          <textarea id="studioWords" rows="3" spellcheck="false"></textarea>
+          <div class="row row-tight">
+            <button id="studioSaveWords" class="ghost-btn small" type="button">Save text</button>
+            <span class="hint">Saved text is used when the clip re-renders.</span>
+          </div>
+        </details>
+      </div>
+      <div class="studio-right">
+        <div class="field-label">Preset</div>
+        <div id="studioPresets" class="preset-grid"></div>
+        <div class="studio-controls">
+          <div class="ctl">
+            <label class="field-label" for="studioFont">Font</label>
+            <select id="studioFont"></select>
+          </div>
+          <div class="ctl">
+            <label class="field-label">Size</label>
+            <div class="seg-row" id="studioSizeSeg"></div>
+          </div>
+          <div class="ctl">
+            <label class="field-label">Position</label>
+            <div class="seg-row" id="studioPosSeg">
+              <button type="button" data-value="top" class="seg">Top</button>
+              <button type="button" data-value="middle" class="seg">Middle</button>
+              <button type="button" data-value="bottom" class="seg">Bottom</button>
+            </div>
+          </div>
+          <div class="ctl">
+            <label class="field-label">Animation</label>
+            <div class="seg-row" id="studioAnimSeg">
+              <button type="button" data-value="none" class="seg">None</button>
+              <button type="button" data-value="pop" class="seg">Pop</button>
+              <button type="button" data-value="glow" class="seg">Glow</button>
+              <button type="button" data-value="box" class="seg">Box</button>
+            </div>
+          </div>
+          <div class="ctl">
+            <label class="field-label" for="studioDim">Dim inactive words — <span id="studioDimVal">55%</span></label>
+            <input id="studioDim" type="range" min="0" max="100" step="1">
+          </div>
+          <div class="ctl">
+            <label class="field-label" for="studioBorder">Border — <span id="studioBorderVal">3</span></label>
+            <input id="studioBorder" type="range" min="0" max="8" step="1">
+          </div>
+          <div class="ctl row row-tight">
+            <label class="chk"><input type="checkbox" id="studioUpper"> UPPERCASE</label>
+            <label class="chk"><input type="checkbox" id="studioOneWord"> One word at a time</label>
+          </div>
+          <div class="ctl row row-tight">
+            <label class="field-label">Text <input type="color" id="studioTextColor" value="#ffffff"></label>
+            <label class="field-label">Highlight <input type="color" id="studioHlColor" value="#c8ff2e"></label>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="row studio-actions">
+      <button id="studioApply" class="primary-btn" type="button">Apply &amp; re-render</button>
+      <button id="studioApplyAll" class="ghost-btn" type="button">Apply to all clips</button>
+      <button id="studioCancel" class="ghost-btn" type="button">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <!-- video preview modal -->
 <div id="previewModal" class="modal hidden">
   <div class="modal-box wide">
@@ -411,14 +638,6 @@
 <div id="settingsModal" class="modal hidden">
   <div class="modal-box">
     <h2>Settings</h2>
-    <div class="field">
-      <label class="field-label" for="apiKeyInput">Gemini API key</label>
-      <div class="key-row">
-        <input id="apiKeyInput" type="password" placeholder="AIza…" spellcheck="false" autocomplete="off">
-        <button id="keyToggle" class="ghost-btn small" type="button" title="Show / hide key">Show</button>
-      </div>
-      <p class="hint">Free — get one at <a href="#" id="keyHelp">aistudio.google.com</a>. Only needed for AI detection mode; Offline mode needs no key.</p>
-    </div>
     <div class="field">
       <label class="field-label">Appearance <span class="hint">— default matches the web app</span></label>
       <div class="segmented" id="themeSeg">

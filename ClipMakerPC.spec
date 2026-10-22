@@ -35,6 +35,8 @@ a = Analysis(
     datas=[
         ("ui", "ui"),
         ("models", "models"),  # YuNet face-detection model for face tracking
+        ("corepack.enc", "."),  # license-sealed core pack (prompts/styles)
+        ("fonts", "fonts"),  # bundled OFL caption fonts (Caption Studio)
     ],
     hiddenimports=[
         "faster_whisper",
@@ -45,6 +47,10 @@ a = Analysis(
         "waitress",
         "cv2",
         "numpy",
+        "local_ai",
+        "licensing",
+        "ed25519",
+        "integrity",
     ],
     hookspath=[],
     hooksconfig={},

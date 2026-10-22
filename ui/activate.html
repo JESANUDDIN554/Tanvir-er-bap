@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Itraji Cliper — Activation</title>
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<style>
+  :root { --accent: #C8FF2E; --bg: #0F0F13; --panel: #17171D; --line: #2A2A33;
+          --text: #F2F2F0; --muted: #9A9AA5; --danger: #FF6B6B; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font-family: "Segoe UI", system-ui, sans-serif;
+         display: flex; align-items: center; justify-content: center;
+         min-height: 100vh; padding: 24px; }
+  .card { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 16px; max-width: 520px; width: 100%;
+          padding: 36px 34px; }
+  .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+  .brand img { width: 40px; height: 40px; border-radius: 9px; }
+  .brand b { font-size: 21px; letter-spacing: .2px; }
+  .brand b span { color: var(--accent); }
+  h1 { font-size: 19px; margin: 14px 0 8px; }
+  p { color: var(--muted); font-size: 14px; line-height: 1.55; margin: 6px 0; }
+  .code { font-family: Consolas, "Cascadia Mono", monospace; font-size: 20px;
+          letter-spacing: 2px; background: #0B0B0E; border: 1px solid var(--line);
+          border-radius: 10px; padding: 12px 14px; margin: 14px 0 6px;
+          display: flex; justify-content: space-between; align-items: center; }
+  .code button { background: none; border: 1px solid var(--line); color: var(--muted);
+                 border-radius: 7px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+  .code button:hover { color: var(--text); border-color: var(--accent); }
+  textarea { width: 100%; min-height: 78px; resize: vertical; margin-top: 12px;
+             background: #0B0B0E; color: var(--text); border: 1px solid var(--line);
+             border-radius: 10px; padding: 11px 12px; font-size: 13px;
+             font-family: Consolas, "Cascadia Mono", monospace; }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .activate { width: 100%; margin-top: 14px; background: var(--accent); color: #10130A;
+              border: none; border-radius: 10px; padding: 13px; font-size: 15px;
+              font-weight: 700; cursor: pointer; }
+  .activate:hover { filter: brightness(1.08); }
+  .activate:disabled { opacity: .55; cursor: default; }
+  .err { color: var(--danger); font-size: 13.5px; min-height: 20px; margin-top: 10px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand"><img src="icon-192.png" alt=""><b>Itraji <span>Cliper</span></b></div>
+
+  <div id="lockedBox">
+    <h1>This copy is locked</h1>
+    <p>Itraji Cliper is licensed per computer. Send this machine code to
+       the seller to get your license key, then paste the key below.</p>
+    <div class="code"><span id="machineCode">····-····-····-····</span>
+      <button type="button" id="copyBtn">Copy</button></div>
+    <textarea id="keyBox" placeholder="Paste your license key here (starts with ITRAJI1.)" spellcheck="false"></textarea>
+    <button type="button" class="activate" id="activateBtn">Activate</button>
+    <div class="err" id="errLine"></div>
+  </div>
+
+  <div id="tamperedBox" class="hidden">
+    <h1>This copy has been modified</h1>
+    <p>Some of the app's files no longer match the signed originals, so
+       Itraji Cliper won't run. Reinstall the app from the original
+       download, then activate it with your license key.</p>
+  </div>
+</div>
+<script>
+async function api(name, args) {
+  const r = await fetch("/api/" + name, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({args: args || []})});
+  return r.json();
+}
+const errLine = document.getElementById("errLine");
+(async () => {
+  try {
+    const st = await api("license_status");
+    if (st.tampered) {
+      document.getElementById("lockedBox").classList.add("hidden");
+      document.getElementById("tamperedBox").classList.remove("hidden");
+      return;
+    }
+    if (!st.locked) { location.reload(); return; }
+    document.getElementById("machineCode").textContent = st.machine_code || "—";
+    if (st.reason && st.reason !== "not activated") errLine.textContent = st.reason;
+  } catch (e) { errLine.textContent = "Could not reach the app. Try reopening it."; }
+})();
+document.getElementById("copyBtn").addEventListener("click", async () => {
+  const code = document.getElementById("machineCode").textContent;
+  try { await navigator.clipboard.writeText(code); } catch (e) {}
+  document.getElementById("copyBtn").textContent = "Copied";
+  setTimeout(() => document.getElementById("copyBtn").textContent = "Copy", 1400);
+});
+document.getElementById("activateBtn").addEventListener("click", async () => {
+  const btn = document.getElementById("activateBtn");
+  const key = document.getElementById("keyBox").value.trim();
+  errLine.textContent = "";
+  if (!key) { errLine.textContent = "Paste your license key first."; return; }
+  btn.disabled = true; btn.textContent = "Checking…";
+  try {
+    const r = await api("activate_license", [key]);
+    if (r.ok) { location.reload(); return; }
+    errLine.textContent = r.error || "That key was not accepted.";
+  } catch (e) { errLine.textContent = "Could not reach the app. Try again."; }
+  btn.disabled = false; btn.textContent = "Activate";
+});
+</script>
+</body>
+</html>

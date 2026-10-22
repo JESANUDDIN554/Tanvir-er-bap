@@ -3,8 +3,8 @@
 Runs a localhost HTTP server for the local UI and opens it in a
 desktop-style Chrome/Edge app window. Zero native dependencies
 (no pywebview / .NET needed).
-All video work runs on this machine; only viral-moment detection
-calls the Google Gemini API with the user's own free key.
+All video work runs on this machine, including the optional
+Built-in AI (a local model) - nothing is sent to any cloud service.
 """
 
 import json
@@ -25,16 +25,25 @@ if getattr(sys, "frozen", False):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pipeline import (  # noqa: E402
-    download_video, transcribe, detect_moments, detect_moments_offline,
+    download_video, transcribe, detect_moments_offline,
+    detect_moments_local,
     find_moments_by_keywords, parse_srt_file,
     render_clip, retime_words, write_srt, write_vtt, write_xml_timeline,
-    merge_clips, probe_duration, set_custom_styles,
-    generate_posting_package,
+    merge_clips, probe_duration, probe_video, set_custom_styles,
+    generate_posting_package, remove_captions,
     LANGUAGES, GENRES, RATIOS,
 )
 
+import local_ai  # noqa: E402  (built-in local LLM: engine/model/server)
+import licensing  # noqa: E402  (signed license + core pack + integrity)
+from pipeline import load_corepack as _load_corepack  # noqa: E402
+import pipeline as _pipeline  # noqa: E402
+
+_pipeline.FONTS_DIR = os.path.join(BASE_DIR, "fonts")
+
 JOBS = {}
 BATCHES = {}
+_REMOVER_JOBS = {}  # Caption Remover runs (session-only, not Library)
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"),
                               ".clipmaker_pc_settings.json")
 
@@ -160,8 +169,8 @@ def _load_library():
             "created": data.get("created", 0) or os.path.getmtime(meta)}
 
 DEFAULT_SETTINGS = {
-    "api_key": "",
-    "clip_length": "60s",          # preset key, see CLIP_LEN_PRESETS
+    "detect_mode": "local",        # "local" (Built-in AI) or "offline"
+    "clip_length": "30-60",        # range string "min-max" seconds
     "clip_count": 8,
     "caption_style": "bold-pop",
     "custom_styles": [],           # [{name, primary, secondary, outline, bold}]
@@ -214,10 +223,17 @@ def load_settings():
         data = {}
     merged = dict(DEFAULT_SETTINGS)
     merged.update(data or {})
+    # Migration: the old cloud-AI option is gone. A stored key from an
+    # old settings file is stripped (and never written back), and the
+    # old "ai" detect mode lands on the Built-in AI.
+    merged.pop("api_key", None)
+    if merged.get("detect_mode") not in ("local", "offline"):
+        merged["detect_mode"] = "local"
     return merged
 
 
 def save_settings(data):
+    data = {k: v for k, v in (data or {}).items() if k != "api_key"}
     try:
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f)
@@ -244,6 +260,32 @@ def _job_progress(job_id):
     return cb
 
 
+_JOB_LOG_CAP = 300
+
+
+def _job_log(job_id, text):
+    """Append a REAL milestone line to a job's event log (the Live
+    Analysis console). Only called at points where the event actually
+    happened - nothing here is decorative."""
+    job = JOBS.get(job_id)
+    if job is None:
+        return
+    log = job.setdefault("log", [])
+    log.append({"t": time.time(), "text": str(text)})
+    if len(log) > _JOB_LOG_CAP:
+        del log[:len(log) - _JOB_LOG_CAP]
+
+
+def _remover_log(rid, text):
+    st = _REMOVER_JOBS.get(rid)
+    if st is None:
+        return
+    log = st.setdefault("log", [])
+    log.append({"t": time.time(), "text": str(text)})
+    if len(log) > _JOB_LOG_CAP:
+        del log[:len(log) - _JOB_LOG_CAP]
+
+
 class Api:
     # -- options -------------------------------------------------------
     def get_options(self):
@@ -251,6 +293,14 @@ class Api:
         return {"languages": LANGUAGES,
                 "genre_defaults": GENRES,
                 "ratios": list(RATIOS.keys())}
+
+    def caption_presets(self):
+        """Caption Studio data: preset bundles + font/size lists."""
+        return {"ok": True,
+                "presets": _pipeline.CAPTION_PRESETS,
+                "fonts": _pipeline.CAPTION_FONTS,
+                "sizes": list(_pipeline.CAPTION_SIZES.keys()),
+                "size_scales": _pipeline.CAPTION_SIZES}
 
     # -- settings ------------------------------------------------------
     def get_settings(self):
@@ -270,8 +320,9 @@ class Api:
                         "video_path": "", "title": "", "duration": 0,
                         "words": [], "moments": [], "renders": [],
                         "language": "auto", "source": "url",
-                        "created": time.time()}
+                        "created": time.time(), "log": []}
         _prune_jobs()
+        _job_log(job_id, "Job queued")
         return job_id
 
     def import_url(self, url, use_cookies=False, language="auto"):
@@ -302,7 +353,9 @@ class Api:
             job["status"] = "error"
             job["error"] = "That file isn't a readable video."
             job["stage"] = "Failed"
+            _job_log(job_id, "ERROR: " + job["error"])
             return {"ok": True, "job_id": job_id}
+        _job_log(job_id, "Local file: " + job["title"])
         t = threading.Thread(target=self._run_transcribe_only,
                              args=(job_id, language or "auto"), daemon=True)
         t.start()
@@ -394,21 +447,29 @@ class Api:
         job = JOBS[job_id]
         try:
             workdir = os.path.join(BASE_DIR, "work", job_id)
+            _job_log(job_id, "Download started")
             video_path, title, duration = download_video(
                 url, workdir, _job_progress(job_id),
                 use_cookies=use_cookies)
             job.update({"video_path": video_path, "title": title,
                         "duration": duration})
+            try:
+                _mb = os.path.getsize(video_path) / (1024 * 1024)
+                _job_log(job_id, f"Download finished ({_mb:.1f} MB)")
+            except OSError:
+                _job_log(job_id, "Download finished")
             self._run_transcribe_only(job_id, language)
         except Exception as e:  # noqa: BLE001 - surfaced to UI
             job["status"] = "error"
             job["error"] = self._friendly_error(e)
             job["stage"] = "Failed"
+            _job_log(job_id, "ERROR: " + job["error"])
 
     def _run_transcribe_only(self, job_id, language):
         job = JOBS[job_id]
         try:
             job["language"] = language
+            _job_log(job_id, "Transcription started")
             words = transcribe(job["video_path"], "base",
                                _job_progress(job_id), language=language)
             if not words:
@@ -417,11 +478,16 @@ class Api:
             job["status"] = "transcribed"
             job["stage"] = "Transcript ready"
             job["progress"] = 100
+            _done = f"Transcription finished - {len(words)} words"
+            if language and language != "auto":
+                _done += f", language: {language}"
+            _job_log(job_id, _done)
             _save_job(job_id)
         except Exception as e:  # noqa: BLE001 - surfaced to UI
             job["status"] = "error"
             job["error"] = self._friendly_error(e)
             job["stage"] = "Failed"
+            _job_log(job_id, "ERROR: " + job["error"])
 
     def import_srt_transcript(self, job_id, srt_path):
         """Replace the job's transcript with words parsed from an SRT file."""
@@ -444,6 +510,7 @@ class Api:
         job["status"] = "transcribed"
         job["stage"] = f"Transcript ready ({len(words)} words from SRT)"
         job["progress"] = 100
+        _job_log(job_id, f"Transcript loaded from SRT - {len(words)} words")
         _save_job(job_id)
         return {"ok": True, "word_count": len(words)}
 
@@ -485,14 +552,32 @@ class Api:
     # -- moment detection ----------------------------------------------
     @staticmethod
     def _clip_len_range(clip_len):
-        key = (clip_len or "60s").strip()
+        """Map the UI's clip-length value to (min_s, max_s).
+
+        Current UI sends a RANGE string "30-60" (seconds), or
+        "custom:<range-or-single>". Legacy single lengths ("60s",
+        "custom:45") still resolve - a single custom number is now an
+        exact length (min == max)."""
+        import re
+        key = (clip_len or "30-60").strip()
+
+        def _range(a, b):
+            return (max(5, min(a, b)), max(5, max(a, b)))
+
+        m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", key)
+        if m:  # explicit range from the range pills
+            return _range(int(m.group(1)), int(m.group(2)))
         if key.startswith("custom:"):
+            raw = key.split(":", 1)[1].strip()
+            m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", raw)
+            if m:
+                return _range(int(m.group(1)), int(m.group(2)))
             try:
-                p = max(5, int(key.split(":")[1]))
-                return (round(p * 0.75), round(p * 1.25))
-            except (ValueError, IndexError):
+                p = max(5, int(raw))
+                return (p, p)  # single number = exact length
+            except ValueError:
                 pass
-        return CLIP_LEN_PRESETS.get(key, CLIP_LEN_PRESETS["60s"])
+        return CLIP_LEN_PRESETS.get(key, (30, 60))
 
     @staticmethod
     def _clip_count(n):
@@ -502,64 +587,11 @@ class Api:
             n = 8
         return max(1, min(40, n))  # hard cap 40
 
-    def detect(self, job_id, max_clips=8, clip_len="60s"):
-        job = JOBS.get(job_id)
-        if not job or job["status"] != "transcribed":
-            return {"ok": False, "error": "Import a video first."}
-        settings = load_settings()
-        api_key = settings.get("api_key", "").strip()
-        if not api_key:
-            return {"ok": False, "error": "no_api_key",
-                    "message": "Paste your free Gemini API key in Settings first "
-                               "(get one at aistudio.google.com), or use "
-                               "Offline mode."}
-        clip_min, clip_max = self._clip_len_range(clip_len)
-        job["status"] = "working"
-        job.pop("detect_error", None)  # don't ship a stale failure
-        t = threading.Thread(
-            target=self._run_detect,
-            args=(job_id, api_key, clip_min, clip_max,
-                  self._clip_count(max_clips)),
-            daemon=True)
-        t.start()
-        return {"ok": True}
-
-    def _run_detect(self, job_id, api_key, clip_min, clip_max, max_clips):
-        job = JOBS[job_id]
-        try:
-            moments = detect_moments(
-                job["words"], api_key, clip_min, clip_max,
-                max_clips=max_clips, progress_cb=_job_progress(job_id))
-            if not moments:
-                raise RuntimeError("no_moments")
-            # keep keyword-search ("matched") moments a concurrent
-            # find_moments call may have added; replace the rest
-            kept = [m for m in job.get("moments", []) if m.get("matched")]
-            job["moments"] = kept + moments
-            job["status"] = "moments"
-            job["stage"] = f"Found {len(moments)} moments"
-            job["progress"] = 100
-            job.pop("detect_error", None)
-            _save_job(job_id)
-        except Exception as e:  # noqa: BLE001
-            # back to transcript state - unless keyword moments from
-            # find_moments are still present, then stay on moments
-            job["status"] = ("moments" if job.get("moments")
-                             else "transcribed")
-            msg = str(e)
-            if "no_api_key" in msg or "bad_api_key" in msg:
-                job["detect_error"] = ("Gemini API key was rejected. "
-                                       "Check the key in Settings.")
-            elif "no_moments" in msg:
-                job["detect_error"] = ("The AI found no strong moments in "
-                                       "this transcript.")
-            else:
-                job["detect_error"] = "Moment detection failed: " + msg[:220]
-            job["stage"] = "Transcript ready"
-            job["progress"] = 100
-
-    # -- offline moment detection (no API key) ---------------------------
+    # -- offline moment detection (heuristic, no model) ---------------------------
     def detect_offline(self, job_id, max_clips=8, clip_len="60s"):
+        gate = _license_gate()
+        if gate:
+            return gate
         job = JOBS.get(job_id)
         if not job or job["status"] != "transcribed":
             return {"ok": False, "error": "Import a video first."}
@@ -577,6 +609,7 @@ class Api:
     def _run_detect_offline(self, job_id, clip_min, clip_max, max_clips):
         job = JOBS[job_id]
         try:
+            _job_log(job_id, "Detection started (Offline)")
             job["stage"] = "Scanning transcript (offline)"
             job["progress"] = 40
             moments = detect_moments_offline(
@@ -591,6 +624,8 @@ class Api:
             job["stage"] = f"Found {len(moments)} moments (offline)"
             job["progress"] = 100
             job.pop("detect_error", None)
+            _job_log(job_id, f"Detection finished - {len(moments)} "
+                             "moments found (Offline)")
             _save_job(job_id)
         except Exception as e:  # noqa: BLE001
             # back to transcript state - unless keyword moments from
@@ -605,6 +640,214 @@ class Api:
                                        + str(e)[:220])
             job["stage"] = "Transcript ready"
             job["progress"] = 100
+            _job_log(job_id, "ERROR: " + job.get("detect_error", ""))
+
+    # -- built-in AI moment detection (local LLM) ------------
+    def detect_local(self, job_id, max_clips=8, clip_len="60s"):
+        gate = _license_gate()
+        if gate:
+            return gate
+        job = JOBS.get(job_id)
+        if not job or job["status"] != "transcribed":
+            return {"ok": False, "error": "Import a video first."}
+        if not local_ai.model_ready():
+            return {"ok": False, "error": "local_ai_missing",
+                    "message": "The Built-in AI model isn't downloaded "
+                               "yet. Click 'Download Built-in AI' below "
+                               "(one-time, ~9 GB), then try again."}
+        clip_min, clip_max = self._clip_len_range(clip_len)
+        job["status"] = "working"
+        job.pop("detect_error", None)  # don't ship a stale failure
+        t = threading.Thread(
+            target=self._run_detect_local,
+            args=(job_id, clip_min, clip_max,
+                  self._clip_count(max_clips)),
+            daemon=True)
+        t.start()
+        return {"ok": True}
+
+    def _run_detect_local(self, job_id, clip_min, clip_max, max_clips):
+        job = JOBS[job_id]
+        try:
+            _job_log(job_id, "Detection started (Built-in AI)")
+            moments = detect_moments_local(
+                job["words"], clip_min, clip_max,
+                max_clips=max_clips, progress_cb=_job_progress(job_id))
+            if not moments:
+                raise RuntimeError("no_moments")
+            # keep keyword-search ("matched") moments a concurrent
+            # find_moments call may have added; replace the rest
+            kept = [m for m in job.get("moments", []) if m.get("matched")]
+            job["moments"] = kept + moments
+            job["status"] = "moments"
+            job["stage"] = f"Found {len(moments)} moments (built-in AI)"
+            job["progress"] = 100
+            job.pop("detect_error", None)
+            _job_log(job_id, f"Detection finished - {len(moments)} "
+                             "moments found (Built-in AI)")
+            _save_job(job_id)
+        except Exception as e:  # noqa: BLE001
+            # back to transcript state - unless keyword moments from
+            # find_moments are still present, then stay on moments
+            job["status"] = ("moments" if job.get("moments")
+                             else "transcribed")
+            msg = str(e)
+            if "no_moments" in msg:
+                job["detect_error"] = ("The Built-in AI found no strong "
+                                       "moments in this transcript.")
+            elif "not downloaded" in msg:
+                job["detect_error"] = msg[:300]
+            else:
+                job["detect_error"] = ("Built-in AI detection failed: "
+                                       + msg[:220])
+            job["stage"] = "Transcript ready"
+            job["progress"] = 100
+            _job_log(job_id, "ERROR: " + job.get("detect_error", ""))
+
+    # -- built-in AI download/status (Step 2 card) ------------------------
+    def local_ai_status(self):
+        st = local_ai.download_state()
+        info = local_ai.model_info()
+        return {"ok": True,
+                "ready": local_ai.model_ready(),
+                "downloading": bool(st.get("active")),
+                "pct": st.get("pct", 0),
+                "size_gb": info.get("size_gb", 0),
+                "error": st.get("error"),
+                "stage": st.get("stage", "")}
+
+    def local_ai_download(self):
+        local_ai.start_download()
+        return self.local_ai_status()
+
+    # -- licensing -------------------------------------------------------
+    def license_status(self):
+        st = _ensure_license()
+        payload = st.get("payload") or {}
+        return {"ok": True,
+                "locked": (not st.get("unlocked"))
+                          or bool(st.get("tampered")),
+                "tampered": bool(st.get("tampered")),
+                "machine_code": licensing.machine_code(),
+                "licensee": payload.get("name", ""),
+                "exp": payload.get("exp", ""),
+                "reason": st.get("reason", "")}
+
+    def activate_license(self, key):
+        st = licensing.try_unlock((key or "").strip(), BASE_DIR,
+                                  _load_corepack)
+        if st.get("unlocked"):
+            current = load_settings()
+            current["license_key"] = (key or "").strip()
+            save_settings(current)
+            return {"ok": True,
+                    "licensee": (st.get("payload") or {}).get("name", "")}
+        return {"ok": False, "error": st.get("reason")
+                or "That key was not accepted."}
+
+    # -- Caption Remover -------------------------------------------------
+    def caption_remover_probe(self, source):
+        """Dimensions of a LOCAL file, so the page can size its stage.
+        Links are probed after download instead (returns probed=False)."""
+        source = (source or "").strip()
+        if not source or source.lower().startswith(("http://", "https://")):
+            return {"ok": True, "probed": False}
+        if not os.path.isfile(source):
+            return {"ok": False, "error": "That file was not found on "
+                                          "this PC."}
+        try:
+            w, h, _f = probe_video(source)
+            return {"ok": True, "probed": True, "width": w, "height": h,
+                    "duration": probe_duration(source) or 0}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
+    def caption_remover_start(self, source, region=None, mode="crop"):
+        gate = _license_gate()
+        if gate:
+            return gate
+        source = (source or "").strip()
+        if not source:
+            return {"ok": False, "error": "Paste a video link or a "
+                                          "local file path first."}
+        if mode not in ("crop", "fill", "ai"):
+            return {"ok": False, "error": "Unknown removal method."}
+        try:
+            top = float((region or {}).get("top_pct", 82.0))
+            bot = float((region or {}).get("bottom_pct", 100.0))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "The caption region needs "
+                                          "numeric top/bottom values."}
+        if not (0.0 <= top <= 100.0 and 0.0 <= bot <= 100.0) \
+                or bot - top < 2.0:
+            return {"ok": False, "error": "The caption region is too "
+                                          "thin or outside the frame - "
+                                          "widen the band."}
+        is_url = source.lower().startswith(("http://", "https://"))
+        if not is_url and not os.path.isfile(source):
+            return {"ok": False, "error": "That file was not found on "
+                                          "this PC."}
+        rid = uuid.uuid4().hex[:12]
+        _REMOVER_JOBS[rid] = {"id": rid, "status": "running", "pct": 0,
+                              "stage": "Starting", "error": None,
+                              "url": None, "mode": mode, "log": []}
+        t = threading.Thread(target=self._run_remover,
+                             args=(rid, source, is_url,
+                                   {"top_pct": top, "bottom_pct": bot},
+                                   mode),
+                             daemon=True)
+        t.start()
+        return {"ok": True, "id": rid}
+
+    def _run_remover(self, rid, source, is_url, region, mode):
+        st = _REMOVER_JOBS[rid]
+
+        def cb(pct, text):
+            st["pct"] = max(0, min(100, int(pct)))
+            st["stage"] = text
+
+        mode_names = {"crop": "Crop Band", "fill": "Smart Fill",
+                      "ai": "AI Inpaint"}
+        _remover_log(rid, "Caption removal started ("
+                     + mode_names.get(mode, mode) + ")")
+        try:
+            settings = load_settings()
+            work = os.path.join(BASE_DIR, "work", "remover-" + rid)
+            os.makedirs(work, exist_ok=True)
+            if is_url:
+                _remover_log(rid, "Download started")
+                src = download_video(
+                    source, work,
+                    lambda p, t: cb(int(p * 0.25), t),
+                    use_cookies=bool(settings.get("use_browser_cookies")))
+                try:
+                    _mb = os.path.getsize(src) / (1024 * 1024)
+                    _remover_log(rid, f"Download finished ({_mb:.1f} MB)")
+                except OSError:
+                    _remover_log(rid, "Download finished")
+            else:
+                src = source
+            out = os.path.join(work, "output.mp4")
+            remove_captions(
+                src, region, mode, out,
+                progress_cb=lambda p, t: cb(25 + int(p * 0.75), t),
+                quality_tier=settings.get("quality_tier", "maximum"))
+            st["status"] = "done"
+            st["pct"] = 100
+            st["stage"] = "Done"
+            st["url"] = "/remover-files/" + rid + "/output.mp4"
+            _remover_log(rid, "Caption removal finished - output.mp4")
+        except Exception as e:
+            st["status"] = "error"
+            st["error"] = str(e)[:300]
+            _remover_log(rid, "ERROR: " + st["error"])
+
+    def caption_remover_status(self, rid):
+        st = _REMOVER_JOBS.get(rid or "")
+        if not st:
+            return {"ok": False, "error": "That removal job is gone "
+                                          "(the app was restarted)."}
+        return {"ok": True, **st}
 
     # -- caption editor ----------------------------------------------
     def _moment_words(self, job, index):
@@ -649,12 +892,15 @@ class Api:
 
     # -- AI posting package --------------------------------------------
     def posting_package(self, job_id, index):
+        gate = _license_gate()
+        if gate:
+            return gate
         """Per-clip posting package: 3 titles, FB description, hashtags.
 
-        Generated once per moment and cached on it. With a Gemini key ->
-        AI copy ("ai" mode); without -> extractive on-PC fallback
-        ("extractive" mode). The "mode" field always says which produced
-        the copy."""
+        Generated once per moment and cached on it. Written by the
+        Built-in AI when its model is downloaded ("ai" mode); otherwise
+        an extractive on-PC fallback ("extractive" mode). The "mode"
+        field always says which produced the copy."""
         job = JOBS.get(job_id)
         if not job or not (0 <= index < len(job.get("moments", []))):
             return {"ok": False, "error": "Moment not found."}
@@ -667,9 +913,8 @@ class Api:
         if not words:
             return {"ok": False, "error": "No captions in this moment."}
         settings = load_settings()
-        api_key = settings.get("api_key", "").strip() or None
         pkg = generate_posting_package(
-            words, m, genre=settings.get("genre", ""), api_key=api_key)
+            words, m, genre=settings.get("genre", ""))
         m["posting"] = pkg
         _save_job(job_id)
         return {"ok": True, "package": pkg, "cached": False}
@@ -702,6 +947,9 @@ class Api:
 
     # -- find clip moment (keyword search) -------------------------------
     def find_moments(self, job_id, queries, clip_len="60s"):
+        gate = _license_gate()
+        if gate:
+            return gate
         """Natural-language/keyword moment search over the transcript.
 
         Each hit is stamped with its query ("Matched: <query>"); queries
@@ -732,6 +980,9 @@ class Api:
 
     # -- render ----------------------------------------------------------
     def render(self, job_id, indices, options=None):
+        gate = _license_gate()
+        if gate:
+            return gate
         job = JOBS.get(job_id)
         if not job or not job.get("moments"):
             return {"ok": False, "error": "Nothing to render yet."}
@@ -814,16 +1065,35 @@ class Api:
         job = JOBS[job_id]
         outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
         os.makedirs(outdir, exist_ok=True)
-        renders = []
+        # Keep clips from earlier render batches: a second batch must
+        # extend the project, not replace it (Download-all relies on
+        # the full list). Clips whose moment is being re-rendered now
+        # are dropped here and re-added below with their fresh file.
+        redo = set(indices)
+        renders = [r for r in job.get("renders", [])
+                   if r.get("moment_index") not in redo
+                   and os.path.isfile(r.get("path", ""))]
+        # Caption Studio: explicit per-render caption params
+        # (normalized once here for storage; render_clip normalizes
+        # again for the actual ASS build - cheap and consistent)
+        eff_params = None
+        if opts.get("caption_params"):
+            eff_params = _pipeline.normalize_caption_params(
+                opts["caption_params"],
+                opts.get("caption_style", "bold-pop"))
         try:
             for n, i in enumerate(indices):
                 m = job["moments"][i]
+                _job_log(job_id, f"Render started - clip {n + 1} of "
+                                 f"{len(indices)}: {m['title']}")
                 job["stage"] = f"Rendering clip {n + 1}/{len(indices)}"
                 job["progress"] = int(n / max(len(indices), 1) * 100)
                 safe = "".join(c if c.isalnum() or c in " -_" else ""
                                for c in m["title"])[:40].strip() or "clip"
                 tag = "_reels-safe" if opts.get("safe_zone") else ""
-                out = os.path.join(outdir, f"{n + 1:02d}_{safe}{tag}.mp4")
+                # named by MOMENT index (stable across batches), so
+                # two batches can never overwrite each other's files
+                out = os.path.join(outdir, f"{i + 1:02d}_{safe}{tag}.mp4")
                 render_clip(job["video_path"], m, job["words"],
                             opts.get("caption_style", "bold-pop"),
                             out, _job_progress(job_id),
@@ -847,12 +1117,21 @@ class Api:
                                 opts.get("enhance_clarity")),
                             logo_path=opts.get("logo_path"),
                             quality_tier=opts.get("quality_tier",
-                                                  "maximum"))
-                renders.append({"path": out, "title": m["title"],
-                                "virality": m["virality"],
-                                "moment_index": i,
-                                "url": f"/files/{job_id}/clips/"
-                                       f"{os.path.basename(out)}"})
+                                                  "maximum"),
+                            caption_params=opts.get("caption_params"))
+                _rd = {"path": out, "title": m["title"],
+                       "virality": m["virality"],
+                       "moment_index": i,
+                       "url": self._download_url(job_id, out)}
+                if eff_params:
+                    _rd["caption_params"] = eff_params
+                    m["caption_params"] = eff_params
+                renders.append(_rd)
+                # publish each clip the moment it exists so the Live
+                # Analysis rail fills one by one during polling
+                job["renders"] = renders
+                _job_log(job_id, "Render finished - "
+                         + os.path.basename(out))
             job["renders"] = renders
             job["status"] = "done"
             job["stage"] = f"Done - {len(renders)} clips rendered"
@@ -862,6 +1141,7 @@ class Api:
             job["status"] = "moments"
             job["render_error"] = "Render failed: " + str(e)[:220]
             job["stage"] = "Render failed"
+            _job_log(job_id, "ERROR: " + job["render_error"])
             # keep any clips that finished before the failure
             job["renders"] = renders
         _save_job(job_id)
@@ -885,8 +1165,10 @@ class Api:
         return r, m, words
 
     def _download_url(self, job_id, path):
+        from urllib.parse import quote
         rel = os.path.relpath(path, os.path.join(BASE_DIR, "work", job_id))
-        return "/files/" + job_id + "/" + rel.replace(os.sep, "/")
+        parts = [quote(p) for p in rel.replace(os.sep, "/").split("/")]
+        return "/files/" + job_id + "/" + "/".join(parts)
 
     def export_srt(self, job_id, render_idx):
         job = JOBS.get(job_id)
@@ -1046,18 +1328,58 @@ class Api:
         save_settings(settings)
         return {"ok": True, "planner": planner}
 
-    def make_zip(self, job_id, with_captions=True):
-        """Download-all ZIP: every rendered MP4 (+ SRT/VTT when present)."""
-        import zipfile
+    def _job_renders_on_disk(self, job_id):
+        """The project's renders as they actually exist on disk: the
+        in-memory list UNION the persisted job.json list, filtered to
+        files that are really there. Returns (renders, missing_count).
+        Downloads must work from the persisted folder alone - a job
+        that only exists in memory is one restart away from 404s."""
+        seen = {}
+        missing = 0
+        sources = []
         job = JOBS.get(job_id)
-        if not job or not job.get("renders"):
-            return {"ok": False, "error": "Render clips first."}
-        outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
-        zpath = os.path.join(outdir, "clips.zip")
+        if job:
+            sources.append(job.get("renders", []))
+        meta = os.path.join(BASE_DIR, "work", job_id, "job.json")
         try:
-            with zipfile.ZipFile(zpath, "w",
+            with open(meta, encoding="utf-8") as f:
+                sources.append(json.load(f).get("renders", []))
+        except (OSError, ValueError):
+            pass
+        for lst in sources:
+            for r in lst or []:
+                p = r.get("path", "")
+                if not p or p in seen:
+                    continue
+                if os.path.isfile(p):
+                    seen[p] = r
+                else:
+                    missing += 1
+        return list(seen.values()), missing
+
+    def make_zip(self, job_id, with_captions=True):
+        """Download-all ZIP: every rendered MP4 (+ SRT/VTT when
+        present), built ON DEMAND at click time from the persisted
+        clip files - never a stale pre-built archive, and never a
+        bare 404: if the clips are genuinely gone it says so here."""
+        import zipfile
+        renders, missing = self._job_renders_on_disk(job_id)
+        if not renders:
+            return {"ok": False,
+                    "error": "No rendered clip files were found for "
+                             "this project on this PC. Render the "
+                             "clips again, then download."}
+        outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
+        os.makedirs(outdir, exist_ok=True)
+        # unique name per build: a rebuild can never truncate the
+        # file a download is streaming, and vice versa
+        build = uuid.uuid4().hex[:8]
+        zpath = os.path.join(outdir, f"clips-{build}.zip")
+        tmp = zpath + ".part"
+        try:
+            with zipfile.ZipFile(tmp, "w",
                                  zipfile.ZIP_DEFLATED) as z:
-                for r in job["renders"]:
+                for r in renders:
                     z.write(r["path"],
                             arcname=os.path.basename(r["path"]))
                     if with_captions:
@@ -1065,11 +1387,32 @@ class Api:
                         for ext in (".srt", ".vtt"):
                             if os.path.exists(base + ext):
                                 z.write(base + ext,
-                                        arcname=os.path.basename(base + ext))
+                                        arcname=os.path.basename(
+                                            base + ext))
+            os.replace(tmp, zpath)
         except Exception as e:  # noqa: BLE001
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
             return {"ok": False, "error": "ZIP failed: " + str(e)[:160]}
-        return {"ok": True, "path": zpath,
-                "url": self._download_url(job_id, zpath)}
+        # prune earlier builds of this project's ZIP
+        for name in os.listdir(outdir):
+            if name.startswith("clips-") and name.endswith(".zip") \
+                    and os.path.join(outdir, name) != zpath:
+                try:
+                    os.remove(os.path.join(outdir, name))
+                except OSError:
+                    pass
+        _job_log(job_id, f"ZIP built - {len(renders)} clips "
+                         "(clips.zip)")
+        resp = {"ok": True, "path": zpath,
+                "url": self._download_url(job_id, zpath),
+                "filename": "clips.zip", "clips": len(renders)}
+        if missing:
+            resp["message"] = (f"{missing} clip(s) from this project "
+                               "are missing on disk and were left out.")
+        return resp
 
     def preview_captions(self, job_id, index, options=None):
         """Captions-only preview: black video + burned captions for a moment.
@@ -1129,6 +1472,9 @@ class Api:
 
     def merge_selected(self, job_id, render_indices, transition="cut",
                        intro_path="", outro_path=""):
+        gate = _license_gate()
+        if gate:
+            return gate
         job = JOBS.get(job_id)
         if not job:
             return {"ok": False, "error": "No job."}
@@ -1180,7 +1526,8 @@ class Api:
             "moment_index": job["renders"][idxs[0]]["moment_index"],
             "words": merged_words, "merged": True,
             "merged_duration": round(offset, 2),
-            "url": f"/files/{job_id}/clips/{os.path.basename(out)}"})
+            "url": self._download_url(job_id, out)})
+        _job_log(job_id, "Render finished - " + os.path.basename(out))
         _save_job(job_id)
         return {"ok": True, "path": out,
                 "url": self._download_url(job_id, out)}
@@ -1206,6 +1553,7 @@ class Api:
             "word_count": len(job["words"]),
             "moments": job["moments"],
             "renders": job["renders"],
+            "log": job.get("log", []),
         }
 
     def open_folder(self, job_id):
@@ -1257,12 +1605,96 @@ def _wsgi_response(start_response, status, content_type, body):
     return [body]
 
 
+def _current_license_key():
+    env_key = os.environ.get("ITRAJI_LICENSE_KEY", "").strip()
+    if env_key:
+        return env_key
+    try:
+        return (load_settings().get("license_key") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _ensure_license():
+    """Verify the stored/env license and load the core pack (the
+    verification is memoized per key inside licensing)."""
+    return licensing.try_unlock(_current_license_key(), BASE_DIR,
+                                _load_corepack)
+
+
+def _license_locked():
+    st = _ensure_license()
+    return (not st.get("unlocked")) or bool(st.get("tampered"))
+
+
+def _license_gate():
+    """Per-operation re-check for the major features. Returns None
+    when unlocked, else an error dict for the API caller."""
+    _ensure_license()
+    reason = licensing.require_unlocked()
+    if reason is None and not _COREPACK_READY():
+        reason = ("This copy is locked - activate it with your "
+                  "license key first.")
+    if reason is None:
+        return None
+    return {"ok": False, "error": "locked", "message": reason}
+
+
+def _COREPACK_READY():
+    import pipeline as _p
+    return _p.corepack_loaded()
+
+
 def make_wsgi_app(api):
     ui_dir = os.path.abspath(os.path.join(BASE_DIR, "ui"))
 
     def app(environ, start_response):
         method = environ.get("REQUEST_METHOD", "GET")
         path = environ.get("PATH_INFO", "/") or "/"
+
+        # --- license gate: while locked, only the activation page
+        # and the two license endpoints exist -------------------------
+        if _license_locked():
+            if method == "GET" and path in ("/", "/index.html"):
+                apath = os.path.join(ui_dir, "activate.html")
+                try:
+                    with open(apath, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    data = b"<h1>This copy is locked</h1>"
+                start_response("200 OK",
+                               [("Content-Type", "text/html; "
+                                 "charset=utf-8"),
+                                ("Content-Length", str(len(data)))])
+                return [data]
+            if method == "POST" and path.startswith("/api/") \
+                    and path[len("/api/"):] in ("license_status",
+                                                "activate_license"):
+                pass  # handled by the normal dispatch below
+            elif path.startswith("/api/"):
+                return _wsgi_response(
+                    start_response, "200 OK", "application/json",
+                    json.dumps({"ok": False, "error": "locked",
+                                "message": "This copy is locked - "
+                                           "activate it with your "
+                                           "license key first."}))
+            else:
+                return _wsgi_response(start_response, "404 Not Found",
+                                      "text/plain", "not found")
+
+        # --- built-in AI: GET /api/local-ai/status ---------------------
+        if method == "GET" and path == "/api/local-ai/status":
+            return _wsgi_response(start_response, "200 OK",
+                                  "application/json",
+                                  json.dumps(api.local_ai_status(),
+                                             default=str))
+
+        # --- built-in AI: POST /api/local-ai/download ------------------
+        if method == "POST" and path == "/api/local-ai/download":
+            return _wsgi_response(start_response, "200 OK",
+                                  "application/json",
+                                  json.dumps(api.local_ai_download(),
+                                             default=str))
 
         # --- API: POST /api/<method> {"args": [...]} ---------------------
         if method == "POST" and path.startswith("/api/"):
@@ -1305,6 +1737,28 @@ def make_wsgi_app(api):
                                   "application/json",
                                   json.dumps(result, default=str))
 
+        # --- Caption Remover output: GET /remover-files/<id>/output.mp4 -
+        if method == "GET" and path.startswith("/remover-files/"):
+            rid = path[len("/remover-files/"):].split("/", 1)[0]
+            fpath = os.path.join(BASE_DIR, "work", "remover-" + rid,
+                                 "output.mp4")
+            if rid not in _REMOVER_JOBS or not os.path.isfile(fpath):
+                return _wsgi_response(start_response, "404 Not Found",
+                                      "text/plain", "not found")
+            start_response("200 OK",
+                           [("Content-Type", "video/mp4"),
+                            ("Content-Length",
+                             str(os.path.getsize(fpath)))])
+
+            def _stream_remover():
+                with open(fpath, "rb") as f:
+                    while True:
+                        chunk = f.read(1 << 20)
+                        if not chunk:
+                            break
+                        yield chunk
+            return _stream_remover()
+
         # --- file downloads: GET /files/<job_id>/<rel path> ---------------
         if method == "GET" and path.startswith("/files/"):
             rest = path[len("/files/"):]
@@ -1313,8 +1767,14 @@ def make_wsgi_app(api):
                 return _wsgi_response(start_response, "404 Not Found",
                                       "text/plain", "not found")
             job_id, rel = parts
-            if (job_id not in JOBS or ".." in rel or rel.startswith("/")
-                    or not rel):
+            # The persisted folder is the authority, not the in-memory
+            # JOBS dict: after a restart (or if the job was pruned from
+            # memory) its files on disk must still download. The job
+            # id is restricted to a safe token and the resolved path
+            # must stay inside work/<job_id>/.
+            import re as _re
+            if (not _re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id or "")
+                    or ".." in rel or rel.startswith("/") or not rel):
                 return _wsgi_response(start_response, "404 Not Found",
                                       "text/plain", "not found")
             base = os.path.abspath(os.path.join(BASE_DIR, "work", job_id))
@@ -1323,23 +1783,48 @@ def make_wsgi_app(api):
                     or not os.path.isfile(fpath):
                 return _wsgi_response(start_response, "404 Not Found",
                                       "text/plain", "not found")
-            try:
-                with open(fpath, "rb") as f:
-                    data = f.read()
-            except OSError:
-                return _wsgi_response(start_response, "404 Not Found",
-                                      "text/plain", "not found")
             ext = os.path.splitext(fpath)[1].lower()
             ctype = _MIME.get(ext, "application/octet-stream")
+            size = os.path.getsize(fpath)
             headers = [("Content-Type", ctype),
-                       ("Content-Length", str(len(data)))]
-            # downloads as attachments, media inline for preview
+                       ("Content-Length", str(size))]
+            # downloads as attachments, media inline for preview; the
+            # ZIP's on-disk name is unique per build - present the
+            # stable friendly name to the browser
             if ext in (".zip", ".srt", ".vtt", ".fcpxml", ".xml", ".ass"):
+                fname = os.path.basename(fpath)
+                if ext == ".zip" and fname.startswith("clips-"):
+                    fname = "clips.zip"
                 headers.append((
                     "Content-Disposition",
-                    "attachment; filename=" + os.path.basename(fpath)))
+                    "attachment; filename=" + fname))
             start_response("200 OK", headers)
-            return [data]
+
+            def _stream():
+                # chunked streaming: never hold a whole (possibly
+                # multi-hundred-MB) archive in memory
+                with open(fpath, "rb") as f:
+                    while True:
+                        chunk = f.read(1 << 20)
+                        if not chunk:
+                            break
+                        yield chunk
+            return _stream()
+
+        # --- bundled fonts (Caption Studio preview @font-face) --------
+        if method == "GET" and path.startswith("/fonts/"):
+            fname = os.path.basename(path)
+            fpath = os.path.join(BASE_DIR, "fonts", fname)
+            if fname.lower().endswith(".ttf") \
+                    and os.path.isfile(fpath):
+                with open(fpath, "rb") as f:
+                    data = f.read()
+                start_response("200 OK",
+                               [("Content-Type", "font/ttf"),
+                                ("Content-Length", str(len(data)))])
+                return [data]
+            return _wsgi_response(start_response, "404 Not Found",
+                                  "text/plain", "not found")
 
         # --- static files from ui/ --------------------------------------
         rel = path.lstrip("/") or "index.html"
@@ -1408,6 +1893,62 @@ def _focus_existing_window():
         pass
 
 
+def _clamp_window_geometry(x0, y0, work_w, work_h):
+    """Pure clamp: window size/position for a work area with origin
+    (x0, y0). Returns (w, h, x, y) - at most 96% of the work area,
+    capped at 1600x1050, centered - or None if the work area is
+    unusably small. Unit-testable without an OS."""
+    if work_w < 400 or work_h < 400:
+        return None
+    w = min(1600, int(work_w * 0.96))
+    h = min(1050, int(work_h * 0.96))
+    x = x0 + (work_w - w) // 2
+    y = y0 + (work_h - h) // 2
+    return (w, h, x, y)
+
+
+def _window_geometry_args():
+    """Chrome --window-size / --window-position clamped to the primary
+    monitor's work area (Windows only).
+
+    Without explicit geometry Chrome restores whatever size/position a
+    previous session left behind - which can be wider than the screen,
+    pushing the top-right buttons off-screen. Fully guarded: any
+    failure returns [] and Chrome keeps its default behavior.
+    """
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long),
+                        ("top", ctypes.c_long),
+                        ("right", ctypes.c_long),
+                        ("bottom", ctypes.c_long)]
+
+        rect = _RECT()
+        SPI_GETWORKAREA = 48
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
+        if ok:
+            x0, y0 = rect.left, rect.top
+            work_w = rect.right - rect.left
+            work_h = rect.bottom - rect.top
+        else:  # fall back to the full primary-monitor size
+            x0 = y0 = 0
+            work_w = ctypes.windll.user32.GetSystemMetrics(0)
+            work_h = ctypes.windll.user32.GetSystemMetrics(1)
+        clamped = _clamp_window_geometry(x0, y0, work_w, work_h)
+        if clamped is None:
+            return []
+        w, h, x, y = clamped
+        return [f"--window-size={w},{h}",
+                f"--window-position={x},{y}"]
+    except Exception:  # noqa: BLE001 - geometry is a nicety, never fatal
+        return []
+
+
 def _launch_window(url):
     """Open the UI in a desktop-style window - exactly ONE window.
 
@@ -1426,7 +1967,8 @@ def _launch_window(url):
         try:
             return subprocess.Popen(
                 [exe, "--app=" + url, "--user-data-dir=" + profile,
-                 "--no-first-run", "--no-default-browser-check"],
+                 "--no-first-run", "--no-default-browser-check"]
+                + _window_geometry_args(),
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             pass
@@ -1611,6 +2153,16 @@ def _wait_port_open(port, timeout=5.0):
 
 def main():
     from waitress import serve
+
+    # Protection startup checks (packaged app): signed integrity over
+    # the loose files + anti-debug. A failure locks the app to the
+    # "modified copy" screen. ITRAJI_DEV=1 skips both for source runs.
+    _integ_ok, _integ_bad = licensing.verify_integrity(BASE_DIR)
+    if not _integ_ok:
+        licensing.mark_tampered()
+    if licensing.debugger_present():
+        licensing.mark_tampered()
+    _ensure_license()
 
     # Single instance: a repeated launch never starts a second server and
     # never opens anything - no second window, no browser tab, ever. It

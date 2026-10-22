@@ -19,12 +19,18 @@ let settings = {};
 let mergeSelected = [];
 let lastToast = { msg: "", t: 0 };
 let captionStyle = "bold-pop";
-let clipLen = "60s";
+let clipLen = "30-60";
 let ratio = "9:16";
 let quality = "1080p";
 let encodeTier = "maximum";
 let clipCount = 8;
 let genre = "";
+/* navigation history state (Back button / logo home) */
+let navStack = [];
+let navNow = { view: "wizard", step: 1 };
+let navApplying = false;
+let lastWizardStep = 1;
+let maxStepReached = 1;
 
 const $ = (id) => document.getElementById(id);
 
@@ -64,6 +70,12 @@ function setStep(n) {
     d.classList.toggle("active", s === n);
     d.classList.toggle("done", s < n);
   });
+  // navigation tracking: wizard step changes are history entries
+  if (!libraryOpen && !removerOpen) {
+    lastWizardStep = n;
+    if (n > maxStepReached) maxStepReached = n;
+    noteNav({ view: "wizard", step: n });
+  }
 }
 
 /* toast notifications (deduped: same message within 4s shows once) */
@@ -209,8 +221,140 @@ async function poll() {
     if (sig !== lastRendersSig) { lastRendersSig = sig; renderRenders(st.renders); }
     reveal($("step3"));
   }
+  updateLivePanel(st);
   refreshQueue();
 }
+
+/* ---------------- Live Analysis panel ----------------
+   Fed entirely by the real job status: the phase chip maps the
+   job's actual stage text, the badge maps its status, the console
+   renders the backend per-job event log incrementally, and the
+   rail mirrors renders as they land in job state. */
+let liveLogJobId = null, liveLogRendered = 0, liveLogFirstT = -1;
+let liveThumbJob = null, lastRailSig = "";
+
+function fmtClock(epochSec) {
+  const d = new Date(epochSec * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function livePhaseFor(st) {
+  if (st.status === "error") return "ERROR";
+  if (st.status === "done") return "COMPLETE";
+  const s = (st.stage || "").toLowerCase();
+  if (s.includes("render")) return "RENDERING CLIPS";
+  if (s.includes("download")) return "DOWNLOADING";
+  if (s.includes("scanning transcript") || s.includes("analyz")
+      || s.includes("built-in ai") || s.includes("moment"))
+    return "VIRAL DETECTION: ACTIVE";
+  if (s.includes("transcri") || s.includes("whisper") || s.includes("audio")
+      || s.includes("speech"))
+    return "SCANNING CONTENT";
+  return "SCANNING CONTENT";
+}
+
+function renderLiveLog(log) {
+  const box = $("liveLog");
+  if (liveLogJobId !== jobId) {
+    liveLogJobId = jobId; liveLogRendered = 0; liveLogFirstT = -1;
+    box.innerHTML = "";
+  }
+  const firstT = log.length ? log[0].t : -1;
+  if (log.length < liveLogRendered || firstT !== liveLogFirstT) {
+    box.innerHTML = ""; liveLogRendered = 0;  // cap dropped old lines
+  }
+  liveLogFirstT = firstT;
+  for (let i = liveLogRendered; i < log.length; i++) {
+    const e = log[i];
+    const div = document.createElement("div");
+    if (String(e.text).startsWith("ERROR")) div.className = "err";
+    div.innerHTML = `<span class="lt">[${fmtClock(e.t)}]</span>`
+      + escapeHtml(e.text);
+    box.appendChild(div);
+  }
+  liveLogRendered = log.length;
+  box.scrollTop = box.scrollHeight;
+}
+
+function renderLiveRail(st) {
+  const renders = st.renders || [];
+  if (st.status === "done" && renders.length) show($("liveGoClips"));
+  else hide($("liveGoClips"));
+  const sig = JSON.stringify(renders.map((r) => r.path));
+  if (sig === lastRailSig) return;
+  lastRailSig = sig;
+  const list = $("liveRailList");
+  list.innerHTML = "";
+  if (renders.length) hide($("liveRailEmpty")); else show($("liveRailEmpty"));
+  const thumb = thumbLoadedFor === jobId
+    ? $("videoThumb").getAttribute("src") : null;
+  renders.forEach((r) => {
+    const div = document.createElement("div");
+    div.className = "rail-clip";
+    div._render = r;
+    let dur = "";
+    if (r.merged_duration) dur = fmtTime(r.merged_duration);
+    else {
+      const m = (lastMoments || [])[r.moment_index];
+      if (m) dur = fmtTime(Math.max(0, Math.round(m.end - m.start)));
+    }
+    div.innerHTML = `${thumb ? `<img src="${thumb}" alt="">` : ""}
+      <div class="rc-text">
+        <div class="rc-title">${escapeHtml(r.title || "Clip")}</div>
+        <div class="rc-meta">${dur ? dur + " · " : ""}virality ${r.virality ?? "—"}</div>
+      </div>
+      <button class="ghost-btn small rc-dl" type="button">Download</button>
+      <button class="ghost-btn small rc-cap" type="button">Captions</button>`;
+    div.querySelector(".rc-dl").addEventListener("click", () => {
+      if (r.url) downloadUrl(r.url);
+    });
+    div.querySelector(".rc-cap").addEventListener("click", () => {
+      openCaptionStudio(r);
+    });
+    list.appendChild(div);
+  });
+}
+
+function updateLivePanel(st) {
+  const panel = $("livePanel");
+  const active = st.status === "working" || st.status === "error";
+  if (!active) { hide(panel); panel.classList.remove("live"); return; }
+  show(panel);
+  panel.classList.toggle("live", st.status === "working");
+  const badge = st.status === "error" ? "ERROR" : "PROCESSING";
+  const bEl = $("liveBadge");
+  bEl.textContent = badge;
+  bEl.className = "live-badge " + badge.toLowerCase();
+  $("livePhaseChip").textContent = livePhaseFor(st);
+  const chip = $("liveStateChip");
+  chip.textContent = badge;
+  chip.className = "live-chip right " + badge.toLowerCase();
+  if (liveThumbJob !== jobId) {          // new job: clear stale thumb
+    liveThumbJob = jobId;
+    $("liveThumb").removeAttribute("src");
+    hide($("liveThumb")); show($("liveThumbFallback"));
+  }
+  const vsrc = thumbLoadedFor === jobId
+    ? $("videoThumb").getAttribute("src") : null;
+  if (vsrc && $("liveThumb").getAttribute("src") !== vsrc) {
+    $("liveThumb").src = vsrc;
+    show($("liveThumb")); hide($("liveThumbFallback"));
+  }
+  $("liveLine1").innerHTML = "&gt; AUDIO_TRANSCRIPT: <b>"
+    + (st.word_count ? st.word_count + " WORDS READY"
+       : st.status === "error" ? "ERROR" : "PROCESSING") + "</b>";
+  $("liveLine2").innerHTML = "&gt; ANALYSIS: <b>"
+    + escapeHtml(st.stage || "—") + "</b>";
+  renderLiveLog(st.log || []);
+  renderLiveRail(st);
+}
+
+$("liveGoClips").addEventListener("click", () => {
+  reveal($("step3"));
+  setStep(3);
+  $("step3").scrollIntoView({ behavior: "smooth", block: "start" });
+});
 
 function startPoll() { stopPoll(); pollTimer = setInterval(poll, 800); }
 function stopPoll() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
@@ -240,6 +384,8 @@ async function refreshQueue() {
 
 function selectJob(id) {
   stopPoll();
+  maxStepReached = 1;  // step dots re-unlock as this job's state polls in
+  lastWizardStep = 1;
   jobId = id;
   lastMomentsSig = ""; lastRendersSig = ""; lastErrSig = "";
   mergeSelected = []; prompts = [];
@@ -365,20 +511,28 @@ function segGet(id) {
   return on ? on.dataset.value : null;
 }
 
+/* Detect modes are "local" (Built-in AI) and "offline". Any older
+   saved value (e.g. the removed cloud mode) lands on "local". */
+function migrateDetectMode(m) {
+  return m === "offline" ? "offline" : "local";
+}
+
 function initControls() {
   // reflect saved settings into every control
-  segSet("detectModeSeg", settings.api_key ? "ai" : "offline");
+  segSet("detectModeSeg", migrateDetectMode(settings.detect_mode));
   syncDetectModeSub(segGet("detectModeSeg"));
   segSet("clipCountSeg", String(settings.clip_count || 8));
   clipCount = parseInt(segGet("clipCountSeg"), 10) || 8;
   ratio = settings.ratio || "9:16";
   document.querySelectorAll("#ratioPicker .ratio-card").forEach((c) =>
     c.classList.toggle("on", c.dataset.value === ratio));
-  clipLen = settings.clip_length || "60s";
-  if (clipLen.startsWith("custom:")) {
-    $("customLenInput").value = clipLen.split(":")[1] || "";
+  const savedLen = String(settings.clip_length || "");
+  if (savedLen.startsWith("custom:")) {
+    clipLen = "30-60"; // pill fallback if the custom box gets cleared
+    $("customLenInput").value = savedLen.slice("custom:".length);
     document.querySelectorAll("#clipLenPills .seg").forEach((p) => p.classList.remove("on"));
   } else {
+    clipLen = migrateClipLen(savedLen); // legacy "60s" -> a range
     segSet("clipLenPills", clipLen);
     $("customLenInput").value = "";
   }
@@ -416,19 +570,110 @@ function initControls() {
 function syncDetectModeSub(mode) {
   $("detectModeSub").textContent = mode === "offline"
     ? "Offline mode scans the transcript on your PC — no key, no internet. Scores are heuristic (energy + speech density), not AI."
-    : "AI mode needs your free Gemini API key (Settings). Every clip is scored 0–100 for virality.";
+    : "Built-in AI runs a professional AI model on your PC — no key, no internet. First use downloads the model once (~9 GB).";
+  if (mode === "local") {
+    show($("localAiCard"));
+    refreshLocalAiStatus();
+    startLocalAiPolling();
+  } else {
+    hide($("localAiCard"));
+    stopLocalAiPolling();
+  }
 }
 
+/* ---------------- built-in AI download card ---------------- */
+let localAiTimer = null;
+
+function startLocalAiPolling() {
+  if (localAiTimer) return;
+  localAiTimer = setInterval(refreshLocalAiStatus, 1500);
+}
+
+function stopLocalAiPolling() {
+  if (localAiTimer) { clearInterval(localAiTimer); localAiTimer = null; }
+}
+
+async function refreshLocalAiStatus() {
+  let st;
+  try {
+    const r = await fetch("/api/local-ai/status");
+    st = await r.json();
+  } catch (e) { return; }  // server hiccup - next poll retries
+  const btn = $("localAiDownloadBtn"), barWrap = $("localAiBarWrap"),
+    bar = $("localAiBar"), pct = $("localAiPct"), txt = $("localAiText");
+  if (!btn) return;
+  if (st.ready) {
+    txt.textContent = "Built-in AI ready ✓ — the model is on your PC and works fully offline.";
+    hide(btn); hide(barWrap); pct.textContent = "";
+    stopLocalAiPolling();
+    return;
+  }
+  if (st.downloading) {
+    hide(btn); show(barWrap);
+    bar.style.width = (st.pct || 0) + "%";
+    pct.textContent = (st.stage || "Downloading…") + " — " + Math.round(st.pct || 0) + "%";
+  } else {
+    show(btn); hide(barWrap); pct.textContent = "";
+    if (st.error) {
+      txt.textContent = "Download failed: " + st.error + " Check your connection and try again.";
+    }
+  }
+}
+
+$("localAiDownloadBtn").addEventListener("click", async () => {
+  try {
+    await fetch("/api/local-ai/download", { method: "POST" });
+  } catch (e) { /* the status poll below will surface any problem */ }
+  startLocalAiPolling();
+  refreshLocalAiStatus();
+});
+
+/* Clip length is a RANGE ("min-max" seconds). Legacy single-length
+   settings ("60s", "2min", ...) migrate to a sensible range; a custom
+   value is either a range ("30-60") or one exact number ("45"). */
+const CLIP_LEN_MIGRATION = {
+  "15s": "15-30", "30s": "15-30", "60s": "30-60", "90s": "60-90",
+  "2min": "90-120", "3min": "120-180", "5min": "180-300",
+  "10min": "300-600", "15min": "600-900",
+  "30-60s": "30-60", "1-2min": "60-120",
+};
+function migrateClipLen(v) {
+  const s = String(v || "").trim();
+  if (/^\d+\s*-\s*\d+$/.test(s)) return s.replace(/\s+/g, "");
+  return CLIP_LEN_MIGRATION[s] || "30-60";
+}
+function parseClipLenValue(str) {
+  const s = String(str || "").trim();
+  const m = s.match(/^(\d+)\s*-\s*(\d+)$/);
+  if (m) {
+    let a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+    if (a > b) { const t = a; a = b; b = t; }
+    return Math.max(5, a) + "-" + Math.max(5, b);
+  }
+  if (/^\d+$/.test(s)) {
+    const n = Math.max(5, parseInt(s, 10));
+    return n + "-" + n; // one number = exact length
+  }
+  return null;
+}
 function currentClipLen() {
   const custom = $("customLenInput").value.trim();
-  if (custom && /^\d+$/.test(custom)) return "custom:" + custom;
+  if (custom) {
+    const parsed = parseClipLenValue(custom);
+    if (parsed) return "custom:" + parsed;
+  }
   return clipLen;
+}
+async function persistClipLen() {
+  try { await api.save_settings({ clip_length: currentClipLen() }); } catch (e) { /* offline */ }
 }
 
 document.querySelectorAll("#detectModeSeg .seg").forEach((b) =>
   b.addEventListener("click", () => {
     segSet("detectModeSeg", b.dataset.value);
     syncDetectModeSub(b.dataset.value);
+    settings.detect_mode = b.dataset.value;
+    api.save_settings({ detect_mode: b.dataset.value }).catch(() => {});
   }));
 document.querySelectorAll("#clipCountSeg .seg").forEach((b) =>
   b.addEventListener("click", () => {
@@ -446,11 +691,13 @@ document.querySelectorAll("#clipLenPills .seg").forEach((b) =>
     segSet("clipLenPills", b.dataset.value);
     clipLen = b.dataset.value;
     $("customLenInput").value = "";
+    persistClipLen();
   }));
 $("customLenInput").addEventListener("input", () => {
   if ($("customLenInput").value.trim())
     document.querySelectorAll("#clipLenPills .seg").forEach((p) => p.classList.remove("on"));
 });
+$("customLenInput").addEventListener("change", persistClipLen);
 document.querySelectorAll("#qualityPicker .quality-card").forEach((c) =>
   c.addEventListener("click", () => {
     document.querySelectorAll("#qualityPicker .quality-card").forEach((x) => x.classList.remove("on"));
@@ -632,9 +879,9 @@ $("detectBtn").addEventListener("click", async () => {
   const len = currentClipLen();
   const res = mode === "offline"
     ? await api.detect_offline(jobId, clipCount, len)
-    : await api.detect(jobId, clipCount, len);
+    : await api.detect_local(jobId, clipCount, len);
   if (!res.ok) {
-    if (res.error === "no_api_key") openSettings();
+    if (res.error === "local_ai_missing") show($("localAiCard"));
     $("detectError").textContent = res.message || res.error;
     show($("detectError"));
     return;
@@ -935,6 +1182,7 @@ function renderRenders(renders) {
       <div class="render-actions">
         <button class="ghost-btn small prevBtn" data-i="${i}">Preview</button>
         <button class="ghost-btn small capPrevBtn" data-i="${i}">Captions only</button>
+        <button class="ghost-btn small studioBtn" data-i="${i}">Edit captions</button>
         <button class="ghost-btn small srtBtn" data-i="${i}">SRT</button>
         <button class="ghost-btn small vttBtn" data-i="${i}">VTT</button>
       </div>
@@ -978,6 +1226,11 @@ function renderRenders(renders) {
       const res = await api.preview_captions(jobId, list[i] ? list[i].moment_index : i);
       if (res.ok && res.url) openPreview("Captions preview", res.url);
       else toast(res.error || "Preview failed", true);
+    }));
+  box.querySelectorAll(".studioBtn").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const r = (renderRenders._list || [])[parseInt(btn.dataset.i, 10)];
+      if (r) openCaptionStudio(r);
     }));
   box.querySelectorAll(".reRenderBtn").forEach((btn) =>
     btn.addEventListener("click", async () => {
@@ -1073,11 +1326,18 @@ $("mergeBtn").addEventListener("click", async () => {
 
 /* zip + xml + folder + new */
 $("zipBtn").addEventListener("click", async () => {
-  if (!jobId) return;
+  if (!jobId || $("zipBtn").disabled) return;
+  $("zipBtn").disabled = true;
   toast("Building ZIP…");
-  const res = await api.make_zip(jobId, true);
-  if (res.ok && res.url) { downloadUrl(res.url); toast("ZIP downloaded"); }
-  else toast(res.error || "ZIP failed", true);
+  try {
+    const res = await api.make_zip(jobId, true);
+    if (res.ok && res.url) {
+      downloadUrl(res.url);
+      toast(res.message || "ZIP downloaded", !!res.message);
+    } else toast(res.error || "ZIP failed", true);
+  } finally {
+    $("zipBtn").disabled = false;
+  }
 });
 $("xmlBtn").addEventListener("click", async () => {
   if (!jobId) return;
@@ -1088,6 +1348,7 @@ $("xmlBtn").addEventListener("click", async () => {
 $("openFolderBtn").addEventListener("click", async () => { await api.open_folder(jobId); });
 $("newVideoBtn").addEventListener("click", () => {
   stopPoll();
+  resetNav();
   jobId = null;
   lastMomentsSig = ""; lastRendersSig = ""; lastErrSig = ""; lastQueueSig = "";
   lastMoments = []; mergeSelected = []; prompts = [];
@@ -1171,15 +1432,104 @@ async function refreshLibrary() {
   });
 }
 
+/* ---------------- navigation history (Back button + logo home) -------
+   A lightweight view/step history. Navigation NEVER touches project
+   state: job id, transcript, moments, renders and the clips DOM all
+   live outside this system, so Back -> return shows everything
+   exactly as it was left, and polling resumes where it applies.
+   (State variables live with the other state at the top of the file.) */
+function noteNav(entry) {
+  if (navApplying) return;
+  if (entry.view === navNow.view && entry.step === navNow.step) return;
+  navStack.push(navNow);
+  if (navStack.length > 50) navStack.shift();
+  navNow = entry;
+  updateBackBtn();
+}
+function applyNav(entry) {
+  navApplying = true;
+  try {
+    if (entry.view === "library") {
+      showLibrary();
+    } else if (entry.view === "remover") {
+      showRemover();
+    } else {
+      if (removerOpen) hideRemover();
+      if (libraryOpen) hideLibrary();
+      setStep(entry.step || 1);
+      const sec = $("step" + (entry.step || 1));
+      if (sec) setTimeout(() =>
+        sec.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
+      if (jobId) { startPoll(); poll(); }
+    }
+  } finally { navApplying = false; }
+  navNow = entry;
+  updateBackBtn();
+}
+function goBack() {
+  const modal = $("settingsModal");
+  if (modal && !modal.classList.contains("hidden")) {
+    closeSettings();
+    return;
+  }
+  const prev = navStack.pop();
+  if (!prev) { updateBackBtn(); return; }  // at the root: a safe no-op
+  applyNav(prev);
+}
+function updateBackBtn() {
+  const b = $("backBtn");
+  if (!b) return;
+  const atRoot = navNow.view === "wizard" && (navNow.step || 1) === 1;
+  b.disabled = navStack.length === 0 && atRoot;
+}
+function resetNav() {
+  navStack = [];
+  navNow = { view: "wizard", step: 1 };
+  lastWizardStep = 1;
+  maxStepReached = 1;
+  updateBackBtn();
+}
+$("backBtn").addEventListener("click", goBack);
+document.querySelectorAll(".step-dot").forEach((d) => {
+  d.addEventListener("click", () => {
+    if (libraryOpen || removerOpen) return;
+    const target = parseInt(d.dataset.step, 10);
+    if (!target || target > maxStepReached) return;  // reached steps only
+    if (navNow.view === "wizard" && (navNow.step || 1) === target) return;
+    noteNav({ view: "wizard", step: target });
+    applyNav({ view: "wizard", step: target });
+  });
+});
+/* Logo = Home (Addendum 8a): a navigation, never a reset - the
+   current project stays intact and can be re-entered any time. */
+function goHome() {
+  if (navNow.view === "wizard" && (navNow.step || 1) === 1
+      && !libraryOpen && !removerOpen) return;
+  noteNav({ view: "wizard", step: 1 });
+  applyNav({ view: "wizard", step: 1 });
+}
+document.querySelectorAll(".home-link").forEach((el) => {
+  el.addEventListener("click", goHome);
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); goHome(); }
+  });
+});
+
 function showLibrary() {
+  noteNav({ view: "library", step: lastWizardStep });
+  $("libraryBtn").classList.add("on");
+  $("removerBtn").classList.remove("on");
   libraryOpen = true;
   stopPoll();
   hide($("step1")); hide($("step2")); hide($("step3"));
+  hide($("removerView"));
   show($("libraryView"));
   refreshLibrary();
 }
 
 function hideLibrary() {
+  noteNav({ view: "wizard", step: lastWizardStep });
+  $("libraryBtn").classList.remove("on");
   libraryOpen = false;
   hide($("libraryView"));
   show($("step1"));
@@ -1188,6 +1538,7 @@ function hideLibrary() {
 }
 
 function openProject(id) {
+  noteNav({ view: "wizard", step: lastWizardStep });
   hide($("libraryView"));
   libraryOpen = false;
   show($("step1"));
@@ -1198,36 +1549,462 @@ function openProject(id) {
 $("libraryBtn").addEventListener("click", showLibrary);
 $("libBackBtn").addEventListener("click", hideLibrary);
 
+/* ---------------- Caption Remover ---------------- */
+let removerOpen = false;
+let removerMode = "crop";
+let removerRegionPreset = "bottom";
+let removerTimer = null;
+
+function showRemover() {
+  noteNav({ view: "remover", step: lastWizardStep });
+  $("removerBtn").classList.add("on");
+  $("libraryBtn").classList.remove("on");
+  removerOpen = true;
+  libraryOpen = false;
+  stopPoll();
+  hide($("step1")); hide($("step2")); hide($("step3"));
+  hide($("libraryView"));
+  show($("removerView"));
+  updateRemoverRegionBox();
+}
+function hideRemover() {
+  noteNav({ view: "wizard", step: lastWizardStep });
+  $("removerBtn").classList.remove("on");
+  removerOpen = false;
+  if (removerTimer) { clearInterval(removerTimer); removerTimer = null; }
+  hide($("removerView"));
+  show($("step1"));
+  if (jobId) { startPoll(); poll(); }
+  else { setStep(1); refreshQueue(); }
+}
+$("removerBtn").addEventListener("click", showRemover);
+$("removerBackBtn").addEventListener("click", hideRemover);
+
+function removerRegion() {
+  return {
+    top_pct: parseInt($("removerTop").value, 10),
+    bottom_pct: parseInt($("removerBot").value, 10),
+  };
+}
+function updateRemoverRegionBox() {
+  const r = removerRegion();
+  $("removerTopVal").textContent = r.top_pct + "%";
+  $("removerBotVal").textContent = r.bottom_pct + "%";
+  const box = $("removerRegionBox");
+  box.style.top = r.top_pct + "%";
+  box.style.height = Math.max(0, r.bottom_pct - r.top_pct) + "%";
+}
+function setRemoverRegion(preset) {
+  removerRegionPreset = preset;
+  segSet("removerRegionSeg", preset);
+  if (preset === "bottom") { $("removerTop").value = 82; $("removerBot").value = 100; }
+  if (preset === "top") { $("removerTop").value = 0; $("removerBot").value = 14; }
+  $("removerSliders").classList.toggle("hidden", preset !== "custom");
+  updateRemoverRegionBox();
+}
+document.querySelectorAll("#removerRegionSeg .seg").forEach((b) =>
+  b.addEventListener("click", () => setRemoverRegion(b.dataset.value)));
+["removerTop", "removerBot"].forEach((id) =>
+  $(id).addEventListener("input", () => {
+    if (removerRegionPreset !== "custom") setRemoverRegion("custom");
+    const t = parseInt($("removerTop").value, 10);
+    const b = parseInt($("removerBot").value, 10);
+    if (b - t < 2) {
+      if (id === "removerTop") $("removerBot").value = Math.min(100, t + 2);
+      else $("removerTop").value = Math.max(0, b - 2);
+    }
+    updateRemoverRegionBox();
+  }));
+document.querySelectorAll("#removerModePicker .mode-card").forEach((c) =>
+  c.addEventListener("click", () => {
+    document.querySelectorAll("#removerModePicker .mode-card").forEach((x) => x.classList.remove("on"));
+    c.classList.add("on");
+    removerMode = c.dataset.value;
+  }));
+$("removerPath").addEventListener("change", async () => {
+  const p = $("removerPath").value.trim();
+  if (!p) return;
+  try {
+    const r = await api.caption_remover_probe(p);
+    if (r && r.ok && r.probed && r.width && r.height)
+      $("removerStage").style.aspectRatio = r.width + " / " + r.height;
+  } catch (e) { /* stage sizing is a nicety */ }
+});
+$("removerRunBtn").addEventListener("click", async () => {
+  const source = $("removerUrl").value.trim() || $("removerPath").value.trim();
+  const errEl = $("removerError");
+  errEl.classList.add("hidden");
+  if (!source) {
+    errEl.textContent = "Paste a video link or a local file path first.";
+    errEl.classList.remove("hidden");
+    return;
+  }
+  hide($("removerResult"));
+  $("removerVideo").classList.add("hidden");
+  $("removerRegionBox").classList.remove("hidden");
+  $("removerStageLabel").textContent = "Region preview — the highlighted band is what gets cleaned";
+  show($("removerProgress"));
+  $("removerBar").style.width = "0%";
+  $("removerRunBtn").disabled = true;
+  removerLogRendered = 0; removerLogRid = null;
+  $("removerLog").innerHTML = "";
+  show($("removerLogWrap"));
+  let started;
+  try { started = await api.caption_remover_start(source, removerRegion(), removerMode); }
+  catch (e) { started = { ok: false, error: String(e) }; }
+  if (!started || !started.ok) {
+    $("removerRunBtn").disabled = false;
+    hide($("removerProgress"));
+    errEl.textContent = (started && started.error) || "Could not start the removal.";
+    errEl.classList.remove("hidden");
+    return;
+  }
+  const rid = started.id;
+  if (removerTimer) clearInterval(removerTimer);
+  removerTimer = setInterval(async () => {
+    let st;
+    try { st = await api.caption_remover_status(rid); } catch (e) { return; }
+    if (!st || !st.ok) return;
+    $("removerBar").style.width = (st.pct || 0) + "%";
+    $("removerStageText").textContent = st.stage || "";
+    renderRemoverLog(rid, st.log || []);
+    if (st.status === "done") {
+      clearInterval(removerTimer); removerTimer = null;
+      $("removerRunBtn").disabled = false;
+      hide($("removerProgress"));
+      const v = $("removerVideo");
+      v.src = st.url;
+      v.classList.remove("hidden");
+      $("removerRegionBox").classList.add("hidden");
+      $("removerStageLabel").textContent = "Cleaned video preview";
+      $("removerDownload").href = st.url;
+      show($("removerResult"));
+    } else if (st.status === "error") {
+      clearInterval(removerTimer); removerTimer = null;
+      $("removerRunBtn").disabled = false;
+      hide($("removerProgress"));
+      errEl.textContent = st.error || "Removal failed.";
+      errEl.classList.remove("hidden");
+    }
+  }, 1000);
+});
+
+/* ---------------- remover log console ---------------- */
+let removerLogRendered = 0, removerLogRid = null, removerLogFirstT = -1;
+function renderRemoverLog(rid, log) {
+  const box = $("removerLog");
+  if (removerLogRid !== rid) {
+    removerLogRid = rid; removerLogRendered = 0; removerLogFirstT = -1;
+    box.innerHTML = "";
+  }
+  const firstT = log.length ? log[0].t : -1;
+  if (log.length < removerLogRendered || firstT !== removerLogFirstT) {
+    box.innerHTML = ""; removerLogRendered = 0;
+  }
+  removerLogFirstT = firstT;
+  for (let i = removerLogRendered; i < log.length; i++) {
+    const e = log[i];
+    const div = document.createElement("div");
+    if (String(e.text).startsWith("ERROR")) div.className = "err";
+    div.innerHTML = `<span class="lt">[${fmtClock(e.t)}]</span>`
+      + escapeHtml(e.text);
+    box.appendChild(div);
+  }
+  removerLogRendered = log.length;
+  box.scrollTop = box.scrollHeight;
+}
+
+/* ---------------- Caption Studio ---------------- */
+let studioData = null;
+let studioCtx = null;
+let studioApplyingAll = false;
+const STUDIO_SIZE_PX = { xs: 13, s: 16, m: 19, l: 23, xl: 28, xxl: 33 };
+const STUDIO_FONT_CSS = { default: "Arial", anton: "'Anton'",
+  "bebas-neue": "'Bebas Neue'", montserrat: "'Montserrat'",
+  poppins: "'Poppins'", "archivo-black": "'Archivo Black'" };
+const STUDIO_PRESET_LABELS = { default: "Default", "one-word": "One Word",
+  clean: "Clean", pill: "Pill", "lime-box": "Lime Box", hormozi: "Hormozi",
+  karaoke: "Karaoke", beast: "Beast", neon: "Neon", "gold-glow": "Gold Glow",
+  cyber: "Cyber", boxed: "Boxed", minimal: "Minimal", classic: "Classic",
+  "royal-blue": "Royal Blue", mint: "Mint", fire: "Fire", bubble: "Bubble",
+  ghost: "Ghost", "shorts-pop": "Shorts Pop" };
+const STYLE_TO_PRESET_JS = { "bold-pop": "default", "lime-punch": "lime-box",
+  clean: "clean", "neon-glow": "neon", hollow: "ghost", boxed: "boxed" };
+
+function blendHex(hex, dimPct) {
+  const f = 1 - 0.8 * (Math.max(0, Math.min(100, dimPct || 0)) / 100);
+  const n = parseInt(String(hex || "#FFFFFF").slice(1), 16);
+  const r = Math.round(((n >> 16) & 255) * f);
+  const g = Math.round(((n >> 8) & 255) * f);
+  const b = Math.round((n & 255) * f);
+  return `rgb(${r},${g},${b})`;
+}
+
+async function ensureStudioData() {
+  if (!studioData) studioData = await api.caption_presets();
+  return studioData;
+}
+
+async function openCaptionStudio(r) {
+  if (!r) { toast("Clip not found", true); return; }
+  const data = await ensureStudioData();
+  if (!data || !data.ok) { toast("Caption Studio unavailable", true); return; }
+  const moment = (lastMoments || [])[r.moment_index] || {};
+  let params = null;
+  const seed = r.caption_params || moment.caption_params;
+  if (seed) params = JSON.parse(JSON.stringify(seed));
+  if (!params) {
+    const pid = STYLE_TO_PRESET_JS[captionStyle] || "default";
+    params = { ...(data.presets[pid] || data.presets.default), preset: pid };
+  }
+  studioCtx = { momentIndex: r.moment_index, params, render: r };
+  $("studioClipTitle").textContent = r.title || "Clip";
+  const v = $("studioVideo");
+  v.src = r.url || "";
+  v.onloadedmetadata = () => {
+    try { v.currentTime = (v.duration || 0) * 0.4; } catch (e) { /* noop */ }
+  };
+  try {
+    const res = await api.get_caption_words(jobId, r.moment_index);
+    $("studioWords").value = res && res.ok ? res.words : "";
+  } catch (e) { $("studioWords").value = ""; }
+  buildStudioControls();
+  syncStudioControls();
+  renderStudioPreview();
+  show($("captionStudioModal"));
+}
+
+function buildStudioControls() {
+  const data = studioData;
+  const grid = $("studioPresets");
+  grid.innerHTML = "";
+  Object.keys(data.presets).forEach((pid) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "preset-chip";
+    b.dataset.preset = pid;
+    b.textContent = STUDIO_PRESET_LABELS[pid] || pid;
+    b.addEventListener("click", () => {
+      studioCtx.params = { ...data.presets[pid], preset: pid };
+      syncStudioControls();
+      renderStudioPreview();
+    });
+    grid.appendChild(b);
+  });
+  const fontSel = $("studioFont");
+  fontSel.innerHTML = "";
+  data.fonts.forEach((f) => {
+    const o = document.createElement("option");
+    o.value = f.id;
+    o.textContent = f.name;
+    fontSel.appendChild(o);
+  });
+  const sizeSeg = $("studioSizeSeg");
+  sizeSeg.innerHTML = "";
+  data.sizes.forEach((s) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "seg";
+    b.dataset.value = s;
+    b.textContent = s.toUpperCase();
+    b.addEventListener("click", () => {
+      studioCtx.params.size = s;
+      syncStudioControls();
+      renderStudioPreview();
+    });
+    sizeSeg.appendChild(b);
+  });
+}
+
+function syncStudioControls() {
+  const p = studioCtx.params;
+  document.querySelectorAll("#studioPresets .preset-chip").forEach((c) =>
+    c.classList.toggle("on", c.dataset.preset === p.preset));
+  $("studioFont").value = p.font;
+  document.querySelectorAll("#studioSizeSeg .seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.value === p.size));
+  document.querySelectorAll("#studioPosSeg .seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.value === p.position));
+  document.querySelectorAll("#studioAnimSeg .seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.value === p.animation));
+  $("studioDim").value = p.dim_inactive;
+  $("studioDimVal").textContent = p.dim_inactive + "%";
+  $("studioBorder").value = p.border;
+  $("studioBorderVal").textContent = p.border;
+  $("studioUpper").checked = !!p.uppercase;
+  $("studioOneWord").checked = !!p.one_word;
+  $("studioTextColor").value = p.text_color;
+  $("studioHlColor").value = p.highlight_color;
+}
+
+function renderStudioPreview() {
+  if (!studioCtx) return;
+  const p = studioCtx.params;
+  const line = $("studioLine");
+  const words = ($("studioWords").value || "Your caption words")
+    .trim().split(/\s+/).filter(Boolean);
+  let showWords, activeIdx;
+  if (p.one_word) { showWords = [words[0] || "Word"]; activeIdx = 0; }
+  else { showWords = words.slice(0, 3); activeIdx = Math.min(1, showWords.length - 1); }
+  line.style.fontFamily = STUDIO_FONT_CSS[p.font] || "Arial";
+  line.style.fontSize = (STUDIO_SIZE_PX[p.size] || 19) + "px";
+  line.style.textTransform = p.uppercase ? "uppercase" : "none";
+  line.style.webkitTextStroke =
+    Math.max(0, p.border * 0.35) + "px " + (p.outline_color || "#000000");
+  $("studioOverlay").className = "studio-overlay pos-" + p.position;
+  line.innerHTML = showWords.map((w, i) => {
+    const active = i === activeIdx;
+    const col = active
+      ? (p.one_word ? p.text_color : p.highlight_color)
+      : blendHex(p.text_color, p.dim_inactive);
+    let style = "color:" + col;
+    let cls = "w" + (active ? " active" : "");
+    if (active && p.animation === "glow")
+      style += ";text-shadow:0 0 12px " + p.highlight_color
+        + ",0 0 3px " + p.highlight_color;
+    if (active && p.animation === "box")
+      style += ";background:" + p.highlight_color
+        + ";color:#10130A;border-radius:6px;padding:0 6px";
+    if (active && p.animation === "pop") cls += " pop";
+    return `<span class="${cls}" style="${style}">${escapeHtml(w)}</span>`;
+  }).join(" ");
+}
+
+function closeStudio() { hide($("captionStudioModal")); }
+$("studioClose").addEventListener("click", closeStudio);
+$("studioCancel").addEventListener("click", closeStudio);
+$("captionStudioModal").addEventListener("click", (e) => {
+  if (e.target === $("captionStudioModal")) closeStudio();
+});
+$("studioFont").addEventListener("change", () => {
+  studioCtx.params.font = $("studioFont").value; renderStudioPreview();
+});
+$("studioDim").addEventListener("input", () => {
+  studioCtx.params.dim_inactive = parseInt($("studioDim").value, 10) || 0;
+  $("studioDimVal").textContent = studioCtx.params.dim_inactive + "%";
+  renderStudioPreview();
+});
+$("studioBorder").addEventListener("input", () => {
+  studioCtx.params.border = parseInt($("studioBorder").value, 10) || 0;
+  $("studioBorderVal").textContent = studioCtx.params.border;
+  renderStudioPreview();
+});
+$("studioUpper").addEventListener("change", () => {
+  studioCtx.params.uppercase = $("studioUpper").checked;
+  renderStudioPreview();
+});
+$("studioOneWord").addEventListener("change", () => {
+  studioCtx.params.one_word = $("studioOneWord").checked;
+  renderStudioPreview();
+});
+$("studioTextColor").addEventListener("input", () => {
+  studioCtx.params.text_color = $("studioTextColor").value;
+  renderStudioPreview();
+});
+$("studioHlColor").addEventListener("input", () => {
+  studioCtx.params.highlight_color = $("studioHlColor").value;
+  renderStudioPreview();
+});
+$("studioWords").addEventListener("input", renderStudioPreview);
+document.querySelectorAll("#studioPosSeg .seg").forEach((b) =>
+  b.addEventListener("click", () => {
+    studioCtx.params.position = b.dataset.value;
+    syncStudioControls(); renderStudioPreview();
+  }));
+document.querySelectorAll("#studioAnimSeg .seg").forEach((b) =>
+  b.addEventListener("click", () => {
+    studioCtx.params.animation = b.dataset.value;
+    syncStudioControls(); renderStudioPreview();
+  }));
+$("studioSaveWords").addEventListener("click", async () => {
+  const res = await api.save_caption_words(
+    jobId, studioCtx.momentIndex, $("studioWords").value);
+  if (res && res.ok) toast("Caption text saved");
+  else toast((res && res.error) || "Save failed", true);
+});
+
+async function studioRenderOne(momentIndex, params) {
+  const opts = { ...collectRenderOptions(), caption_params: { ...params } };
+  const res = await api.render(jobId, [momentIndex], opts);
+  if (!res || !res.ok) {
+    toast((res && (res.message || res.error)) || "Render failed", true);
+    return false;
+  }
+  return true;
+}
+
+$("studioApply").addEventListener("click", async () => {
+  const { momentIndex, params } = studioCtx;
+  closeStudio();
+  if (await studioRenderOne(momentIndex, params)) {
+    reveal($("step3"));
+    setStep(3);
+    show($("renderProgress"));
+    startPoll();
+    toast("Re-rendering with new captions…");
+  }
+});
+
+$("studioApplyAll").addEventListener("click", async () => {
+  if (studioApplyingAll) return;
+  const { params } = studioCtx;
+  const mis = [...new Set(
+    (renderRenders._list || []).map((r) => r.moment_index))];
+  if (!mis.length) { toast("No clips yet", true); return; }
+  studioApplyingAll = true;
+  closeStudio();
+  startPoll();
+  let doneCount = 0;
+  for (const mi of mis) {
+    toast(`Applying captions to all clips (${doneCount + 1}/${mis.length})…`);
+    if (!(await studioRenderOne(mi, params))) break;
+    const t0 = Date.now();
+    let okRender = false;
+    while (Date.now() - t0 < 900000) {
+      await new Promise((r2) => setTimeout(r2, 700));
+      let st;
+      try { st = await api.job_status(jobId); } catch (e) { continue; }
+      if (st.render_error) { toast(st.render_error, true); break; }
+      if (st.status === "done") { okRender = true; break; }
+    }
+    if (!okRender) break;
+    doneCount++;
+  }
+  studioApplyingAll = false;
+  if (doneCount === mis.length)
+    toast(`Captions applied to all ${mis.length} clips`);
+});
+
 /* ---------------- settings ---------------- */
-function openSettings() { show($("settingsModal")); }
+function openSettings() {
+  show($("settingsModal"));
+  $("settingsBtn").classList.add("on");
+}
+function closeSettings() {
+  hide($("settingsModal"));
+  $("settingsBtn").classList.remove("on");
+}
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape"
+      && !$("settingsModal").classList.contains("hidden"))
+    closeSettings();
+});
+$("settingsModal").addEventListener("click", (e) => {
+  if (e.target === $("settingsModal")) closeSettings();  // backdrop click
+});
 $("settingsBtn").addEventListener("click", async () => {
   try {
     const s = await api.get_settings();
     settings = s || {};
   } catch (e) { settings = settings || {}; }
-  $("apiKeyInput").value = settings.api_key || "";
-  $("apiKeyInput").type = "password";
-  $("keyToggle").textContent = "Show";
   segSet("themeSeg", settings.theme === "light" ? "light" : "dark");
   $("accentPick").value = settings.accent || "#2effc8";
   openSettings();
 });
-$("closeSettingsBtn").addEventListener("click", () => hide($("settingsModal")));
+$("closeSettingsBtn").addEventListener("click", closeSettings);
 $("saveSettingsBtn").addEventListener("click", async () => {
-  await api.save_settings({ api_key: $("apiKeyInput").value.trim() });
-  settings.api_key = $("apiKeyInput").value.trim();
-  hide($("settingsModal"));
+  closeSettings();
   toast("Settings saved");
-});
-$("keyToggle").addEventListener("click", () => {
-  const inp = $("apiKeyInput");
-  const showing = inp.type === "text";
-  inp.type = showing ? "password" : "text";
-  $("keyToggle").textContent = showing ? "Show" : "Hide";
-});
-$("keyHelp").addEventListener("click", (e) => {
-  e.preventDefault();
-  toast("Get a free key at aistudio.google.com/app/apikey");
 });
 
 /* ---------------- theme (Dark default = web-app look) ---------------- */
