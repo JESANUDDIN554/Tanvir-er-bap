@@ -203,16 +203,54 @@ def _read_wav_mono16k(wav_path):
     return (audio.astype("float32") / 32768.0)
 
 
+def _whisper_cache_dir(model_name):
+    """The huggingface hub cache folder for the faster-whisper model,
+    or None if it cannot be located."""
+    repo = (model_name if "/" in model_name
+            else "Systran/faster-whisper-" + model_name)
+    folder = "models--" + repo.replace("/", "--")
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+        return os.path.join(HF_HUB_CACHE, folder)
+    except Exception:  # noqa: BLE001
+        home = os.path.expanduser("~")
+        return os.path.join(home, ".cache", "huggingface", "hub", folder)
+
+
+def _load_whisper_model(model_name, progress_cb=None):
+    """Load the faster-whisper model, self-healing a broken download.
+
+    On Windows a first download can end up half-written (interrupted,
+    or snapshot entries that are symlinks the OS cannot resolve), and
+    every later load then dies with "Unable to open file 'model.bin'".
+    If the first load fails, wipe the cached model and download it
+    fresh, exactly once, then load again.
+    """
+    # Real files instead of symlinks in the HF cache: symlink entries
+    # are the classic Windows failure behind the model.bin error.
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+    from faster_whisper import WhisperModel
+    try:
+        return WhisperModel(model_name, device="cpu", compute_type="int8")
+    except Exception:  # noqa: BLE001 - fall through to the repair path
+        pass
+    cache_dir = _whisper_cache_dir(model_name)
+    if cache_dir and os.path.isdir(cache_dir):
+        if progress_cb:
+            progress_cb(6, "Repairing transcription model download")
+        import shutil
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    return WhisperModel(model_name, device="cpu", compute_type="int8")
+
+
 def transcribe(video_path, model_name="base", progress_cb=None,
                language="auto"):
     """Transcribe with word-level timestamps. Returns list of word dicts.
 
     language: faster-whisper language code ("en", "es", ...) or "auto"."""
-    from faster_whisper import WhisperModel
-
     if progress_cb:
         progress_cb(5, "Loading transcription model")
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    model = _load_whisper_model(model_name, progress_cb)
     if progress_cb:
         progress_cb(10, "Extracting audio")
     wav_fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="trans_")
