@@ -155,7 +155,11 @@ def verify_license(key_str):
         payload = json.loads(payload_bytes.decode("utf-8"))
     except Exception:  # noqa: BLE001
         raise LicenseError("That license key is damaged or incomplete.")
-    if payload.get("machine") != machine_code():
+    lic_machine = str(payload.get("machine") or "")
+    # A signed "ANY" key is the owner's universal key: it unlocks any
+    # machine. Only the private-key holder can mint one, so it cannot
+    # be forged - but whoever holds it can use it anywhere.
+    if lic_machine != "ANY" and lic_machine != machine_code():
         raise LicenseError(
             "This key was issued for a different computer. Keys are "
             "tied to one machine - ask the seller for a key for this "
@@ -175,8 +179,9 @@ def verify_license(key_str):
         raise LicenseError(
             "This license key is not genuine - its core signature "
             "doesn't check out.")
+    wrap_machine = "ANY" if lic_machine == "ANY" else machine_code()
     wrap_key = hashlib.sha256(
-        core_sig + machine_code().encode("ascii")).digest()
+        core_sig + wrap_machine.encode("ascii")).digest()
     try:
         pack_key = open_sealed(wrap_key, wrapped, aad=b"itraji-pack-key")
     except ValueError:
@@ -255,7 +260,7 @@ def require_unlocked():
     if not _state["unlocked"] or not _state.get("payload"):
         return _state.get("reason") or "not activated"
     payload = _state["payload"]
-    if payload.get("machine") != machine_code():
+    if str(payload.get("machine") or "") not in ("ANY", machine_code()):
         return "This key was issued for a different computer."
     import datetime
     exp = str(payload.get("exp") or "never")
