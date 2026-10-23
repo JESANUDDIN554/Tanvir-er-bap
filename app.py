@@ -816,7 +816,7 @@ class Api:
             os.makedirs(work, exist_ok=True)
             if is_url:
                 _remover_log(rid, "Download started")
-                src = download_video(
+                src, _dl_title, _dl_dur = download_video(
                     source, work,
                     lambda p, t: cb(int(p * 0.25), t),
                     use_cookies=bool(settings.get("use_browser_cookies")))
