@@ -30,7 +30,7 @@ from pipeline import (  # noqa: E402
     find_moments_by_keywords, parse_srt_file,
     render_clip, retime_words, write_srt, write_vtt, write_xml_timeline,
     merge_clips, probe_duration, probe_video, set_custom_styles,
-    generate_posting_package, remove_captions,
+    generate_posting_package, remove_captions, detect_caption_band,
     LANGUAGES, GENRES, RATIOS,
 )
 
@@ -757,8 +757,13 @@ class Api:
                                           "this PC."}
         try:
             w, h, _f = probe_video(source)
-            return {"ok": True, "probed": True, "width": w, "height": h,
-                    "duration": probe_duration(source) or 0}
+            res = {"ok": True, "probed": True, "width": w, "height": h,
+                   "duration": probe_duration(source) or 0}
+            try:
+                res["detected"] = detect_caption_band(source, samples=16)
+            except Exception:
+                res["detected"] = {"found": False}
+            return res
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 
@@ -772,17 +777,20 @@ class Api:
                                           "local file path first."}
         if mode not in ("crop", "fill", "ai"):
             return {"ok": False, "error": "Unknown removal method."}
-        try:
-            top = float((region or {}).get("top_pct", 82.0))
-            bot = float((region or {}).get("bottom_pct", 100.0))
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "The caption region needs "
-                                          "numeric top/bottom values."}
-        if not (0.0 <= top <= 100.0 and 0.0 <= bot <= 100.0) \
-                or bot - top < 2.0:
-            return {"ok": False, "error": "The caption region is too "
-                                          "thin or outside the frame - "
-                                          "widen the band."}
+        auto = bool((region or {}).get("auto"))
+        top = bot = None
+        if not auto:
+            try:
+                top = float((region or {}).get("top_pct", 82.0))
+                bot = float((region or {}).get("bottom_pct", 100.0))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "The caption region needs "
+                                              "numeric top/bottom values."}
+            if not (0.0 <= top <= 100.0 and 0.0 <= bot <= 100.0) \
+                    or bot - top < 2.0:
+                return {"ok": False, "error": "The caption region is too "
+                                              "thin or outside the frame - "
+                                              "widen the band."}
         is_url = source.lower().startswith(("http://", "https://"))
         if not is_url and not os.path.isfile(source):
             return {"ok": False, "error": "That file was not found on "
@@ -791,10 +799,10 @@ class Api:
         _REMOVER_JOBS[rid] = {"id": rid, "status": "running", "pct": 0,
                               "stage": "Starting", "error": None,
                               "url": None, "mode": mode, "log": []}
+        job_region = ({"auto": True} if auto
+                      else {"top_pct": top, "bottom_pct": bot})
         t = threading.Thread(target=self._run_remover,
-                             args=(rid, source, is_url,
-                                   {"top_pct": top, "bottom_pct": bot},
-                                   mode),
+                             args=(rid, source, is_url, job_region, mode),
                              daemon=True)
         t.start()
         return {"ok": True, "id": rid}
@@ -827,6 +835,23 @@ class Api:
                     _remover_log(rid, "Download finished")
             else:
                 src = source
+            if region and region.get("auto"):
+                _remover_log(rid, "Auto-detect: scanning the video to "
+                                  "find the captions")
+                cb(26, "Auto-detecting the caption band")
+                det = detect_caption_band(src)
+                if det.get("found"):
+                    region = {"top_pct": det["top_pct"],
+                              "bottom_pct": det["bottom_pct"]}
+                    _remover_log(
+                        rid, "Auto-detected caption band: "
+                        f"{det['top_pct']:.0f}% - {det['bottom_pct']:.0f}% "
+                        "of the frame height")
+                else:
+                    region = {"top_pct": 82.0, "bottom_pct": 100.0}
+                    _remover_log(rid, "No clear caption band found - "
+                                      "using the bottom band (82% - 100%). "
+                                      "Use Custom to adjust if needed.")
             out = os.path.join(work, "output.mp4")
             remove_captions(
                 src, region, mode, out,

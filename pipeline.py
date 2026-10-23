@@ -2720,3 +2720,113 @@ def _remove_captions_ai(src, out, W, H, y0, y1, duration, cb, tier):
         os.remove(log_path)
     except OSError:
         pass
+
+
+def detect_caption_band(video_path, samples=24):
+    """Find where burned-in captions sit in the frame, by itself.
+
+    Samples frames across the video and looks for the horizontal band
+    whose rows carry dense, persistent, center-spread edges - the
+    signature of caption text (scene edges move around; caption rows
+    stay put while the words change). Returns {"found": bool, ...};
+    when found, top_pct/bottom_pct give the band (with a safety
+    margin). Conservative gates: a video with no captions should come
+    back found=False so callers can fall back honestly.
+    """
+    import cv2
+    import numpy as np
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return {"found": False}
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if not total or not height:
+        cap.release()
+        return {"found": False}
+    idxs = np.linspace(int(total * 0.04), int(total * 0.96),
+                       samples).astype(int)
+    edge_frames = []
+    for i in idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if width > 320:
+            gray = cv2.resize(gray,
+                              (320, max(2, int(height * 320 / width))))
+        edge_frames.append(cv2.Canny(gray, 50, 150) > 0)
+    cap.release()
+    if len(edge_frames) < 5:
+        return {"found": False}
+    E = np.stack(edge_frames).astype(np.float32)
+    _n, h, w = E.shape
+    prof = E.mean(axis=2)                       # per-frame row density
+    mean_prof = prof.mean(axis=0)
+    persist = (prof > 0.03).mean(axis=0)        # rows edgy in many frames
+    score = mean_prof * (0.35 + 0.65 * persist)
+    k = max(3, int(h * 0.015)) | 1
+    ss = np.convolve(score, np.ones(k) / k, mode="same")
+    peak = float(ss.max())
+    if peak < 0.16:
+        return {"found": False, "peak": round(peak, 3)}
+    # Candidate bands = clusters of strong rows. A busy static scene
+    # region can outscore the captions, so EVERY candidate must pass
+    # the text gates on its own; the best passing one wins.
+    above = ss > 0.45 * peak
+    clusters = []
+    i = 0
+    while i < h:
+        if above[i]:
+            j = i
+            while j < h and above[j]:
+                j += 1
+            clusters.append((i, j))
+            i = j
+        else:
+            i += 1
+    ctx = int(h * 0.03)
+    good = []
+    for a, b in clusters:
+        y0 = max(0, a - ctx)
+        y1 = min(h, b + ctx)
+        if y1 - y0 < int(h * 0.035):
+            c = (y0 + y1) // 2
+            half = int(h * 0.02)
+            y0 = max(0, c - half)
+            y1 = min(h, c + half + 1)
+        if y1 - y0 > int(h * 0.30):
+            c = (y0 + y1) // 2
+            half = int(h * 0.15)
+            y0 = max(0, c - half)
+            y1 = min(h, c + half)
+        band = E[:, y0:y1, int(w * 0.1):int(w * 0.9)]
+        if band.size == 0:
+            continue
+        colprof = band.mean(axis=(0, 1))
+        mid_share = float(
+            colprof[int(len(colprof) * 0.2):int(len(colprof) * 0.8)].sum()
+            / max(float(colprof.sum()), 1e-9))
+        bpeak = float(ss[y0:y1].max())
+        if bpeak >= 0.16 and mid_share >= 0.72:
+            good.append((bpeak * mid_share, y0, y1, mid_share))
+    if not good:
+        return {"found": False, "peak": round(peak, 3)}
+    good.sort(reverse=True)
+    _s, y0, y1, mid_share = good[0]
+    # trim quiet rows at the band edges, then add a safety margin
+    thr = 0.45 * float(ss[y0:y1].mean())
+    while y0 < y1 - 2 and ss[y0] < thr:
+        y0 += 1
+    while y1 > y0 + 2 and ss[y1 - 1] < thr:
+        y1 -= 1
+    m = int(h * 0.022)
+    y0 = max(0, y0 - m)
+    y1 = min(h, y1 + m)
+    return {"found": True,
+            "top_pct": round(100.0 * y0 / h, 1),
+            "bottom_pct": round(100.0 * y1 / h, 1),
+            "peak": round(peak, 3),
+            "mid_share": round(mid_share, 3)}
