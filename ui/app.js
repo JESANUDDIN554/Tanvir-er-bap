@@ -1551,8 +1551,10 @@ $("libBackBtn").addEventListener("click", hideLibrary);
 
 /* ---------------- Caption Remover ---------------- */
 let removerOpen = false;
-let removerMode = "crop";
-let removerRegionPreset = "bottom";
+let removerMode = "ai";
+let removerRegionPreset = "auto";
+let removerDetected = null;
+let removerModeTouched = false;
 let removerTimer = null;
 
 function showRemover() {
@@ -1581,25 +1583,46 @@ $("removerBtn").addEventListener("click", showRemover);
 $("removerBackBtn").addEventListener("click", hideRemover);
 
 function removerRegion() {
+  if (removerRegionPreset === "auto") return { auto: true };
   return {
     top_pct: parseInt($("removerTop").value, 10),
     bottom_pct: parseInt($("removerBot").value, 10),
   };
 }
 function updateRemoverRegionBox() {
-  const r = removerRegion();
-  $("removerTopVal").textContent = r.top_pct + "%";
-  $("removerBotVal").textContent = r.bottom_pct + "%";
+  const t = parseInt($("removerTop").value, 10);
+  const b = parseInt($("removerBot").value, 10);
+  $("removerTopVal").textContent = t + "%";
+  $("removerBotVal").textContent = b + "%";
   const box = $("removerRegionBox");
-  box.style.top = r.top_pct + "%";
-  box.style.height = Math.max(0, r.bottom_pct - r.top_pct) + "%";
+  box.style.top = t + "%";
+  box.style.height = Math.max(0, b - t) + "%";
+  if (removerRegionPreset === "auto") {
+    $("removerStageLabel").textContent = (removerDetected && removerDetected.found)
+      ? "Auto-detected caption band: " + Math.round(removerDetected.top_pct) + "% – " + Math.round(removerDetected.bottom_pct) + "% — this is what gets cleaned"
+      : "Auto-detect — the app finds the caption band by itself when you press Remove";
+  }
 }
 function setRemoverRegion(preset) {
   removerRegionPreset = preset;
   segSet("removerRegionSeg", preset);
   if (preset === "bottom") { $("removerTop").value = 82; $("removerBot").value = 100; }
   if (preset === "top") { $("removerTop").value = 0; $("removerBot").value = 14; }
+  if (preset === "auto") {
+    if (removerDetected && removerDetected.found) {
+      $("removerTop").value = Math.round(removerDetected.top_pct);
+      $("removerBot").value = Math.round(removerDetected.bottom_pct);
+    }
+    if (!removerModeTouched && removerMode !== "ai") {
+      removerMode = "ai";
+      document.querySelectorAll("#removerModePicker .mode-card").forEach((x) =>
+        x.classList.toggle("on", x.dataset.value === "ai"));
+    }
+  }
   $("removerSliders").classList.toggle("hidden", preset !== "custom");
+  $("removerAutoHint").classList.toggle("hidden", preset !== "auto");
+  if (preset !== "auto")
+    $("removerStageLabel").textContent = "Region preview — the highlighted band is what gets cleaned";
   updateRemoverRegionBox();
 }
 document.querySelectorAll("#removerRegionSeg .seg").forEach((b) =>
@@ -1620,6 +1643,7 @@ document.querySelectorAll("#removerModePicker .mode-card").forEach((c) =>
     document.querySelectorAll("#removerModePicker .mode-card").forEach((x) => x.classList.remove("on"));
     c.classList.add("on");
     removerMode = c.dataset.value;
+    removerModeTouched = true;
   }));
 $("removerPath").addEventListener("change", async () => {
   const p = $("removerPath").value.trim();
@@ -1628,6 +1652,10 @@ $("removerPath").addEventListener("change", async () => {
     const r = await api.caption_remover_probe(p);
     if (r && r.ok && r.probed && r.width && r.height)
       $("removerStage").style.aspectRatio = r.width + " / " + r.height;
+    if (r && r.ok && r.detected) {
+      removerDetected = r.detected;
+      if (removerRegionPreset === "auto") setRemoverRegion("auto");
+    }
   } catch (e) { /* stage sizing is a nicety */ }
 });
 $("removerRunBtn").addEventListener("click", async () => {

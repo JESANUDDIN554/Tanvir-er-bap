@@ -453,10 +453,12 @@
     <div class="field">
       <label class="field-label">Caption region</label>
       <div class="segmented" id="removerRegionSeg">
-        <button type="button" data-value="bottom" class="seg on">Bottom band</button>
+        <button type="button" data-value="auto" class="seg on">Auto-detect</button>
+        <button type="button" data-value="bottom" class="seg">Bottom band</button>
         <button type="button" data-value="top" class="seg">Top band</button>
         <button type="button" data-value="custom" class="seg">Custom</button>
       </div>
+      <p class="hint" id="removerAutoHint" style="margin-top:8px">Auto-detect scans the video and finds the caption band by itself, then removes it with AI Inpaint for the best quality. Nothing to pick.</p>
       <div id="removerSliders" class="hidden" style="margin-top:12px">
         <div class="row row-tight">
           <label class="hint" style="min-width:86px">Region top <span id="removerTopVal">82%</span></label>
@@ -477,9 +479,9 @@
     <div class="field">
       <label class="field-label">Method</label>
       <div class="mode-grid" id="removerModePicker">
-        <button type="button" class="mode-card on" data-value="crop"><span class="mode-name">Crop Band</span><span class="mode-desc">Cuts the band out and stretches the frame back to full size. Instant, zero artifacts — the picture gets slightly taller-looking.</span></button>
+        <button type="button" class="mode-card" data-value="crop"><span class="mode-name">Crop Band</span><span class="mode-desc">Cuts the band out and stretches the frame back to full size. Instant, zero artifacts — the picture gets slightly taller-looking.</span></button>
         <button type="button" class="mode-card" data-value="fill"><span class="mode-name">Smart Fill</span><span class="mode-desc">Fills the band with a texture blend sampled from the band itself. Fast, keeps the framing — soft where captions were.</span></button>
-        <button type="button" class="mode-card" data-value="ai"><span class="mode-name">AI Inpaint</span><span class="mode-desc">A LaMa AI model rebuilds what's behind the captions. Best quality, slowest. First use downloads the model once (~198 MB).</span></button>
+        <button type="button" class="mode-card on" data-value="ai"><span class="mode-name">AI Inpaint — best quality</span><span class="mode-desc">A LaMa AI model rebuilds what's behind the captions. Best quality, slowest. First use downloads the model once (~198 MB). Auto-detect uses this one.</span></button>
       </div>
     </div>
 
