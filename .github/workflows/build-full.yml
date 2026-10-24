@@ -232,14 +232,14 @@ jobs:
           exit /b 0
           '@
           [System.IO.File]::WriteAllText("$tree\uninstall.cmd", $uninstall, (New-Object System.Text.ASCIIEncoding))
-          $extraZip = Join-Path $sfxDir '7z2605-extra.7z'
-          curl.exe -L --fail --retry 3 -o $extraZip 'https://github.com/ip7z/7zip/releases/download/26.05/7z2605-extra.7z'
-          if ($LASTEXITCODE -ne 0) { throw "7-Zip extra download failed: curl exit $LASTEXITCODE" }
-          $extraDir = Join-Path $sfxDir 'extra'
+          $extraZip = Join-Path $sfxDir 'lzma2605.7z'
+          curl.exe -L --fail --retry 3 -o $extraZip 'https://github.com/ip7z/7zip/releases/download/26.05/lzma2605.7z'
+          if ($LASTEXITCODE -ne 0) { throw "LZMA SDK download failed: curl exit $LASTEXITCODE" }
+          $extraDir = Join-Path $sfxDir 'sdk'
           & 7z x $extraZip "-o$extraDir" -y | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'extracting 7-Zip extra package failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'extracting LZMA SDK failed' }
           $sfxMod = Get-ChildItem -Recurse $extraDir -Filter '7zSD.sfx' | Select-Object -First 1
-          if (-not $sfxMod) { throw '7zSD.sfx not found in 7-Zip extra package' }
+          if (-not $sfxMod) { throw '7zSD.sfx not found in LZMA SDK' }
           $za = Get-ChildItem -Recurse $extraDir -Filter '7za.exe' | Select-Object -First 1
           $sevenZip = if ($za) { $za.FullName } else { '7z' }
           Write-Host "Using SFX module: $($sfxMod.FullName); archiver: $sevenZip"
