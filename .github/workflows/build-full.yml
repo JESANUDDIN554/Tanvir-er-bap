@@ -1,12 +1,25 @@
-# Builds the FULL Itraji Cliper installer: the normal app payload PLUS
-# the ~9 GB built-in AI model (Qwen2.5-14B-Instruct Q4_K_M GGUF) and the
-# llama.cpp engine baked in, so the app is fully ready right after
-# install - no first-run model download.
+# Builds the FULL Itraji Cliper installer as ONE self-extracting exe:
+# the normal app payload PLUS the ~9 GB built-in AI model
+# (Qwen2.5-14B-Instruct Q4_K_M GGUF) and the llama.cpp engine baked in,
+# so the app is fully ready right after install - no first-run download.
 #
-# The output (~9.3 GB) exceeds the 2 GB GitHub Release asset limit, so
+# The output (~9.2 GB) exceeds the 2 GB GitHub Release asset limit, so
 # it is published as a workflow ARTIFACT (name: ItrajiCliper-Setup-Full),
 # not a Release asset. The light installer flow (build-exe.yml) is
 # untouched.
+#
+# How the single file works: the Inno compile step still builds the
+# disk-spanned parts as an internal cross-check, but the deliverable is
+# built by the 7zSD SFX step below: a 7z archive of the installed-layout
+# tree (dist tree + models/ + llama/ + post-install helpers) concatenated
+# behind the 7zSD.sfx installer module (pinned 7-Zip 26.05 extra package).
+# At install time the SFX module extracts to a temp folder, then the
+# bundled postinstall.cmd MOVES the tree into
+# %LOCALAPPDATA%\Programs\Itraji Cliper - a same-volume rename, so no
+# second 9 GB copy is written - then creates shortcuts, registers the
+# uninstall entry, and launches the app. Free space needed at install
+# time is ~the installed footprint (~9.5 GB) on top of the downloaded
+# file itself, NOT ~28 GB.
 #
 # The model is NOT in git: this workflow downloads it from the official
 # bartowski Hugging Face repo and hard-fails unless its size and
@@ -72,8 +85,7 @@ jobs:
             Sort-Object Free -Descending | Select-Object -First 1
           $stage = Join-Path $best.Root 'itraji-full-stage'
           New-Item -ItemType Directory -Force -Path `
-            "$stage\models", "$stage\llama", "$stage\out", `
-            "$stage\install-test" | Out-Null
+            "$stage\models", "$stage\llama", "$stage\out" | Out-Null
           "STAGE_DIR=$stage" | Out-File -FilePath $env:GITHUB_ENV -Append
           Get-PSDrive -PSProvider FileSystem |
             Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} |
@@ -138,61 +150,196 @@ jobs:
           $total = ($parts | Measure-Object Length -Sum).Sum
           Write-Host "$($parts.Count) parts (exe + $($bins.Count) .bin), $total bytes total"
 
-      - name: Verify the installer (silent install, model hash, integrity manifest)
+      - name: Build single-file self-extracting installer (7zSD SFX)
         if: success()
         shell: pwsh
         run: |
-          $setup = Join-Path $env:STAGE_DIR 'out\ItrajiCliper-Setup-Full.exe'
-          $idir = Join-Path $env:STAGE_DIR 'install-test'
-          $p = Start-Process $setup -Wait -PassThru -ArgumentList `
-            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$idir"
-          if ($p.ExitCode -ne 0) { throw "silent install exit code $($p.ExitCode)" }
-          $model = Join-Path $idir 'models\Qwen2.5-14B-Instruct-Q4_K_M.gguf'
+          $stage = $env:STAGE_DIR
+          $sfxDir = Join-Path $stage 'sfx'
+          $tree = Join-Path $sfxDir 'tree'
+          New-Item -ItemType Directory -Force -Path $tree | Out-Null
+          $drive = (Get-Item $stage).PSDrive
+          $freeGB = [math]::Round($drive.Free / 1GB, 1)
+          if ($drive.Free -lt 30GB) { throw "not enough free space on staging drive $($drive.Name): $freeGB GB" }
+          Write-Host "Staging drive $($drive.Name): $freeGB GB free"
+          Copy-Item -Recurse -Force 'dist\ClipMakerPC\*' $tree
+          New-Item -ItemType Directory -Force -Path "$tree\models" | Out-Null
+          $modelSrc = Join-Path $stage 'models\Qwen2.5-14B-Instruct-Q4_K_M.gguf'
+          fsutil hardlink create "$tree\models\Qwen2.5-14B-Instruct-Q4_K_M.gguf" $modelSrc | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'hardlink for model failed' }
+          Copy-Item -Recurse -Force (Join-Path $stage 'llama') "$tree\llama"
+          $postinstall = @'
+          @echo off
+          setlocal
+          rem Itraji Cliper single-file installer: post-install helper.
+          rem The 7zSD SFX module extracted the whole app tree into a temp folder
+          rem and runs this script from inside it (%~dp0 = that temp folder).
+          rem We MOVE the tree into its final home. %TEMP% and
+          rem %LOCALAPPDATA%\Programs are both under the user profile, so this is
+          rem a same-volume rename: no second 9 GB copy is written. (If TEMP was
+          rem redirected to another volume, Windows move falls back to copy+delete.)
+          set "SRC=%~dp0"
+          if "%SRC:~-1%"=="\" set "SRC=%SRC:~0,-1%"
+          set "FINAL=%LOCALAPPDATA%\Programs\Itraji Cliper"
+          if not exist "%LOCALAPPDATA%\Programs" mkdir "%LOCALAPPDATA%\Programs"
+          taskkill /F /IM ClipMakerPC.exe >nul 2>&1
+          if exist "%FINAL%.old" rd /s /q "%FINAL%.old"
+          if exist "%FINAL%" (
+          move /Y "%FINAL%" "%FINAL%.old"
+          if errorlevel 1 (
+          echo ERROR: existing install at "%FINAL%" could not be moved aside
+          exit /b 1
+          )
+          )
+          cd /d "%TEMP%"
+          move /Y "%SRC%" "%FINAL%"
+          if errorlevel 1 (
+          echo ERROR: could not move app tree to "%FINAL%"
+          if exist "%FINAL%.old" move /Y "%FINAL%.old" "%FINAL%"
+          exit /b 1
+          )
+          if exist "%FINAL%.old" rd /s /q "%FINAL%.old"
+          cd /d "%FINAL%"
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws = New-Object -ComObject WScript.Shell; $d = [Environment]::GetFolderPath('Desktop'); $m = [Environment]::GetFolderPath('StartMenu'); $t = Join-Path $env:LOCALAPPDATA 'Programs\Itraji Cliper\ClipMakerPC.exe'; $w = Join-Path $env:LOCALAPPDATA 'Programs\Itraji Cliper'; $s = $ws.CreateShortcut((Join-Path $d 'Itraji Cliper.lnk')); $s.TargetPath = $t; $s.WorkingDirectory = $w; $s.Save(); $s2 = $ws.CreateShortcut((Join-Path $m 'Programs\Itraji Cliper.lnk')); $s2.TargetPath = $t; $s2.WorkingDirectory = $w; $s2.Save()"
+          if errorlevel 1 echo WARNING: shortcut creation failed, continuing
+          reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ItrajiCliper" /v DisplayName /t REG_SZ /d "Itraji Cliper" /f >nul
+          reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ItrajiCliper" /v DisplayVersion /t REG_SZ /d "2.0.0" /f >nul
+          reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ItrajiCliper" /v Publisher /t REG_SZ /d "Itraji" /f >nul
+          reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ItrajiCliper" /v InstallLocation /t REG_SZ /d "%FINAL%" /f >nul
+          reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ItrajiCliper" /v UninstallString /t REG_SZ /d "\"%FINAL%\uninstall.cmd\"" /f >nul
+          reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ItrajiCliper" /v DisplayIcon /t REG_SZ /d "%FINAL%\ClipMakerPC.exe" /f >nul
+          echo Itraji Cliper installed > "%FINAL%\install-ok.txt"
+          if not "%ITRAJI_SFX_SILENT%"=="1" start "" "%FINAL%\ClipMakerPC.exe"
+          exit /b 0
+          '@
+          [System.IO.File]::WriteAllText("$tree\postinstall.cmd", $postinstall, (New-Object System.Text.ASCIIEncoding))
+          $uninstall = @'
+          @echo off
+          setlocal
+          rem Itraji Cliper uninstaller (bundled with the single-file install).
+          rem Removes shortcuts + registry entry, then deletes this app folder via
+          rem a detached cleanup script (this script lives inside that folder).
+          set "FINAL=%~dp0"
+          if "%FINAL:~-1%"=="\" set "FINAL=%FINAL:~0,-1%"
+          powershell -NoProfile -Command "Remove-Item -Force (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Itraji Cliper.lnk') -ErrorAction SilentlyContinue; Remove-Item -Force (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\Itraji Cliper.lnk') -ErrorAction SilentlyContinue" 2>nul
+          reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ItrajiCliper" /f >nul 2>&1
+          cd /d "%TEMP%"
+          > "%TEMP%\itraji-uninstall-cleanup.cmd" echo @echo off
+          >> "%TEMP%\itraji-uninstall-cleanup.cmd" echo cd /d "%TEMP%"
+          >> "%TEMP%\itraji-uninstall-cleanup.cmd" echo timeout /t 3 /nobreak ^>nul
+          >> "%TEMP%\itraji-uninstall-cleanup.cmd" echo rd /s /q "%FINAL%"
+          start "" /min "%TEMP%\itraji-uninstall-cleanup.cmd"
+          exit /b 0
+          '@
+          [System.IO.File]::WriteAllText("$tree\uninstall.cmd", $uninstall, (New-Object System.Text.ASCIIEncoding))
+          $extraZip = Join-Path $sfxDir '7z2605-extra.7z'
+          curl.exe -L --fail --retry 3 -o $extraZip 'https://github.com/ip7z/7zip/releases/download/26.05/7z2605-extra.7z'
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip extra download failed: curl exit $LASTEXITCODE" }
+          $extraDir = Join-Path $sfxDir 'extra'
+          & 7z x $extraZip "-o$extraDir" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'extracting 7-Zip extra package failed' }
+          $sfxMod = Get-ChildItem -Recurse $extraDir -Filter '7zSD.sfx' | Select-Object -First 1
+          if (-not $sfxMod) { throw '7zSD.sfx not found in 7-Zip extra package' }
+          $za = Get-ChildItem -Recurse $extraDir -Filter '7za.exe' | Select-Object -First 1
+          $sevenZip = if ($za) { $za.FullName } else { '7z' }
+          Write-Host "Using SFX module: $($sfxMod.FullName); archiver: $sevenZip"
+          $archive = Join-Path $sfxDir 'payload.7z'
+          Push-Location $tree
+          & $sevenZip a -t7z -mx=0 $archive * | Out-Null
+          $zaExit = $LASTEXITCODE
+          Pop-Location
+          if ($zaExit -ne 0) { throw "7z archive failed: $zaExit" }
+          $config = @'
+          ;!@Install@!UTF-8!
+          Title="Itraji Cliper"
+          Progress="yes"
+          RunProgram="hidcon:postinstall.cmd"
+          ;!@InstallEnd@!
+          '@
+          [System.IO.File]::WriteAllText("$sfxDir\sfx-config.txt", $config, (New-Object System.Text.UTF8Encoding($false)))
+          $out = Join-Path $stage 'out'
+          $single = Join-Path $out 'ItrajiCliper-Setup-Full.exe'
+          $fsOut = [System.IO.File]::Create($single)
+          try {
+          foreach ($part in @($sfxMod.FullName, "$sfxDir\sfx-config.txt", $archive)) {
+          $fsIn = [System.IO.File]::OpenRead($part)
+          try { $fsIn.CopyTo($fsOut) } finally { $fsIn.Close() }
+          }
+          } finally { $fsOut.Close() }
+          $sf = Get-Item $single
+          if ($sf.Length -lt 9000000000) { throw "single exe suspiciously small: $($sf.Length) bytes" }
+          Write-Host "Single-file installer: $($sf.Name), $($sf.Length) bytes"
+          Remove-Item $archive -Force
+          Remove-Item -Recurse -Force $tree
+          Get-ChildItem $out -Filter '*.bin' | Remove-Item -Force
+          Get-ChildItem $out -File | Select-Object Name, Length | Format-Table | Out-String | Write-Host
+
+      - name: Verify the single-file installer (move-install, model hash, integrity manifest)
+        if: success()
+        shell: pwsh
+        timeout-minutes: 60
+        run: |
+          $single = Join-Path $env:STAGE_DIR 'out\ItrajiCliper-Setup-Full.exe'
+          if (-not (Test-Path $single)) { throw 'single-file installer missing from out dir' }
+          $sf = Get-Item $single
+          Write-Host "Single-file installer: $($sf.Length) bytes"
+          $final = Join-Path $env:LOCALAPPDATA 'Programs\Itraji Cliper'
+          if (Test-Path $final) { Remove-Item -Recurse -Force $final }
+          $env:ITRAJI_SFX_SILENT = '1'
+          $p = Start-Process $single -Wait -PassThru -ArgumentList '-y'
+          if ($p.ExitCode -ne 0) { throw "single-file installer exit code $($p.ExitCode)" }
+          if (-not (Test-Path (Join-Path $final 'install-ok.txt'))) {
+          throw 'post-install helper marker missing: helper did not run'
+          }
+          $model = Join-Path $final 'models\Qwen2.5-14B-Instruct-Q4_K_M.gguf'
           $f = Get-Item $model
           if ($f.Length -ne 8988110976) {
-            throw "installed model size mismatch: got $($f.Length), want 8988110976"
+          throw "installed model size mismatch: got $($f.Length), want 8988110976"
           }
           $h = (Get-FileHash $model -Algorithm SHA256).Hash.ToLower()
           if ($h -ne 'e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008') {
-            throw "installed model SHA256 mismatch: got $h"
+          throw "installed model SHA256 mismatch: got $h"
           }
-          if (-not (Get-ChildItem -Recurse (Join-Path $idir 'llama') -Filter 'llama-server.exe')) {
-            throw 'installed llama-server.exe missing under llama\'
+          if (-not (Get-ChildItem -Recurse (Join-Path $final 'llama') -Filter 'llama-server.exe')) {
+          throw 'installed llama-server.exe missing under llama\'
           }
-          if (-not (Test-Path (Join-Path $idir 'ClipMakerPC.exe'))) {
-            throw 'installed ClipMakerPC.exe missing'
+          if (-not (Test-Path (Join-Path $final 'ClipMakerPC.exe'))) {
+          throw 'installed ClipMakerPC.exe missing'
           }
-          Get-ChildItem $idir | Select-Object Name
-          Get-ChildItem (Join-Path $idir '_internal') | Select-Object Name
-          # The app itself verifies integrity against its bundle dir
-          # (BASE_DIR = sys._MEIPASS = the _internal folder of the installed
-          # onedir layout), so this check must point at _internal too -
-          # pointing it at the install root fails on the first manifest
-          # entry (ui/activate.html) because the file lives under _internal.
-          $env:ITRAJI_INSTALL_DIR = Join-Path $idir '_internal'
+          $uninst = Get-ItemProperty -ErrorAction SilentlyContinue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ItrajiCliper'
+          if (-not $uninst -or -not $uninst.UninstallString) {
+          throw 'uninstall registry entry missing'
+          }
+          $desk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Itraji Cliper.lnk'
+          $startm = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\Itraji Cliper.lnk'
+          if (-not (Test-Path $desk)) { throw 'desktop shortcut missing' }
+          if (-not (Test-Path $startm)) { throw 'start menu shortcut missing' }
+          Get-ChildItem $final | Select-Object Name
+          Get-ChildItem (Join-Path $final '_internal') | Select-Object Name
+          # Same integrity rule as the app itself: verify against the bundle
+          # dir (BASE_DIR = sys._MEIPASS = _internal in the installed
+          # onedir layout), NOT the install root.
+          $env:ITRAJI_INSTALL_DIR = Join-Path $final '_internal'
           python -c "import os, sys, licensing; ok, bad = licensing.verify_integrity(os.environ['ITRAJI_INSTALL_DIR']); print('verify_integrity:', ok, bad); sys.exit(0 if ok else 1)"
           if ($LASTEXITCODE -ne 0) { throw 'integrity manifest check failed on installed payload' }
-          Write-Host 'Installer verification passed: model bytes + hash, engine, app exe, signed integrity manifest.'
+          Write-Host 'Single-file installer verification passed: move-install, model bytes + hash, engine, app exe, shortcuts, uninstall entry, signed integrity manifest.'
 
       - name: Write build summary
         if: success()
         shell: pwsh
         run: |
           $out = Join-Path $env:STAGE_DIR 'out'
-          $parts = Get-ChildItem $out -File | Sort-Object Name
-          $total = ($parts | Measure-Object Length -Sum).Sum
-          $exeHash = (Get-FileHash (Join-Path $out 'ItrajiCliper-Setup-Full.exe') -Algorithm SHA256).Hash.ToLower()
+          $single = Join-Path $out 'ItrajiCliper-Setup-Full.exe'
+          $exeHash = (Get-FileHash $single -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item $single).Length
           $lines = @(
-            '## ItrajiCliper-Setup-Full (disk-spanned installer)'
+            '## ItrajiCliper-Setup-Full (single-file self-extracting installer)'
             ''
-            "Parts: $($parts.Count), total: $total bytes (the .exe and every .bin must stay in the same folder; the installer reads the parts automatically)"
-            "ItrajiCliper-Setup-Full.exe SHA256: $exeHash"
+            "Single file: ItrajiCliper-Setup-Full.exe, $size bytes, SHA256: $exeHash"
+            'Install model: the 7zSD SFX module extracts to a temp folder, then the bundled post-install helper MOVES the tree into %LOCALAPPDATA%\Programs\Itraji Cliper (same-volume rename, no second 9 GB copy), creates Desktop + Start Menu shortcuts, registers the HKCU uninstall entry, and launches the app. Free space needed at install time is ~the installed footprint (~9.5 GB) on top of the downloaded file.'
+            'Model: Qwen2.5-14B-Instruct-Q4_K_M.gguf, 8988110976 bytes, sha256 e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008 (verified before packaging and again in the installed tree)'
+            'Single-file verification on the runner: PASSED (move-install, marker file, model, engine, app exe, shortcuts, uninstall entry, signed integrity manifest)'
           )
-          foreach ($p in $parts) {
-            $lines += "- $($p.Name): $($p.Length) bytes"
-          }
-          $lines += 'Model: Qwen2.5-14B-Instruct-Q4_K_M.gguf, 8988110976 bytes, sha256 e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008 (verified before compile and again in the installed tree)'
-          $lines += 'Silent-install verification on the runner: PASSED (model, engine, app exe, signed integrity manifest)'
           $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - name: Upload FULL installer as workflow artifact
