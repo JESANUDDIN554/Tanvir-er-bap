@@ -3330,6 +3330,14 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
     motion_hist = []      # recent mean |flow| values (flow pixels)
     mask_ocr = None       # latest OCR mask, crop coordinates
     since_ocr = 10 ** 9
+    ocr_every = max(15, min(45, int(round(fps))))  # ~1 s windows
+    # Per-window text verdict from the OCR refresh: "wide" = text
+    # spread across the band (captions / overlay strip - full mask
+    # logic), "narrow" = one localised patch (a corner logo - paint
+    # only at the OCR-confirmed boxes), "none" = OCR saw no text in
+    # the band at all (pass the frames through untouched; texture
+    # alone must never trigger painting - see the mask logic below).
+    win_mode = "wide"
     n = plates = warps = 0
     pipe_broken = False
     try:
@@ -3345,7 +3353,7 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
                                interpolation=cv2.INTER_AREA)
 
             # ---- text mask for this frame --------------------------
-            if det is not None and since_ocr >= 30:
+            if det is not None and since_ocr >= ocr_every:
                 try:
                     boxes = det.detect(frame, max_side=768)
                     # caption text only: boxes centred in the band
@@ -3355,17 +3363,50 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
                              <= y1 + 12]
                     mask_ocr = _rasterize_boxes(boxes, (ch, W),
                                                 oy=cy0)
+                    # Classify the window by how the OCR evidence
+                    # spreads over the band: coverage of the band
+                    # area and of its columns. A corner logo covers
+                    # ~0.30 of the columns; captions and the bodycam
+                    # strip span nearly all of them.
+                    band_area = float(max(1, (by1 - by0) * W))
+                    cov = (float(mask_ocr[by0:by1].sum())
+                           / band_area)
+                    cols = float((mask_ocr[by0:by1].sum(axis=0)
+                                  > 0).mean())
+                    if not boxes:
+                        win_mode = "none"
+                    elif cols >= 0.38 or cov >= 0.45:
+                        win_mode = "wide"
+                    else:
+                        win_mode = "narrow"
                 except Exception:
                     mask_ocr = None
                 since_ocr = 0
             since_ocr += 1
+            gate_closed = det is not None and win_mode == "none"
             th = _tophat_text_mask(gray)
             near = np.zeros((ch, W), np.float32)
             ny0 = max(0, by0 - (by1 - by0) // 2)
             ny1 = min(ch, by1 + (by1 - by0) // 2)
             near[ny0:ny1] = 1.0
             th = th * near
-            if mask_ocr is not None:
+            if gate_closed:
+                # OCR found no text in the band this window: any
+                # mask would come from texture alone (wood grain,
+                # photo detail fires the top-hat hard), and painting
+                # the plate over a text-free stretch leaves a
+                # smeared strip behind. No mask, no paint.
+                mask = np.zeros((ch, W), np.float32)
+            elif det is not None and win_mode == "narrow" \
+                    and mask_ocr is not None:
+                # Only localised text this window (e.g. a corner
+                # logo in a photo segment): paint only at/near the
+                # OCR-confirmed boxes instead of wherever the
+                # top-hat signal fires across the band.
+                gate = cv2.dilate(mask_ocr,
+                                  np.ones((41, 41), np.float32))
+                mask = np.maximum(mask_ocr, th) * gate
+            elif mask_ocr is not None:
                 a_th = float(th[by0:by1].sum())
                 a_ocr = float(mask_ocr[by0:by1].sum())
                 if a_ocr <= 1.0 or a_th > 1.4 * a_ocr:
@@ -3391,7 +3432,8 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
             # ---- plate: build or track -----------------------------
             rebuild = plate is None
             flow = None
-            if prev_small is not None and not rebuild:
+            if prev_small is not None and not rebuild \
+                    and not gate_closed:
                 flow = cv2.calcOpticalFlowFarneback(
                     prev_small, small, None, 0.5, 3, 21, 3, 5, 1.2, 0)
                 mag = float(np.abs(flow).mean())
@@ -3423,7 +3465,14 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
                         or plate_age > age_limit \
                         or cum_disp > disp_budget:
                     rebuild = True
-            if rebuild:
+            if gate_closed:
+                # Text-free window: no plate work and no painting -
+                # the frame passes through untouched. Drop the plate
+                # so text returning later is filled from a fresh
+                # plate built on a text-bearing frame, never from a
+                # stale plate carried across a scene change.
+                plate = None
+            elif rebuild:
                 # A plate must be text-free EVERYWHERE text could
                 # appear, not just where this frame's mask looked:
                 # build it from the union of this frame's and the
@@ -3532,15 +3581,18 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
         pass
 
 
-def _detect_band_ocr(video_path, samples=14):
+def _detect_band_ocr(video_path, samples=18):
     """OCR caption-band detection: run the text detector over frames
     sampled across the video (decoded sequentially - random seeks
-    are far slower), cluster the boxes by height, and keep the
-    cluster that behaves like captions: present in most samples,
-    dense with text, covering a real share of the frame. Corner
-    overlays (channel logos, bodycam clocks) are text too, but they
-    are sparse specks beside a caption block, so the scoring rejects
-    them. Returns the detect dict, or None when sampling failed."""
+    are far slower), cluster the boxes by vertical proximity, and
+    keep every cluster that behaves like captions: WIDE, confident
+    text in a THIN strip in the lower frame. Presence share does NOT
+    gate qualification - dialogue captions come in bursts (a few
+    seconds in a long clip), so a caption cluster may appear in only
+    a couple of samples while an always-on overlay appears in all of
+    them; gating on persistence picks the overlay and leaves the
+    dialogue behind. All qualifying clusters are unioned into one
+    band. Returns the detect dict, or None when sampling failed."""
     import cv2
     import numpy as np
     det = _get_text_detector()
@@ -3568,103 +3620,102 @@ def _detect_band_ocr(video_path, samples=14):
             continue
         boxes = det.detect(frame, max_side=768)
         per_sample.append([(x0 / width, y0 / height, x1 / width,
-                            y1 / height)
-                           for (x0, y0, x1, y1, _s) in boxes])
+                            y1 / height, s)
+                           for (x0, y0, x1, y1, s) in boxes])
     cap.release()
     if len(per_sample) < 5:
         return None
     all_boxes = [b for bs in per_sample for b in bs]
     if not all_boxes:
         return {"found": False, "method": "ocr", "boxes": 0}
-    # Row-profile clustering: captions are WIDE text that stays put
-    # across samples, so score every height row by how often a wide
-    # box covers it. Scene text (signs, dashboards) is usually
-    # narrower, taller, or only on screen briefly, so it washes out
-    # of the profile instead of chaining into the caption cluster.
-    rows_n = 240
-    cover = np.zeros(rows_n, np.float32)
-    for bs in per_sample:
-        hit = np.zeros(rows_n, bool)
+    # Caption-likeness clustering: group the boxes themselves by
+    # vertical proximity (boxes whose rows overlap or nearly touch
+    # chain together - the lines of one caption block, or a logo
+    # sitting on the metadata strip), then judge each cluster the
+    # way a person would: captions are WIDE, confident text in a
+    # THIN strip (a line or two, never a third of the frame) in the
+    # lower half. Presence share is only a small ranking bonus: the
+    # previous scoring required a cluster in a third of all samples,
+    # which dialogue bursts (2 of 14 samples in the QA bodycam clip)
+    # can never reach, while the permanent overlay sailed through -
+    # auto mode erased the bodycam clock strip and left both spoken
+    # caption lines fully legible. A stack of scene text (a document
+    # shown on screen) chains into one TALL cluster and is rejected
+    # by the height gate; top-of-frame titles and watermarks fall
+    # outside the caption zone.
+    cand = []
+    for si, bs in enumerate(per_sample):
         for b in bs:
-            if (b[2] - b[0]) < 0.22:
-                continue
-            r0 = int(b[1] * rows_n)
-            r1 = min(rows_n, max(r0 + 1,
-                                 int(np.ceil(b[3] * rows_n))))
-            hit[r0:r1] = True
-        cover += hit
-    share = cover / float(len(per_sample))
-    strong = share >= 0.20
-    runs = []
-    r = 0
-    while r < rows_n:
-        if not strong[r]:
-            r += 1
-            continue
-        r0 = r
-        r1 = r
-        gap = 0
-        r += 1
-        while r < rows_n and gap <= 3:  # bridge inter-line gaps
-            if strong[r]:
-                r1 = r
-                gap = 0
-            else:
-                gap += 1
-            r += 1
-        runs.append((r0, r1))
+            if (b[2] - b[0]) >= 0.20 and b[4] >= 0.60:
+                cand.append((si, b))
+    if not cand:
+        return {"found": False, "method": "ocr",
+                "boxes": len(all_boxes)}
+    cand.sort(key=lambda sb: (sb[1][1] + sb[1][3]) / 2.0)
+    clusters = []
+    for si, b in cand:
+        if clusters and b[1] - clusters[-1]["bot"] <= 0.030:
+            c = clusters[-1]
+        else:
+            c = {"top": b[1], "bot": b[3], "boxes": []}
+            clusters.append(c)
+        c["top"] = min(c["top"], b[1])
+        c["bot"] = max(c["bot"], b[3])
+        c["boxes"].append((si, b))
+    n_samples = float(len(per_sample))
     scored = []
-    for (r0, r1) in runs:
-        top = r0 / rows_n
-        bot = (r1 + 1) / rows_n
-        cheight = bot - top
-        if cheight > 0.50 or cheight < 0.012:
-            continue
-        persistence = float(share[r0:r1 + 1].mean())
-        areas = []
-        present = 0
-        for bs in per_sample:
-            sel = [b for b in bs
-                   if (b[2] - b[0]) >= 0.22
-                   and top <= (b[1] + b[3]) / 2.0 <= bot]
-            if sel:
-                present += 1
-                areas.append(sum((b[2] - b[0]) * (b[3] - b[1])
-                                 for b in sel))
-        if not areas:
-            continue
-        persistence = present / float(len(per_sample))
+    for c in clusters:
+        boxes = c["boxes"]
+        cheight = c["bot"] - c["top"]
+        center = (c["top"] + c["bot"]) / 2.0
+        present = sorted({si for si, _b in boxes})
+        n_present = len(present)
+        width_med = float(np.median([b[2] - b[0] for _s, b in boxes]))
+        score_med = float(np.median([b[4] for _s, b in boxes]))
+        areas = [sum((b[2] - b[0]) * (b[3] - b[1])
+                     for s2, b in boxes if s2 == si)
+                 for si in present]
         area_med = float(np.median(areas))
-        density = area_med / cheight
-        score = persistence * density * float(np.sqrt(area_med))
-        if persistence >= 0.34 and density >= 0.15 and score >= 0.02:
-            scored.append((score, top, bot))
+        density = area_med / max(cheight, 1e-6)
+        qualifies = (
+            cheight <= 0.30
+            and center >= 0.45
+            and width_med >= 0.22
+            and score_med >= 0.70
+            and density >= 0.10
+            and (n_present >= 2
+                 or (width_med >= 0.40 and score_med >= 0.90
+                     and area_med >= 0.015)))
+        if not qualifies:
+            continue
+        share = n_present / n_samples
+        score = (width_med * score_med * float(np.sqrt(area_med))
+                 * (0.55 + 0.45 * share))
+        scored.append((score, c["top"], c["bot"]))
     if not scored:
         return {"found": False, "method": "ocr",
                 "boxes": len(all_boxes)}
-    scored.sort(key=lambda s: s[1])
-    # merge strong runs that sit close together (e.g. the main
-    # caption block and a second burned-in line just below it)
-    merged = [list(scored[0])]
+    # Union every qualifying cluster into ONE band (the dialogue
+    # lines AND the overlay strip beneath them - the band the manual
+    # control run proved ghost-free). Clusters join in score order
+    # only while the union stays under ~half the frame height, so
+    # one stray cluster cannot stretch the band over the picture.
+    scored.sort(key=lambda s: -s[0])
+    best_score = scored[0][0]
+    top_u, bot_u = scored[0][1], scored[0][2]
     for s in scored[1:]:
-        if s[1] - merged[-1][2] <= 0.06:
-            merged[-1][2] = max(merged[-1][2], s[2])
-            merged[-1][0] = max(merged[-1][0], s[0])
-        else:
-            merged.append(list(s))
-    merged.sort(key=lambda s: -s[0])
-    best = merged[0]
-    if best[2] - best[1] > 0.50:
-        return {"found": False, "method": "ocr",
-                "boxes": len(all_boxes)}
+        nt = min(top_u, s[1])
+        nb = max(bot_u, s[2])
+        if nb - nt <= 0.52:
+            top_u, bot_u = nt, nb
     m = 0.022
-    top = max(0.0, best[1] - m)
-    bot = min(1.0, best[2] + m)
+    top = max(0.0, top_u - m)
+    bot = min(1.0, bot_u + m)
     return {"found": True,
             "top_pct": round(100.0 * top, 1),
             "bottom_pct": round(100.0 * bot, 1),
             "method": "ocr",
-            "score": round(float(best[0]), 3),
+            "score": round(float(best_score), 3),
             "boxes": len(all_boxes)}
 
 
@@ -3676,7 +3727,7 @@ def detect_caption_band(video_path, samples=24):
     found=False means 'no caption band we trust' - callers fall back
     to the standard bottom band and say so."""
     try:
-        r = _detect_band_ocr(video_path, samples=min(samples, 14))
+        r = _detect_band_ocr(video_path, samples=min(samples, 18))
         if r is not None:
             if r.get("found") or not r.get("boxes"):
                 return r
@@ -3814,8 +3865,11 @@ def find_preview_section(video_path, region, seconds=5.0):
         return (0.0, min(seconds, duration))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     step = max(1, int(round(fps)))
-    prev_mask = None
-    best_t, best_score = 0.0, -1.0
+    try:
+        det = _get_text_detector()
+    except Exception:
+        det = None  # picker falls back to the top-hat score alone
+    secs = []
     idx = -1
     while True:
         if not cap.grab():
@@ -3834,18 +3888,112 @@ def find_preview_section(video_path, region, seconds=5.0):
         if ctx.size:
             busy = float((cv2.Canny(cv2.cvtColor(
                 ctx, cv2.COLOR_BGR2GRAY), 50, 150) > 0).mean())
+        small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
+                           (64, 36))
+        hist = cv2.calcHist([small], [0], None, [64],
+                            [0, 256]).flatten()
+        bmask = None
+        if det is not None:
+            try:
+                boxes = det.detect(frame, max_side=768)
+                boxes = [b for b in boxes
+                         if y0 - 12 <= (b[1] + b[3]) / 2.0 <= y1 + 12]
+                bmask = _rasterize_boxes(boxes, (band_h, W), oy=y0)
+            except Exception:
+                bmask = None
+        secs.append((t, m, busy, hist, bmask))
+    cap.release()
+    if not secs:
+        return (0.0, min(seconds, duration))
+    # OCR-guided change: pixels covered by text boxes in ~every
+    # sampled second are permanent overlay furniture (logo, clock
+    # strip); what is left is the DYNAMIC text - the dialogue
+    # captions. A caption change is the top-hat signal changing
+    # inside the dynamic boxes; camera motion elsewhere in the band
+    # (the old score's downfall on bodycam footage: a pan through a
+    # caption-free stretch outscored the actual line change) never
+    # creates OCR boxes, so it cannot win here.
+    dyn = None
+    if det is not None and all(s[4] is not None for s in secs):
+        occ = np.zeros((band_h, W), np.float32)
+        for s in secs:
+            # dilate before accumulating: detector boxes jitter by a
+            # few pixels, and a permanent logo's jittered edges must
+            # still count as permanent, not as dynamic text
+            occ += (cv2.dilate(s[4], np.ones((9, 9), np.float32))
+                    > 0)
+        occ /= float(len(secs))
+        dyn = [s[4] * (occ < 0.8) for s in secs]
+        if not any(float(d.sum()) > 0 for d in dyn):
+            dyn = None
+    band_area = float(max(1, band_h * W))
+    best_t, best_score = 0.0, -1.0
+    for i, (t, m, busy, hist, bmask) in enumerate(secs):
         change = 0.0
-        if prev_mask is not None and prev_mask.shape == m.shape:
-            inter = float((m * prev_mask).sum())
-            union = float(((m + prev_mask) > 0).sum()) or 1.0
-            change = 1.0 - inter / union
+        if i > 0:
+            pm, phist = secs[i - 1][1], secs[i - 1][3]
+            if dyn is not None:
+                gate = cv2.dilate(
+                    np.maximum(dyn[i - 1], dyn[i]),
+                    np.ones((15, 15), np.float32))
+                a = pm * gate
+                b = m * gate
+                sa, sb = float(a.sum()), float(b.sum())
+                if sa > 0 and sb > 0:
+                    inter = float((np.minimum(a, b)).sum())
+                    union = float((np.maximum(a, b)).sum()) or 1.0
+                    change = 1.0 - inter / union
+                elif sa + sb > 0:
+                    change = 1.0  # text appeared / vanished
+                # ...unless the whole frame changed with it: text
+                # appearing/vanishing AT a scene cut is the cut,
+                # not a caption change (histogram correlation - the
+                # temporal engine's cut signal).
+                denom = float(np.linalg.norm(hist)
+                              * np.linalg.norm(phist)) or 1.0
+                if float(hist @ phist / denom) < 0.55:
+                    change = 0.0
+                # Weight by how much text actually changed hands: a
+                # caption line swapping involves thousands of text
+                # pixels on both sides; a name strap flickering or
+                # detector jitter involves a few hundred, and must
+                # not outscore the real caption change.
+                mass = min(sa, sb) / band_area
+                change *= min(1.0, float(np.sqrt(mass / 0.06)))
+                # ...and by how long the dynamic text has been on
+                # screen around the change: a caption track runs for
+                # seconds, a name strap or a stray graphic flickers
+                # for one sampled second.
+                present = [float(d.sum()) > 400.0 for d in dyn]
+                run = 0
+                j = i - 1
+                while j >= 0 and present[j]:
+                    run += 1
+                    j -= 1
+                j = i
+                while j < len(present) and present[j]:
+                    run += 1
+                    j += 1
+                change *= min(1.0, run / 3.0)
+            elif pm.shape == m.shape:
+                inter = float((m * pm).sum())
+                union = float(((m + pm) > 0).sum()) or 1.0
+                change = 1.0 - inter / union
+                # A scene CUT changes the band mask completely too,
+                # but it says nothing about caption-change quality.
+                # Discount seconds whose whole frame changed
+                # (histogram correlation - the temporal engine's cut
+                # signal): a caption change leaves the scene's
+                # histogram nearly untouched.
+                denom = float(np.linalg.norm(hist)
+                              * np.linalg.norm(phist)) or 1.0
+                if float(hist @ phist / denom) < 0.55:
+                    change = 0.0
         score = change * (0.4 + busy * 8.0)
         if float(m.sum()) > 0:
             score += 0.05
         if score > best_score:
             best_t, best_score = t, score
-        prev_mask = m
-    cap.release()
     start = max(0.0, best_t - 1.5)
     if start + seconds > duration:
         start = max(0.0, duration - seconds)
