@@ -271,7 +271,23 @@ jobs:
           # The artifact must contain ONLY the .iso: remove the loose
           # parts (they live on inside the image) and the staging tree.
           Get-ChildItem $out -File | Where-Object { $_.FullName -ne $isoPath } | Remove-Item -Force
-          Remove-Item -Recurse -Force $isoRoot
+          # Release the IMAPI objects first (they can hold the source
+          # files open), then remove the staging tree best-effort with
+          # retries: a leftover staging folder on an ephemeral runner is
+          # harmless and must never fail a build whose ISO is already
+          # written and hashed (run #8 died exactly here, on a cleanup
+          # file-lock, AFTER printing the ISO's size + SHA256).
+          $result = $null
+          $fsi = $null
+          [GC]::Collect()
+          [GC]::WaitForPendingFinalizers()
+          for ($i = 1; $i -le 5; $i++) {
+            try { Remove-Item -Recurse -Force $isoRoot -ErrorAction Stop; break }
+            catch {
+              if ($i -eq 5) { Write-Warning "could not fully remove staging tree $isoRoot (harmless): $($_.Exception.Message)" }
+              else { Start-Sleep -Seconds 3 }
+            }
+          }
           Get-ChildItem $out -File | Select-Object Name, Length | Format-Table | Out-String | Write-Host
 
       - name: Verify the ISO installer (mount, silent install, model hash, integrity manifest)
