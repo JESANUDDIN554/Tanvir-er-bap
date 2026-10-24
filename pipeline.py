@@ -2967,27 +2967,77 @@ def _lama_inpaint(sess, img_name, mask_name, crop_bgr, mask01):
     """Run LaMa (fixed 512x512) on a working crop with a tight 0/1
     mask; returns the inpainted crop at the crop's own resolution.
 
-    (Native-resolution tiling was evaluated for large crops and
-    measured on real bodycam frames: no visible gain - the footage
-    behind captions is defocused/compressed, so there is little fine
-    texture for the squeeze to lose - at ~6x the per-plate cost.
-    Single call it is.)"""
+    The crop is processed at NATIVE resolution in overlapping
+    512x512 tiles (reflection-padded, never squeezed, aspect kept).
+    Squeezing a wide HD crop into a single 512x512 call and
+    stretching it back made the cleaned area measurably softer
+    than the footage around it (user-reported blur, 2026-10-24:
+    band sharpness 5-9 after cleaning vs 82-356 in the untouched
+    footage). Tiles whose mask is empty are skipped, and outside
+    the feathered mask the original pixels are returned untouched,
+    so only the letters are ever repainted."""
     import cv2
     import numpy as np
     ch, cw = crop_bgr.shape[:2]
-    small = cv2.resize(crop_bgr, (512, 512),
-                       interpolation=cv2.INTER_AREA)
-    m = cv2.resize(mask01, (512, 512), interpolation=cv2.INTER_AREA)
-    m = (m > 0.2).astype(np.float32)[None, None]
-    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-    inp = (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
-    res = sess.run(None, {img_name: inp, mask_name: m})[0]
-    o = np.asarray(res)[0].transpose(1, 2, 0)
-    if float(o.max()) <= 1.5:
-        o = o * 255.0
-    o = np.clip(o, 0, 255).astype(np.uint8)
-    return cv2.resize(cv2.cvtColor(o, cv2.COLOR_RGB2BGR), (cw, ch),
-                      interpolation=cv2.INTER_LINEAR)
+    TILE = 512
+    OVERLAP = 64
+
+    def run_tile(img512, m512):
+        rgb = cv2.cvtColor(img512, cv2.COLOR_BGR2RGB)
+        inp = (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+        res = sess.run(None, {img_name: inp, mask_name: m512})[0]
+        o = np.asarray(res)[0].transpose(1, 2, 0)
+        if float(o.max()) <= 1.5:
+            o = o * 255.0
+        o = np.clip(o, 0, 255).astype(np.uint8)
+        return cv2.cvtColor(o, cv2.COLOR_RGB2BGR)
+
+    def starts(n):
+        if n <= TILE:
+            return [0]
+        s = list(range(0, n - TILE + 1, TILE - OVERLAP))
+        if s[-1] != n - TILE:
+            s.append(n - TILE)
+        return s
+
+    bin_mask = (mask01 > 0.2).astype(np.float32)
+    acc = crop_bgr.astype(np.float32) * 1e-3
+    wsum = np.full((ch, cw), 1e-3, np.float32)
+    for ty in starts(ch):
+        for tx in starts(cw):
+            th = min(TILE, ch - ty)
+            tw = min(TILE, cw - tx)
+            tile_m = bin_mask[ty:ty + th, tx:tx + tw]
+            if float(tile_m.max()) <= 0.0:
+                continue  # no text here - nothing to repaint
+            tile = crop_bgr[ty:ty + th, tx:tx + tw]
+            imgp = cv2.copyMakeBorder(tile, 0, TILE - th, 0, TILE - tw,
+                                      cv2.BORDER_REFLECT)
+            mp = cv2.copyMakeBorder(tile_m, 0, TILE - th, 0, TILE - tw,
+                                    cv2.BORDER_CONSTANT, value=0)
+            out_t = run_tile(imgp, mp[None, None])[:th, :tw]
+            wx = np.ones(tw, np.float32)
+            wy = np.ones(th, np.float32)
+            if tx > 0 and tw > OVERLAP:
+                wx[:OVERLAP] = np.linspace(0.1, 1.0, OVERLAP)
+            if tx + tw < cw and tw > OVERLAP:
+                wx[-OVERLAP:] = np.linspace(1.0, 0.1, OVERLAP)
+            if ty > 0 and th > OVERLAP:
+                wy[:OVERLAP] = np.linspace(0.1, 1.0, OVERLAP)
+            if ty + th < ch and th > OVERLAP:
+                wy[-OVERLAP:] = np.linspace(1.0, 0.1, OVERLAP)
+            w2 = (wy[:, None] * wx[None, :]).astype(np.float32)
+            acc[ty:ty + th, tx:tx + tw] += out_t.astype(np.float32) \
+                * w2[:, :, None]
+            wsum[ty:ty + th, tx:tx + tw] += w2
+    stitched = (acc / wsum[:, :, None]).astype(np.uint8)
+    # Outside the feathered mask, return the original pixels exactly:
+    # the model only ever repaints the letters themselves.
+    keep = cv2.GaussianBlur(bin_mask, (0, 0), 1.2)
+    keep = np.clip(keep * 1.6, 0.0, 1.0)[:, :, None]
+    out = stitched.astype(np.float32) * keep \
+        + crop_bgr.astype(np.float32) * (1.0 - keep)
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def _crop_text_mask(det, crop_bgr, band_y0, band_y1):
@@ -3305,6 +3355,9 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
     grid_x, grid_y = np.meshgrid(
         np.arange(W, dtype=np.float32),
         np.arange(ch, dtype=np.float32))
+    grid_xs, grid_ys = np.meshgrid(
+        np.arange(fw, dtype=np.float32),
+        np.arange(fh, dtype=np.float32))
     max_age_fast = int(6 * fps)      # plate life while the scene moves
     max_age_slow = int(10 * fps)     # ... and while it barely does
     disp_budget = 0.07 * fw          # total scene travel a plate may
@@ -3322,6 +3375,10 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
         stdin=subprocess.PIPE, stdout=logf, stderr=logf)
 
     plate = None          # clean (text-free) working crop, full res
+    plate_src = None      # the plate as built - warps always sample
+    #                       this pristine copy, never a previous warp
+    Dmap = None           # accumulated scene displacement since the
+    #                       plate was built (flow resolution)
     prev_small = None     # previous frame's crop, flow resolution
     prev_mask = None      # previous frame's text mask (crop coords)
     prev_had_text = False
@@ -3430,7 +3487,7 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
                 have_text = True
 
             # ---- plate: build or track -----------------------------
-            rebuild = plate is None
+            rebuild = plate_src is None
             flow = None
             if prev_small is not None and not rebuild \
                     and not gate_closed:
@@ -3472,6 +3529,8 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
                 # plate built on a text-bearing frame, never from a
                 # stale plate carried across a scene change.
                 plate = None
+                plate_src = None
+                Dmap = None
             elif rebuild:
                 # A plate must be text-free EVERYWHERE text could
                 # appear, not just where this frame's mask looked:
@@ -3484,31 +3543,47 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
                     build_mask = np.maximum(build_mask, prev_mask)
                 build_mask = cv2.dilate(
                     build_mask, np.ones((9, 9), np.float32))
-                plate = _lama_inpaint(sess, img_name, mask_name,
-                                      crop, build_mask)
+                plate_src = _lama_inpaint(sess, img_name, mask_name,
+                                          crop, build_mask)
                 plates += 1
                 # Verify the plate really is text-free; if letters
                 # survived the inpaint, widen the mask with what is
                 # still text-like in the plate and inpaint once more.
-                pgray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
+                pgray = cv2.cvtColor(plate_src, cv2.COLOR_BGR2GRAY)
                 pth = _tophat_text_mask(pgray) * near
                 if float(pth[by0:by1].sum()) > 0.35 * max(
                         1.0, float(build_mask[by0:by1].sum())):
                     build_mask = cv2.dilate(
                         np.maximum(build_mask, pth),
                         np.ones((9, 9), np.float32))
-                    plate = _lama_inpaint(sess, img_name, mask_name,
-                                          crop, build_mask)
+                    plate_src = _lama_inpaint(sess, img_name,
+                                              mask_name, crop,
+                                              build_mask)
                     plates += 1
+                plate = plate_src
+                Dmap = np.zeros((fh, fw, 2), np.float32)
                 plate_age = 0
                 cum_disp = 0.0
             else:
-                fup = cv2.resize(flow, (W, ch),
-                                   interpolation=cv2.INTER_LINEAR)
+                # Track by warping the PRISTINE plate with the total
+                # accumulated displacement - never by re-warping last
+                # frame's warp. Chained INTER_LINEAR resamples blur
+                # the plate a little more every frame, and a plate
+                # can live ~300 frames, so the cleaned area slowly
+                # went soft even when the plate started sharp.
+                if Dmap is None:
+                    Dmap = np.zeros((fh, fw, 2), np.float32)
+                mx = (grid_xs - flow[:, :, 0]).astype(np.float32)
+                my = (grid_ys - flow[:, :, 1]).astype(np.float32)
+                Dmap = cv2.remap(Dmap, mx, my, cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_REPLICATE) \
+                    + flow
+                fup = cv2.resize(Dmap, (W, ch),
+                                 interpolation=cv2.INTER_LINEAR)
                 fup[:, :, 0] *= (W / float(fw))
                 fup[:, :, 1] *= (ch / float(fh))
                 plate = cv2.remap(
-                    plate,
+                    plate_src,
                     (grid_x - fup[:, :, 0]).astype(np.float32),
                     (grid_y - fup[:, :, 1]).astype(np.float32),
                     cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
@@ -3528,7 +3603,7 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
             if prev_mask is not None and (have_text or prev_had_text):
                 eff = np.maximum(mask, prev_mask) if have_text \
                     else prev_mask
-            if have_text or prev_had_text:
+            if (have_text or prev_had_text) and plate is not None:
                 alpha = eff[by0:by1]
                 k = 9 if (motion_hist and motion_hist[-1] > 1.2) else 5
                 alpha = cv2.dilate(alpha, np.ones((k, k), np.float32))
