@@ -1551,7 +1551,7 @@ $("libBackBtn").addEventListener("click", hideLibrary);
 
 /* ---------------- Caption Remover ---------------- */
 let removerOpen = false;
-let removerMode = "ai";
+let removerMode = "auto";
 let removerRegionPreset = "auto";
 let removerDetected = null;
 let removerModeTouched = false;
@@ -1613,10 +1613,10 @@ function setRemoverRegion(preset) {
       $("removerTop").value = Math.round(removerDetected.top_pct);
       $("removerBot").value = Math.round(removerDetected.bottom_pct);
     }
-    if (!removerModeTouched && removerMode !== "ai") {
-      removerMode = "ai";
+    if (!removerModeTouched && removerMode !== "auto") {
+      removerMode = "auto";
       document.querySelectorAll("#removerModePicker .mode-card").forEach((x) =>
-        x.classList.toggle("on", x.dataset.value === "ai"));
+        x.classList.toggle("on", x.dataset.value === "auto"));
     }
   }
   $("removerSliders").classList.toggle("hidden", preset !== "custom");
@@ -1655,10 +1655,16 @@ $("removerPath").addEventListener("change", async () => {
     if (r && r.ok && r.detected) {
       removerDetected = r.detected;
       if (removerRegionPreset === "auto") setRemoverRegion("auto");
+      const stEl = $("removerAutoStatus");
+      if (stEl) {
+        stEl.textContent = r.detected.found
+          ? "Auto found the captions: band " + Math.round(r.detected.top_pct) + "% – " + Math.round(r.detected.bottom_pct) + "% of the frame height. Press Remove Captions — nothing else to pick."
+          : "Auto scanned this video and found no clear caption band — it will use the standard bottom band (82% – 100%). If the captions sit somewhere else, open Advanced below.";
+      }
     }
   } catch (e) { /* stage sizing is a nicety */ }
 });
-$("removerRunBtn").addEventListener("click", async () => {
+async function startRemoverJob(kind) {
   const source = $("removerUrl").value.trim() || $("removerPath").value.trim();
   const errEl = $("removerError");
   errEl.classList.add("hidden");
@@ -1674,14 +1680,19 @@ $("removerRunBtn").addEventListener("click", async () => {
   show($("removerProgress"));
   $("removerBar").style.width = "0%";
   $("removerRunBtn").disabled = true;
+  $("removerPreviewBtn").disabled = true;
   removerLogRendered = 0; removerLogRid = null;
   $("removerLog").innerHTML = "";
   show($("removerLogWrap"));
   let started;
-  try { started = await api.caption_remover_start(source, removerRegion(), removerMode); }
-  catch (e) { started = { ok: false, error: String(e) }; }
+  try {
+    started = kind === "preview"
+      ? await api.caption_remover_preview(source, removerRegion(), removerMode)
+      : await api.caption_remover_start(source, removerRegion(), removerMode);
+  } catch (e) { started = { ok: false, error: String(e) }; }
   if (!started || !started.ok) {
     $("removerRunBtn").disabled = false;
+    $("removerPreviewBtn").disabled = false;
     hide($("removerProgress"));
     errEl.textContent = (started && started.error) || "Could not start the removal.";
     errEl.classList.remove("hidden");
@@ -1699,23 +1710,33 @@ $("removerRunBtn").addEventListener("click", async () => {
     if (st.status === "done") {
       clearInterval(removerTimer); removerTimer = null;
       $("removerRunBtn").disabled = false;
+      $("removerPreviewBtn").disabled = false;
       hide($("removerProgress"));
       const v = $("removerVideo");
       v.src = st.url;
       v.classList.remove("hidden");
       $("removerRegionBox").classList.add("hidden");
-      $("removerStageLabel").textContent = "Cleaned video preview";
+      const isPreview = st.kind === "preview";
+      $("removerStageLabel").textContent = isPreview
+        ? "Cleaned preview — the worst 5 seconds"
+        : "Cleaned video preview";
+      $("removerResultHint").textContent = isPreview
+        ? "Preview section " + (st.section || "") + " — if this looks clean, press Remove Captions for the whole video."
+        : "The preview above is the cleaned video.";
       $("removerDownload").href = st.url;
       show($("removerResult"));
     } else if (st.status === "error") {
       clearInterval(removerTimer); removerTimer = null;
       $("removerRunBtn").disabled = false;
+      $("removerPreviewBtn").disabled = false;
       hide($("removerProgress"));
       errEl.textContent = st.error || "Removal failed.";
       errEl.classList.remove("hidden");
     }
   }, 1000);
-});
+}
+$("removerRunBtn").addEventListener("click", () => startRemoverJob("full"));
+$("removerPreviewBtn").addEventListener("click", () => startRemoverJob("preview"));
 
 /* ---------------- remover log console ---------------- */
 let removerLogRendered = 0, removerLogRid = null, removerLogFirstT = -1;

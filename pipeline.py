@@ -2477,6 +2477,300 @@ def ensure_lama(progress_cb=None):
     return path
 
 
+# ---------------------------------------------------------------------------
+# OCR text detection (PP-OCRv4 DBNet, ONNX) - finds the actual text
+# boxes instead of guessing a band from edges. The model is tiny
+# (~4.7 MB, Apache-2.0: PaddleOCR via the RapidOCR project) and
+# self-downloads once on first use, like the other brains. Used for
+# (a) auto caption-band detection and (b) tight per-frame text masks,
+# so inpainting only touches the letters (+ outline/shadow), not a
+# whole rectangular slab of picture.
+# ---------------------------------------------------------------------------
+OCR_DET_MODEL_URL = ("https://huggingface.co/SWHL/RapidOCR/resolve/main/"
+                     "PP-OCRv4/ch_PP-OCRv4_det_infer.onnx")
+OCR_DET_MODEL_FILE = "ppocrv4_det.onnx"
+OCR_DET_MODEL_SIZE = 4_745_517
+OCR_DET_MODEL_SHA256 = ("d2a7720d45a54257208b1e13e36a8479894cb74155"
+                        "a5efe29462512d42f49da9")
+
+
+def ocr_model_path():
+    import local_ai
+    os.makedirs(local_ai.MODELS_DIR, exist_ok=True)
+    return os.path.join(local_ai.MODELS_DIR, OCR_DET_MODEL_FILE)
+
+
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def ocr_ready():
+    try:
+        return os.path.getsize(ocr_model_path()) == OCR_DET_MODEL_SIZE
+    except OSError:
+        return False
+
+
+def ensure_text_detector(progress_cb=None):
+    """Download the OCR text-detection model once (~4.7 MB), verified
+    by size AND sha256 (unlike a bare size check, a corrupted or
+    substituted file can not slip through). Returns the model path;
+    RuntimeError on failure."""
+    import urllib.request
+    path = ocr_model_path()
+    if ocr_ready() and _sha256_file(path) == OCR_DET_MODEL_SHA256:
+        return path
+    tmp = path + ".part"
+    try:
+        req = urllib.request.Request(
+            OCR_DET_MODEL_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp, \
+                open(tmp, "wb") as f:
+            total = int(resp.headers.get("Content-Length")
+                        or OCR_DET_MODEL_SIZE)
+            got = 0
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if progress_cb and total:
+                    progress_cb(3, "Downloading text-detection model "
+                                   "(one-time, ~5 MB)")
+        if got != OCR_DET_MODEL_SIZE \
+                or _sha256_file(tmp) != OCR_DET_MODEL_SHA256:
+            raise RuntimeError(
+                "Text-detection model download did not verify "
+                f"({got} bytes) - check your connection and retry.")
+        os.replace(tmp, path)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Could not download the text-detection "
+                           f"model: {e}")
+    return path
+
+
+class _TextDetector:
+    """DBNet text detector (PP-OCRv4 det, ONNX). detect() returns a
+    list of (x0, y0, x1, y1, score) boxes in source-image pixels."""
+
+    def __init__(self, model_path):
+        import onnxruntime as ort
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = os.cpu_count() or 2
+        self.sess = ort.InferenceSession(
+            model_path, sess_options=opts,
+            providers=["CPUExecutionProvider"])
+        self.iname = self.sess.get_inputs()[0].name
+
+    def detect(self, img_bgr, max_side=960, thresh=0.3, box_thresh=0.55):
+        import cv2
+        import numpy as np
+        h, w = img_bgr.shape[:2]
+        if not h or not w:
+            return []
+        scale = min(1.0, float(max_side) / max(h, w))
+        nw = max(32, int(round(w * scale)) // 32 * 32)
+        nh = max(32, int(round(h * scale)) // 32 * 32)
+        rgb = cv2.cvtColor(cv2.resize(img_bgr, (nw, nh)),
+                           cv2.COLOR_BGR2RGB)
+        x = rgb.astype(np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], np.float32)
+        std = np.array([0.229, 0.224, 0.225], np.float32)
+        x = ((x - mean) / std).transpose(2, 0, 1)[None].astype(np.float32)
+        prob = self.sess.run(None, {self.iname: x})[0][0, 0]
+        binary = (prob > thresh).astype(np.uint8)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        sx, sy = w / float(nw), h / float(nh)
+        boxes = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) < 12:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            (cx, cy), (bw, bh), ang = rect
+            if min(bw, bh) < 3:
+                continue
+            m = np.zeros(prob.shape, np.uint8)
+            cv2.drawContours(m, [cnt], -1, 1, -1)
+            sel = m > 0
+            score = float(prob[sel].mean()) if sel.any() else 0.0
+            if score < box_thresh:
+                continue
+            # DBNet unclip: grow the box by area*1.5/perimeter so the
+            # mask covers the whole glyph plus its dark outline.
+            d = cv2.contourArea(cnt) * 1.5 / max(cv2.arcLength(cnt, True),
+                                                 1.0)
+            pts = cv2.boxPoints(((cx, cy), (bw + 2 * d, bh + 2 * d), ang))
+            xs, ys = pts[:, 0] * sx, pts[:, 1] * sy
+            boxes.append((float(max(0, xs.min())),
+                          float(max(0, ys.min())),
+                          float(min(w, xs.max())),
+                          float(min(h, ys.max())), score))
+        return boxes
+
+
+_OCR_SINGLETON = {"det": None, "failed": False}
+
+
+def _get_text_detector(progress_cb=None):
+    """Lazy singleton; raises RuntimeError when the OCR model cannot
+    be downloaded/loaded (callers fall back honestly)."""
+    if _OCR_SINGLETON["det"] is not None:
+        return _OCR_SINGLETON["det"]
+    if _OCR_SINGLETON["failed"]:
+        raise RuntimeError("Text detection unavailable (earlier load "
+                           "failed).")
+    try:
+        det = _TextDetector(ensure_text_detector(progress_cb))
+    except Exception:
+        _OCR_SINGLETON["failed"] = True
+        raise
+    _OCR_SINGLETON["det"] = det
+    return det
+
+
+def _tophat_text_mask(gray):
+    """Cheap per-frame text-pixel mask from a grayscale crop: white
+    top-hat (bright strokes) + black top-hat (dark strokes), the
+    classic caption-text signature. Returns float32 0/1, same shape.
+    Used for caption-change detection and to top up the OCR mask
+    between detector refreshes. Large inputs are processed at half
+    resolution (caption strokes are big there, and the full-res
+    morphology costs ~0.9 s/frame at 1080p - the mask is dilated and
+    blurred by callers anyway, so the softer edges cost nothing)."""
+    import cv2
+    import numpy as np
+    h, w = gray.shape[:2]
+    if h > 420 and w > 420:
+        small = cv2.resize(gray, (w // 2, h // 2),
+                           interpolation=cv2.INTER_AREA)
+        m = _tophat_text_mask(small)
+        m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
+        return (m > 0.4).astype(np.float32)
+    kw = max(9, (w // 28) | 1)
+    kh = max(5, (h // 7) | 1)
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kw, kh))
+    g = gray.astype(np.int16)
+    white = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kern).astype(np.int16)
+    black = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT,
+                             kern).astype(np.int16)
+    resp = np.maximum(white, black)
+    # text strokes are also locally brighter/darker than their blur
+    blur = cv2.GaussianBlur(gray, (0, 0), 3).astype(np.int16)
+    resp = np.maximum(resp, np.abs(g - blur) * 2)
+    return (resp > 20).astype(np.float32)
+
+
+def _rasterize_boxes(boxes, shape, ox=0, oy=0, grow_x=0.30, grow_y=0.55):
+    """Rasterize OCR boxes into a 0/1 float mask of `shape` (h, w),
+    offset by (ox, oy) and grown so the mask also covers the caption
+    box/shadow hugging the text."""
+    import numpy as np
+    h, w = shape
+    mask = np.zeros((h, w), np.float32)
+    for (x0, y0, x1, y1, _s) in boxes:
+        bh = max(2.0, y1 - y0)
+        bw = max(2.0, x1 - x0)
+        gx = bw * grow_x * 0.5 + 3
+        gy = bh * grow_y * 0.5 + 3
+        ix0 = int(max(0, x0 - ox - gx))
+        iy0 = int(max(0, y0 - oy - gy))
+        ix1 = int(min(w, x1 - ox + gx))
+        iy1 = int(min(h, y1 - oy + gy))
+        if ix1 > ix0 and iy1 > iy0:
+            mask[iy0:iy1, ix0:ix1] = 1.0
+    return mask
+
+
+def _lama_session():
+    import onnxruntime as ort
+    model = ensure_lama()
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = os.cpu_count() or 2
+    sess = ort.InferenceSession(model, sess_options=opts,
+                                providers=["CPUExecutionProvider"])
+    inputs = {i.name: i for i in sess.get_inputs()}
+    img_name = next((n for n in inputs if "image" in n.lower()
+                     or "img" in n.lower()), sess.get_inputs()[0].name)
+    mask_name = next((n for n in inputs if "mask" in n.lower()),
+                     sess.get_inputs()[-1].name)
+    return sess, img_name, mask_name
+
+
+def _lama_inpaint(sess, img_name, mask_name, crop_bgr, mask01):
+    """Run LaMa (fixed 512x512) on a working crop with a tight 0/1
+    mask; returns the inpainted crop at the crop's own resolution.
+
+    (Native-resolution tiling was evaluated for large crops and
+    measured on real bodycam frames: no visible gain - the footage
+    behind captions is defocused/compressed, so there is little fine
+    texture for the squeeze to lose - at ~6x the per-plate cost.
+    Single call it is.)"""
+    import cv2
+    import numpy as np
+    ch, cw = crop_bgr.shape[:2]
+    small = cv2.resize(crop_bgr, (512, 512),
+                       interpolation=cv2.INTER_AREA)
+    m = cv2.resize(mask01, (512, 512), interpolation=cv2.INTER_AREA)
+    m = (m > 0.2).astype(np.float32)[None, None]
+    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    inp = (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+    res = sess.run(None, {img_name: inp, mask_name: m})[0]
+    o = np.asarray(res)[0].transpose(1, 2, 0)
+    if float(o.max()) <= 1.5:
+        o = o * 255.0
+    o = np.clip(o, 0, 255).astype(np.uint8)
+    return cv2.resize(cv2.cvtColor(o, cv2.COLOR_RGB2BGR), (cw, ch),
+                      interpolation=cv2.INTER_LINEAR)
+
+
+def _crop_text_mask(det, crop_bgr, band_y0, band_y1):
+    """Tight text mask for a working crop (0/1 float, crop shape).
+
+    OCR boxes (when the detector is available) unioned with the
+    per-frame top-hat signal, dilated a touch. When neither finds
+    anything, falls back to the plain band rectangle (the historical
+    behaviour) so removal never silently does nothing."""
+    import cv2
+    import numpy as np
+    ch, cw = crop_bgr.shape[:2]
+    mask = np.zeros((ch, cw), np.float32)
+    if det is not None:
+        try:
+            boxes = det.detect(crop_bgr, max_side=768)
+            # Only text whose centre sits in the caption rows counts
+            # as caption text - scene text that merely shares the
+            # working crop (signs, documents) is not a caption.
+            boxes = [b for b in boxes
+                     if band_y0 - 12 <= (b[1] + b[3]) / 2.0
+                     <= band_y1 + 12]
+            mask = np.maximum(mask, _rasterize_boxes(boxes, (ch, cw)))
+        except Exception:
+            pass
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    th = _tophat_text_mask(gray)
+    # only trust top-hat inside/near the band rows (scene texture
+    # elsewhere in the context crop would over-mask)
+    near = np.zeros((ch, cw), np.float32)
+    ny0 = max(0, band_y0 - (band_y1 - band_y0) // 2)
+    ny1 = min(ch, band_y1 + (band_y1 - band_y0) // 2)
+    near[ny0:ny1] = 1.0
+    mask = np.maximum(mask, th * near)
+    if float(mask.sum()) < 0.0005 * ch * cw:
+        mask = np.zeros((ch, cw), np.float32)
+        mask[band_y0:band_y1] = 1.0
+        return mask
+    return cv2.dilate(mask, np.ones((5, 5), np.float32))
+
+
 def _run_ffmpeg_progress(cmd, duration, progress_cb, lo, hi, stage):
     """Run ffmpeg, mapping its -progress output onto [lo, hi] percent."""
     full = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
@@ -2506,11 +2800,14 @@ def remove_captions(video_path, region, mode, out_path,
                     progress_cb=None, quality_tier="maximum"):
     """Remove burned-in captions from a band of the frame.
 
-    region: {"top_pct": .., "bottom_pct": ..}; mode: crop|fill|ai.
-    Returns out_path. Progress via progress_cb(pct, stage_text)."""
+    region: {"top_pct": .., "bottom_pct": ..}; mode: crop|fill|ai|
+    temporal (auto == temporal: the app's smart default). Returns
+    out_path. Progress via progress_cb(pct, stage_text)."""
     if not os.path.isfile(video_path):
         raise RuntimeError("Video file not found: " + str(video_path))
-    if mode not in ("crop", "fill", "ai"):
+    if mode == "auto":
+        mode = "temporal"
+    if mode not in ("crop", "fill", "ai", "temporal"):
         raise ValueError("Unknown caption-removal mode: " + str(mode))
     W, H, _fps = probe_video(video_path)
     if not W or not H:
@@ -2527,6 +2824,9 @@ def remove_captions(video_path, region, mode, out_path,
     elif mode == "fill":
         _remove_captions_fill(video_path, out_path, W, H, y0, y1,
                               duration, progress_cb, quality_tier)
+    elif mode == "temporal":
+        _remove_captions_temporal(video_path, out_path, W, H, y0, y1,
+                                  duration, progress_cb, quality_tier)
     else:
         _remove_captions_ai(video_path, out_path, W, H, y0, y1,
                             duration, progress_cb, quality_tier)
@@ -2587,21 +2887,14 @@ def _remove_captions_fill(src, out, W, H, y0, y1, duration, cb, tier):
 def _remove_captions_ai(src, out, W, H, y0, y1, duration, cb, tier):
     import cv2
     import numpy as np
-    import onnxruntime as ort
 
-    model = ensure_lama(cb)
     if cb:
-        cb(16, "Loading AI inpainting model")
-    opts = ort.SessionOptions()
-    opts.intra_op_num_threads = os.cpu_count() or 2
-    sess = ort.InferenceSession(model, sess_options=opts,
-                                providers=["CPUExecutionProvider"])
-    inputs = {i.name: i for i in sess.get_inputs()}
-    img_name = next((n for n in inputs if "image" in n.lower()
-                     or "img" in n.lower()), sess.get_inputs()[0].name)
-    mask_name = next((n for n in inputs if "mask" in n.lower()),
-                     sess.get_inputs()[-1].name)
-    fixed = inputs[img_name].shape  # fixed HxW if the export is static
+        cb(14, "Loading AI inpainting model")
+    sess, img_name, mask_name = _lama_session()
+    try:
+        det = _get_text_detector(cb)
+    except Exception:
+        det = None  # tight masks degrade to the band rectangle
 
     cap = cv2.VideoCapture(src)
     if not cap.isOpened():
@@ -2614,17 +2907,9 @@ def _remove_captions_ai(src, out, W, H, y0, y1, duration, cb, tier):
     cy0 = max(0, y0 - pad)
     cy1 = min(H, y1 + pad)
     ch = cy1 - cy0
-    if isinstance(fixed[2], int) and isinstance(fixed[3], int):
-        wh, ww = fixed[2], fixed[3]
-    else:
-        scale = min(1.0, 768.0 / W)
-        ww = max(64, (int(round(W * scale)) // 8) * 8)
-        wh = max(64, (int(round(ch * scale)) // 8) * 8)
     # band rows inside the working crop
-    by0 = int(round((y0 - cy0) * wh / ch))
-    by1 = max(by0 + 1, int(round((y1 - cy0) * wh / ch)))
-    mask = np.zeros((1, 1, wh, ww), dtype=np.float32)
-    mask[:, :, max(0, by0 - 2):min(wh, by1 + 2), :] = 1.0
+    by0 = y0 - cy0
+    by1 = y1 - cy0
 
     log_path = out + ".ffmpeg.log"
     logf = open(log_path, "wb")
@@ -2649,7 +2934,7 @@ def _remove_captions_ai(src, out, W, H, y0, y1, duration, cb, tier):
             if not ok:
                 break
             crop = frame[cy0:cy1]
-            small = cv2.resize(crop, (ww, wh),
+            small = cv2.resize(crop, (512, 512),
                                interpolation=cv2.INTER_AREA)
             # Temporal reuse: burned captions (and the scene behind
             # them) usually sit still for stretches. If the working
@@ -2665,17 +2950,8 @@ def _remove_captions_ai(src, out, W, H, y0, y1, duration, cb, tier):
                 band = last_band
                 since_inpaint += 1
             else:
-                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-                inp = (rgb.astype(np.float32)
-                       / 255.0).transpose(2, 0, 1)[None]
-                res = sess.run(None, {img_name: inp,
-                                      mask_name: mask})[0]
-                o = np.asarray(res)[0].transpose(1, 2, 0)
-                if float(o.max()) <= 1.5:
-                    o = o * 255.0
-                o = np.clip(o, 0, 255).astype(np.uint8)
-                back = cv2.resize(cv2.cvtColor(o, cv2.COLOR_RGB2BGR),
-                                  (W, ch), interpolation=cv2.INTER_LINEAR)
+                m = _crop_text_mask(det, crop, by0, by1)
+                back = _lama_inpaint(sess, img_name, mask_name, crop, m)
                 band = back[y0 - cy0:y1 - cy0]
                 last_small = small
                 last_band = band
@@ -2722,7 +2998,438 @@ def _remove_captions_ai(src, out, W, H, y0, y1, duration, cb, tier):
         pass
 
 
+def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
+    """Temporal inpainting (the smart default).
+
+    Per-frame LaMa flickers because every frame is rebuilt from
+    scratch, and it is far too slow to run on every frame anyway.
+    Instead this engine builds ONE clean "plate" of the caption area
+    with LaMa, then TRACKS it through the following frames with dense
+    optical flow: the plate is warped along with the moving scene, so
+    the fill is temporally stable (no shimmer, no ghost letters when
+    the words change - the plate is text-free everywhere, so new
+    words sit on the same clean background). Caption changes do NOT
+    force a new plate; only background motion does: when the
+    forward-backward flow check says the warp can no longer be
+    trusted (scene cut, violent motion, occlusion), the plate is
+    rebuilt from the current frame. Static shots ride one plate for
+    a long stretch, so LaMa runs a handful of times per minute of
+    video instead of on every frame.
+    """
+    import cv2
+    import numpy as np
+
+    if cb:
+        cb(14, "Loading AI inpainting model")
+    sess, img_name, mask_name = _lama_session()
+    try:
+        det = _get_text_detector(cb)
+    except Exception:
+        det = None  # masks degrade to top-hat / band rectangle
+
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open the video for AI "
+                           "inpainting.")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    pad = max(16, y1 - y0)
+    cy0 = max(0, y0 - pad)
+    cy1 = min(H, y1 + pad)
+    ch = cy1 - cy0
+    by0, by1 = y0 - cy0, y1 - cy0
+
+    # Optical flow runs on a downscaled copy of the working crop.
+    fw = min(W, 480)
+    fs = fw / float(W)
+    fh = max(2, int(round(ch * fs)))
+    grid_x, grid_y = np.meshgrid(
+        np.arange(W, dtype=np.float32),
+        np.arange(ch, dtype=np.float32))
+    max_age_fast = int(6 * fps)      # plate life while the scene moves
+    max_age_slow = int(10 * fps)     # ... and while it barely does
+    disp_budget = 0.07 * fw          # total scene travel a plate may
+    #                                  follow before it is rebuilt -
+    #                                  bounds zoom/pan warp drift
+
+    log_path = out + ".ffmpeg.log"
+    logf = open(log_path, "wb")
+    proc = subprocess.Popen(
+        ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+         "-s", f"{W}x{H}", "-r", f"{fps:.3f}", "-i", "-",
+         "-i", src, "-map", "0:v", "-map", "1:a?",
+         ] + _encode_args(tier) + [
+         "-c:a", "aac", "-b:a", "192k", "-shortest", out],
+        stdin=subprocess.PIPE, stdout=logf, stderr=logf)
+
+    plate = None          # clean (text-free) working crop, full res
+    prev_small = None     # previous frame's crop, flow resolution
+    prev_mask = None      # previous frame's text mask (crop coords)
+    prev_had_text = False
+    plate_age = 0
+    cum_disp = 0.0        # scene travel since the plate was built
+    motion_hist = []      # recent mean |flow| values (flow pixels)
+    mask_ocr = None       # latest OCR mask, crop coordinates
+    since_ocr = 10 ** 9
+    n = plates = warps = 0
+    pipe_broken = False
+    try:
+        if cb:
+            cb(18, "AI temporal inpainting frames")
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            crop = frame[cy0:cy1]
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            small = cv2.resize(gray, (fw, fh),
+                               interpolation=cv2.INTER_AREA)
+
+            # ---- text mask for this frame --------------------------
+            if det is not None and since_ocr >= 30:
+                try:
+                    boxes = det.detect(frame, max_side=768)
+                    # caption text only: boxes centred in the band
+                    # rows (scene text elsewhere is not a caption)
+                    boxes = [b for b in boxes
+                             if y0 - 12 <= (b[1] + b[3]) / 2.0
+                             <= y1 + 12]
+                    mask_ocr = _rasterize_boxes(boxes, (ch, W),
+                                                oy=cy0)
+                except Exception:
+                    mask_ocr = None
+                since_ocr = 0
+            since_ocr += 1
+            th = _tophat_text_mask(gray)
+            near = np.zeros((ch, W), np.float32)
+            ny0 = max(0, by0 - (by1 - by0) // 2)
+            ny1 = min(ch, by1 + (by1 - by0) // 2)
+            near[ny0:ny1] = 1.0
+            th = th * near
+            if mask_ocr is not None:
+                a_th = float(th[by0:by1].sum())
+                a_ocr = float(mask_ocr[by0:by1].sum())
+                if a_ocr <= 1.0 or a_th > 1.4 * a_ocr:
+                    mask = np.maximum(mask_ocr, th)
+                elif a_th < 0.3 * a_ocr:
+                    # caption shrank/vanished: keep OCR pixels only
+                    # near the text that is actually there now
+                    gate = cv2.dilate(th, np.ones((31, 31),
+                                                  np.float32))
+                    mask = np.maximum(th, mask_ocr * gate)
+                else:
+                    mask = np.maximum(mask_ocr, th)
+            else:
+                mask = th
+            if float(mask.sum()) < 0.0005 * ch * W:
+                mask = np.zeros((ch, W), np.float32)
+                mask[by0:by1] = 1.0
+                have_text = False
+            else:
+                mask = cv2.dilate(mask, np.ones((5, 5), np.float32))
+                have_text = True
+
+            # ---- plate: build or track -----------------------------
+            rebuild = plate is None
+            flow = None
+            if prev_small is not None and not rebuild:
+                flow = cv2.calcOpticalFlowFarneback(
+                    prev_small, small, None, 0.5, 3, 21, 3, 5, 1.2, 0)
+                mag = float(np.abs(flow).mean())
+                cum_disp += mag
+                motion_hist.append(mag)
+                if len(motion_hist) > 30:
+                    motion_hist.pop(0)
+                # forward-backward consistency: warp the backward
+                # flow by the forward flow; a trustworthy warp nearly
+                # cancels out.
+                flow_b = cv2.calcOpticalFlowFarneback(
+                    small, prev_small, None, 0.5, 3, 21, 3, 5, 1.2, 0)
+                yy, xx = np.mgrid[0:fh, 0:fw].astype(np.float32)
+                mx = (xx + flow[:, :, 0]).astype(np.float32)
+                my = (yy + flow[:, :, 1]).astype(np.float32)
+                bw = cv2.remap(flow_b, mx, my, cv2.INTER_LINEAR)
+                fb_err = float(np.median(np.abs(flow + bw).reshape(-1)))
+                hist = cv2.calcHist([small], [0], None, [64],
+                                    [0, 256]).flatten()
+                hist_p = cv2.calcHist([prev_small], [0], None, [64],
+                                      [0, 256]).flatten()
+                denom = float(np.linalg.norm(hist)
+                              * np.linalg.norm(hist_p)) or 1.0
+                hist_corr = float(hist @ hist_p / denom)
+                low_motion = (float(np.mean(motion_hist)) < 0.2
+                              if motion_hist else False)
+                age_limit = max_age_slow if low_motion else max_age_fast
+                if fb_err > 1.2 or mag > 0.16 * fw or hist_corr < 0.55 \
+                        or plate_age > age_limit \
+                        or cum_disp > disp_budget:
+                    rebuild = True
+            if rebuild:
+                # A plate must be text-free EVERYWHERE text could
+                # appear, not just where this frame's mask looked:
+                # build it from the union of this frame's and the
+                # previous frame's masks, dilated wide. A partial
+                # mask would bake the missed letters INTO the plate
+                # and ghost them into every following frame.
+                build_mask = mask
+                if prev_mask is not None:
+                    build_mask = np.maximum(build_mask, prev_mask)
+                build_mask = cv2.dilate(
+                    build_mask, np.ones((9, 9), np.float32))
+                plate = _lama_inpaint(sess, img_name, mask_name,
+                                      crop, build_mask)
+                plates += 1
+                # Verify the plate really is text-free; if letters
+                # survived the inpaint, widen the mask with what is
+                # still text-like in the plate and inpaint once more.
+                pgray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
+                pth = _tophat_text_mask(pgray) * near
+                if float(pth[by0:by1].sum()) > 0.35 * max(
+                        1.0, float(build_mask[by0:by1].sum())):
+                    build_mask = cv2.dilate(
+                        np.maximum(build_mask, pth),
+                        np.ones((9, 9), np.float32))
+                    plate = _lama_inpaint(sess, img_name, mask_name,
+                                          crop, build_mask)
+                    plates += 1
+                plate_age = 0
+                cum_disp = 0.0
+            else:
+                fup = cv2.resize(flow, (W, ch),
+                                   interpolation=cv2.INTER_LINEAR)
+                fup[:, :, 0] *= (W / float(fw))
+                fup[:, :, 1] *= (ch / float(fh))
+                plate = cv2.remap(
+                    plate,
+                    (grid_x - fup[:, :, 0]).astype(np.float32),
+                    (grid_y - fup[:, :, 1]).astype(np.float32),
+                    cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                warps += 1
+                plate_age += 1
+            prev_small = small
+            prev_mask = mask if have_text else None
+            prev_had_text = have_text
+
+            # ---- composite the clean plate under the text ----------
+            # Burned-in captions are a screen-fixed overlay, so the
+            # previous frame's real mask stays valid for this frame
+            # too: unioning it patches the frames where motion blur
+            # makes the text itself hard to detect (the classic
+            # ghost-letter moment is a caption change mid-whip-pan).
+            eff = mask
+            if prev_mask is not None and (have_text or prev_had_text):
+                eff = np.maximum(mask, prev_mask) if have_text \
+                    else prev_mask
+            if have_text or prev_had_text:
+                alpha = eff[by0:by1]
+                k = 9 if (motion_hist and motion_hist[-1] > 1.2) else 5
+                alpha = cv2.dilate(alpha, np.ones((k, k), np.float32))
+                alpha = cv2.GaussianBlur(alpha, (9, 9), 0)
+                # saturate: weakly-covered pixels (faint italic
+                # lines, anti-aliased edges) must still be FULLY
+                # replaced, or they survive as readable fragments
+                alpha = np.clip(alpha * 1.5, 0.0, 1.0)[:, :, None]
+                band = frame[y0:y1].astype(np.float32)
+                fill = plate[by0:by1].astype(np.float32)
+                frame[y0:y1] = (alpha * fill
+                                + (1.0 - alpha) * band).astype(np.uint8)
+            try:
+                proc.stdin.write(frame.tobytes())
+            except (BrokenPipeError, OSError):
+                pipe_broken = True
+                break
+            n += 1
+            if cb and total and n % 10 == 0:
+                cb(18 + int(77 * n / total),
+                   f"AI temporal inpainting frames ({n}/{total})")
+    finally:
+        cap.release()
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=120)
+        except Exception:
+            proc.kill()
+        logf.close()
+    if pipe_broken:
+        raise RuntimeError("AI temporal inpainting failed: the video "
+                           "encoder stopped early.")
+    if proc.returncode != 0 or n == 0:
+        tail = ""
+        try:
+            with open(log_path, errors="replace") as f:
+                tail = f.read()[-300:]
+        except OSError:
+            pass
+        raise RuntimeError("AI temporal inpainting failed. " + tail)
+    if cb:
+        cb(97, f"AI temporal done ({plates} clean plates rebuilt, "
+               f"{warps} frames tracked by motion)")
+    try:
+        os.remove(log_path)
+    except OSError:
+        pass
+
+
+def _detect_band_ocr(video_path, samples=14):
+    """OCR caption-band detection: run the text detector over frames
+    sampled across the video (decoded sequentially - random seeks
+    are far slower), cluster the boxes by height, and keep the
+    cluster that behaves like captions: present in most samples,
+    dense with text, covering a real share of the frame. Corner
+    overlays (channel logos, bodycam clocks) are text too, but they
+    are sparse specks beside a caption block, so the scoring rejects
+    them. Returns the detect dict, or None when sampling failed."""
+    import cv2
+    import numpy as np
+    det = _get_text_detector()
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if not total or not height:
+        cap.release()
+        return None
+    targets = set(np.linspace(int(total * 0.04), int(total * 0.96),
+                              samples).astype(int).tolist())
+    per_sample = []
+    idx = -1
+    while True:
+        if not cap.grab():
+            break
+        idx += 1
+        if idx not in targets:
+            continue
+        ok, frame = cap.retrieve()
+        if not ok:
+            continue
+        boxes = det.detect(frame, max_side=768)
+        per_sample.append([(x0 / width, y0 / height, x1 / width,
+                            y1 / height)
+                           for (x0, y0, x1, y1, _s) in boxes])
+    cap.release()
+    if len(per_sample) < 5:
+        return None
+    all_boxes = [b for bs in per_sample for b in bs]
+    if not all_boxes:
+        return {"found": False, "method": "ocr", "boxes": 0}
+    # Row-profile clustering: captions are WIDE text that stays put
+    # across samples, so score every height row by how often a wide
+    # box covers it. Scene text (signs, dashboards) is usually
+    # narrower, taller, or only on screen briefly, so it washes out
+    # of the profile instead of chaining into the caption cluster.
+    rows_n = 240
+    cover = np.zeros(rows_n, np.float32)
+    for bs in per_sample:
+        hit = np.zeros(rows_n, bool)
+        for b in bs:
+            if (b[2] - b[0]) < 0.22:
+                continue
+            r0 = int(b[1] * rows_n)
+            r1 = min(rows_n, max(r0 + 1,
+                                 int(np.ceil(b[3] * rows_n))))
+            hit[r0:r1] = True
+        cover += hit
+    share = cover / float(len(per_sample))
+    strong = share >= 0.20
+    runs = []
+    r = 0
+    while r < rows_n:
+        if not strong[r]:
+            r += 1
+            continue
+        r0 = r
+        r1 = r
+        gap = 0
+        r += 1
+        while r < rows_n and gap <= 3:  # bridge inter-line gaps
+            if strong[r]:
+                r1 = r
+                gap = 0
+            else:
+                gap += 1
+            r += 1
+        runs.append((r0, r1))
+    scored = []
+    for (r0, r1) in runs:
+        top = r0 / rows_n
+        bot = (r1 + 1) / rows_n
+        cheight = bot - top
+        if cheight > 0.50 or cheight < 0.012:
+            continue
+        persistence = float(share[r0:r1 + 1].mean())
+        areas = []
+        present = 0
+        for bs in per_sample:
+            sel = [b for b in bs
+                   if (b[2] - b[0]) >= 0.22
+                   and top <= (b[1] + b[3]) / 2.0 <= bot]
+            if sel:
+                present += 1
+                areas.append(sum((b[2] - b[0]) * (b[3] - b[1])
+                                 for b in sel))
+        if not areas:
+            continue
+        persistence = present / float(len(per_sample))
+        area_med = float(np.median(areas))
+        density = area_med / cheight
+        score = persistence * density * float(np.sqrt(area_med))
+        if persistence >= 0.34 and density >= 0.15 and score >= 0.02:
+            scored.append((score, top, bot))
+    if not scored:
+        return {"found": False, "method": "ocr",
+                "boxes": len(all_boxes)}
+    scored.sort(key=lambda s: s[1])
+    # merge strong runs that sit close together (e.g. the main
+    # caption block and a second burned-in line just below it)
+    merged = [list(scored[0])]
+    for s in scored[1:]:
+        if s[1] - merged[-1][2] <= 0.06:
+            merged[-1][2] = max(merged[-1][2], s[2])
+            merged[-1][0] = max(merged[-1][0], s[0])
+        else:
+            merged.append(list(s))
+    merged.sort(key=lambda s: -s[0])
+    best = merged[0]
+    if best[2] - best[1] > 0.50:
+        return {"found": False, "method": "ocr",
+                "boxes": len(all_boxes)}
+    m = 0.022
+    top = max(0.0, best[1] - m)
+    bot = min(1.0, best[2] + m)
+    return {"found": True,
+            "top_pct": round(100.0 * top, 1),
+            "bottom_pct": round(100.0 * bot, 1),
+            "method": "ocr",
+            "score": round(float(best[0]), 3),
+            "boxes": len(all_boxes)}
+
+
 def detect_caption_band(video_path, samples=24):
+    """Find where burned-in captions sit, by itself. OCR text
+    detection first (it reads the actual letters); the older
+    edge-persistence heuristic is only a second opinion for when the
+    OCR model cannot be loaded or sees text it cannot cluster.
+    found=False means 'no caption band we trust' - callers fall back
+    to the standard bottom band and say so."""
+    try:
+        r = _detect_band_ocr(video_path, samples=min(samples, 14))
+        if r is not None:
+            if r.get("found") or not r.get("boxes"):
+                return r
+            edge = _detect_band_edges(video_path, samples=samples)
+            return edge if edge.get("found") else r
+    except Exception:
+        pass
+    return _detect_band_edges(video_path, samples=samples)
+
+
+def _detect_band_edges(video_path, samples=24):
     """Find where burned-in captions sit in the frame, by itself.
 
     Samples frames across the video and looks for the horizontal band
@@ -2830,3 +3537,87 @@ def detect_caption_band(video_path, samples=24):
             "bottom_pct": round(100.0 * y1 / h, 1),
             "peak": round(peak, 3),
             "mid_share": round(mid_share, 3)}
+
+
+def find_preview_section(video_path, region, seconds=5.0):
+    """Pick the most honest few seconds to preview: a caption CHANGE
+    on a busy background - exactly where ghosting and flicker would
+    show. Scans ~1 frame per second; returns (start_sec, end_sec)."""
+    import cv2
+    import numpy as np
+    W, H, _f = probe_video(video_path)
+    duration = probe_duration(video_path) or 0.0
+    if not W or not H or not duration:
+        return (0.0, min(seconds, duration or seconds))
+    y0, y1 = _remover_band(region, H)
+    band_h = max(2, y1 - y0)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return (0.0, min(seconds, duration))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    step = max(1, int(round(fps)))
+    prev_mask = None
+    best_t, best_score = 0.0, -1.0
+    idx = -1
+    while True:
+        if not cap.grab():
+            break
+        idx += 1
+        if idx % step:
+            continue
+        ok, frame = cap.retrieve()
+        if not ok:
+            continue
+        t = idx / fps
+        gray = cv2.cvtColor(frame[y0:y1], cv2.COLOR_BGR2GRAY)
+        m = _tophat_text_mask(gray)
+        ctx = frame[max(0, y0 - band_h):y0]
+        busy = 0.0
+        if ctx.size:
+            busy = float((cv2.Canny(cv2.cvtColor(
+                ctx, cv2.COLOR_BGR2GRAY), 50, 150) > 0).mean())
+        change = 0.0
+        if prev_mask is not None and prev_mask.shape == m.shape:
+            inter = float((m * prev_mask).sum())
+            union = float(((m + prev_mask) > 0).sum()) or 1.0
+            change = 1.0 - inter / union
+        score = change * (0.4 + busy * 8.0)
+        if float(m.sum()) > 0:
+            score += 0.05
+        if score > best_score:
+            best_t, best_score = t, score
+        prev_mask = m
+    cap.release()
+    start = max(0.0, best_t - 1.5)
+    if start + seconds > duration:
+        start = max(0.0, duration - seconds)
+    return (start, min(duration, start + seconds))
+
+
+def preview_caption_removal(video_path, region, mode, out_path,
+                            progress_cb=None, quality_tier="maximum",
+                            seconds=5.0):
+    """Render only the worst ~5 s (see find_preview_section) with the
+    chosen removal engine, so quality can be judged before a full
+    run. Returns (out_path, start_sec, end_sec)."""
+    import shutil
+    import tempfile
+    start, end = find_preview_section(video_path, region, seconds)
+    workdir = tempfile.mkdtemp(prefix="crprev_")
+    try:
+        seg = os.path.join(workdir, "segment.mp4")
+        cmd = (["ffmpeg", "-y", "-ss", f"{start:.2f}", "-i",
+                video_path, "-t", f"{max(0.5, end - start):.2f}"]
+               + _encode_args(quality_tier)
+               + ["-c:a", "aac", "-b:a", "192k", seg])
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0 or not os.path.isfile(seg):
+            raise RuntimeError("Could not cut the preview segment: "
+                               + (r.stderr or "")[-200:])
+        remove_captions(seg, region, mode, out_path,
+                        progress_cb=progress_cb,
+                        quality_tier=quality_tier)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return out_path, start, end

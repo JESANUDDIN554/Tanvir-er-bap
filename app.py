@@ -31,6 +31,7 @@ from pipeline import (  # noqa: E402
     render_clip, retime_words, write_srt, write_vtt, write_xml_timeline,
     merge_clips, probe_duration, probe_video, set_custom_styles,
     generate_posting_package, remove_captions, detect_caption_band,
+    preview_caption_removal,
     LANGUAGES, GENRES, RATIOS,
 )
 
@@ -767,7 +768,7 @@ class Api:
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 
-    def caption_remover_start(self, source, region=None, mode="crop"):
+    def caption_remover_start(self, source, region=None, mode="auto"):
         gate = _license_gate()
         if gate:
             return gate
@@ -775,7 +776,7 @@ class Api:
         if not source:
             return {"ok": False, "error": "Paste a video link or a "
                                           "local file path first."}
-        if mode not in ("crop", "fill", "ai"):
+        if mode not in ("auto", "crop", "fill", "ai", "temporal"):
             return {"ok": False, "error": "Unknown removal method."}
         auto = bool((region or {}).get("auto"))
         top = bot = None
@@ -815,7 +816,13 @@ class Api:
             st["stage"] = text
 
         mode_names = {"crop": "Crop Band", "fill": "Smart Fill",
-                      "ai": "AI Inpaint"}
+                      "ai": "AI Inpaint (frame by frame)",
+                      "temporal": "AI Temporal (clean plate, tracked)"}
+        if mode == "auto":
+            mode = "temporal"
+            _remover_log(rid, "Auto mode: the app picked the temporal "
+                              "AI engine (one clean plate per shot, "
+                              "tracked by motion - no flicker)")
         _remover_log(rid, "Caption removal started ("
                      + mode_names.get(mode, mode) + ")")
         try:
@@ -853,10 +860,26 @@ class Api:
                                       "using the bottom band (82% - 100%). "
                                       "Use Custom to adjust if needed.")
             out = os.path.join(work, "output.mp4")
-            remove_captions(
-                src, region, mode, out,
-                progress_cb=lambda p, t: cb(25 + int(p * 0.75), t),
-                quality_tier=settings.get("quality_tier", "maximum"))
+            tier = settings.get("quality_tier", "maximum")
+            try:
+                remove_captions(
+                    src, region, mode, out,
+                    progress_cb=lambda p, t: cb(25 + int(p * 0.75), t),
+                    quality_tier=tier)
+            except RuntimeError as e:
+                if mode in ("temporal", "ai") \
+                        and "model" in str(e).lower():
+                    _remover_log(rid, "The AI engine could not start ("
+                                      + str(e)[:140] + ") - finishing "
+                                      "with Smart Fill instead, so you "
+                                      "still get a clean video.")
+                    remove_captions(
+                        src, region, "fill", out,
+                        progress_cb=lambda p, t: cb(25 + int(p * 0.75),
+                                                    t),
+                        quality_tier=tier)
+                else:
+                    raise
             st["status"] = "done"
             st["pct"] = 100
             st["stage"] = "Done"
@@ -873,6 +896,119 @@ class Api:
             return {"ok": False, "error": "That removal job is gone "
                                           "(the app was restarted)."}
         return {"ok": True, **st}
+
+    def caption_remover_preview(self, source, region=None, mode="auto"):
+        """Start a ~5s preview job: the worst section (a caption
+        change on a busy background), so quality can be judged
+        before committing to a full run."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        source = (source or "").strip()
+        if not source:
+            return {"ok": False, "error": "Paste a video link or a "
+                                          "local file path first."}
+        if mode not in ("auto", "crop", "fill", "ai", "temporal"):
+            return {"ok": False, "error": "Unknown removal method."}
+        auto = bool((region or {}).get("auto"))
+        top = bot = None
+        if not auto:
+            try:
+                top = float((region or {}).get("top_pct", 82.0))
+                bot = float((region or {}).get("bottom_pct", 100.0))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "The caption region needs "
+                                              "numeric top/bottom values."}
+            if not (0.0 <= top <= 100.0 and 0.0 <= bot <= 100.0) \
+                    or bot - top < 2.0:
+                return {"ok": False, "error": "The caption region is too "
+                                              "thin or outside the frame - "
+                                              "widen the band."}
+        is_url = source.lower().startswith(("http://", "https://"))
+        if not is_url and not os.path.isfile(source):
+            return {"ok": False, "error": "That file was not found on "
+                                          "this PC."}
+        rid = uuid.uuid4().hex[:12]
+        _REMOVER_JOBS[rid] = {"id": rid, "status": "running", "pct": 0,
+                              "stage": "Starting", "error": None,
+                              "url": None, "mode": mode, "log": [],
+                              "kind": "preview", "section": None}
+        job_region = ({"auto": True} if auto
+                      else {"top_pct": top, "bottom_pct": bot})
+        t = threading.Thread(target=self._run_remover_preview,
+                             args=(rid, source, is_url, job_region, mode),
+                             daemon=True)
+        t.start()
+        return {"ok": True, "id": rid}
+
+    def _run_remover_preview(self, rid, source, is_url, region, mode):
+        st = _REMOVER_JOBS[rid]
+
+        def cb(pct, text):
+            st["pct"] = max(0, min(100, int(pct)))
+            st["stage"] = text
+
+        _remover_log(rid, "Preview started (worst 5 seconds: a caption "
+                          "change on a busy background)")
+        try:
+            settings = load_settings()
+            work = os.path.join(BASE_DIR, "work", "remover-" + rid)
+            os.makedirs(work, exist_ok=True)
+            if is_url:
+                _remover_log(rid, "Download started")
+                src, _dl_title, _dl_dur = download_video(
+                    source, work,
+                    lambda p, t: cb(int(p * 0.25), t),
+                    use_cookies=bool(settings.get("use_browser_cookies")))
+                _remover_log(rid, "Download finished")
+            else:
+                src = source
+            if region and region.get("auto"):
+                cb(26, "Auto-detecting the caption band")
+                det = detect_caption_band(src)
+                if det.get("found"):
+                    region = {"top_pct": det["top_pct"],
+                              "bottom_pct": det["bottom_pct"]}
+                    _remover_log(
+                        rid, "Auto-detected caption band: "
+                        f"{det['top_pct']:.0f}% - {det['bottom_pct']:.0f}% "
+                        "of the frame height")
+                else:
+                    region = {"top_pct": 82.0, "bottom_pct": 100.0}
+                    _remover_log(rid, "No clear caption band found - "
+                                      "using the bottom band (82% - 100%).")
+            out = os.path.join(work, "output.mp4")
+            tier = settings.get("quality_tier", "maximum")
+            engine = "temporal" if mode == "auto" else mode
+            try:
+                _o, start, end = preview_caption_removal(
+                    src, region, engine, out,
+                    progress_cb=lambda p, t: cb(25 + int(p * 0.75), t),
+                    quality_tier=tier)
+            except RuntimeError as e:
+                if engine in ("temporal", "ai") \
+                        and "model" in str(e).lower():
+                    _remover_log(rid, "The AI engine could not start - "
+                                      "previewing with Smart Fill "
+                                      "instead.")
+                    _o, start, end = preview_caption_removal(
+                        src, region, "fill", out,
+                        progress_cb=lambda p, t: cb(25 + int(p * 0.75),
+                                                    t),
+                        quality_tier=tier)
+                else:
+                    raise
+            st["section"] = f"{start:.0f}s - {end:.0f}s"
+            st["status"] = "done"
+            st["pct"] = 100
+            st["stage"] = "Done"
+            st["url"] = "/remover-files/" + rid + "/output.mp4"
+            _remover_log(rid, "Preview finished - output.mp4 "
+                              f"(section {st['section']})")
+        except Exception as e:
+            st["status"] = "error"
+            st["error"] = str(e)[:300]
+            _remover_log(rid, "ERROR: " + st["error"])
 
     # -- caption editor ----------------------------------------------
     def _moment_words(self, job, index):
