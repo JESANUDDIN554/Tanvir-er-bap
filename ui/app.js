@@ -2661,7 +2661,20 @@ function applyTheme() {
   root.setProperty("--accent2", `rgb(${d2.join(", ")})`);
   root.setProperty("--accent-dim", `rgba(${rgb.join(", ")}, 0.10)`);
   root.setProperty("--accent-glow", `rgba(${rgb.join(", ")}, 0.22)`);
+  markActiveTheme();
 }
+function markActiveTheme() {
+  const cur = (settings.accent || "#2effc8").toLowerCase();
+  document.querySelectorAll("#themeGrid .theme-swatch").forEach((b) =>
+    b.classList.toggle("on", b.dataset.accent.toLowerCase() === cur));
+}
+document.querySelectorAll("#themeGrid .theme-swatch").forEach((b) =>
+  b.addEventListener("click", async () => {
+    settings.accent = b.dataset.accent;
+    $("accentPick").value = b.dataset.accent;
+    applyTheme();
+    try { await api.save_settings({ accent: settings.accent }); } catch (e) { /* offline */ }
+  }));
 document.querySelectorAll("#themeSeg .seg").forEach((b) =>
   b.addEventListener("click", async () => {
     segSet("themeSeg", b.dataset.value);
