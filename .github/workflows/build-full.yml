@@ -162,7 +162,14 @@ jobs:
           if (-not (Test-Path (Join-Path $idir 'ClipMakerPC.exe'))) {
             throw 'installed ClipMakerPC.exe missing'
           }
-          $env:ITRAJI_INSTALL_DIR = $idir
+          Get-ChildItem $idir | Select-Object Name
+          Get-ChildItem (Join-Path $idir '_internal') | Select-Object Name
+          # The app itself verifies integrity against its bundle dir
+          # (BASE_DIR = sys._MEIPASS = the _internal folder of the installed
+          # onedir layout), so this check must point at _internal too -
+          # pointing it at the install root fails on the first manifest
+          # entry (ui/activate.html) because the file lives under _internal.
+          $env:ITRAJI_INSTALL_DIR = Join-Path $idir '_internal'
           python -c "import os, sys, licensing; ok, bad = licensing.verify_integrity(os.environ['ITRAJI_INSTALL_DIR']); print('verify_integrity:', ok, bad); sys.exit(0 if ok else 1)"
           if ($LASTEXITCODE -ne 0) { throw 'integrity manifest check failed on installed payload' }
           Write-Host 'Installer verification passed: model bytes + hash, engine, app exe, signed integrity manifest.'
