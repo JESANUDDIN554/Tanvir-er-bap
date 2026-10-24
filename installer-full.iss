@@ -33,6 +33,12 @@ DefaultDirName={localappdata}\Programs\Itraji Cliper
 DisableProgramGroupPage=yes
 OutputDir={#FullOutDir}
 OutputBaseFilename=ItrajiCliper-Setup-Full
+; The payload is ~9.35 GB, over Inno's single-Setup.exe ceiling
+; (~4.2 GB), so span it: Setup.exe + ItrajiCliper-Setup-Full-N.bin
+; parts, each slice under GitHub's 2 GB release-asset limit. All
+; parts must sit next to the .exe when installing.
+DiskSpanning=yes
+DiskSliceSize=1900000000
 SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\ClipMakerPC.exe
 Compression=lzma2/ultra64
