@@ -1,0 +1,193 @@
+# Builds the FULL Itraji Cliper installer: the normal app payload PLUS
+# the ~9 GB built-in AI model (Qwen2.5-14B-Instruct Q4_K_M GGUF) and the
+# llama.cpp engine baked in, so the app is fully ready right after
+# install - no first-run model download.
+#
+# The output (~9.3 GB) exceeds the 2 GB GitHub Release asset limit, so
+# it is published as a workflow ARTIFACT (name: ItrajiCliper-Setup-Full),
+# not a Release asset. The light installer flow (build-exe.yml) is
+# untouched.
+#
+# The model is NOT in git: this workflow downloads it from the official
+# bartowski Hugging Face repo and hard-fails unless its size and
+# SHA256 match the pinned values from local_ai.py / HF LFS metadata.
+name: Build Windows EXE (Full, AI model included)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'installer-full.iss'
+      - '.github/workflows/build-full.yml'
+
+permissions:
+  contents: write   # file an issue with the log tail if the build fails
+  issues: write
+
+jobs:
+  build-full:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Download YuNet face model (binary, not stored in git)
+        shell: bash
+        run: |
+          curl -L -o models/face_yunet.onnx https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+          ls -la models/
+
+      - name: Build with PyInstaller
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          sed -i 's/upx=True/upx=False/' ClipMakerPC.spec
+          pyinstaller ClipMakerPC.spec 2>&1 | tee build.log
+
+      - name: Bundle ffmpeg + ffprobe (standalone, no install needed)
+        if: success()
+        shell: bash
+        run: |
+          curl -L -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          7z x ffmpeg.zip -offmpeg_dl > /dev/null
+          EXE_DIR=$(echo ffmpeg_dl/ffmpeg-*-essentials_build/bin)
+          cp "$EXE_DIR/ffmpeg.exe" "$EXE_DIR/ffprobe.exe" dist/ClipMakerPC/
+          ls -la dist/ClipMakerPC/ffmpeg.exe dist/ClipMakerPC/ffprobe.exe dist/ClipMakerPC/ClipMakerPC.exe
+
+      - name: Pick the staging drive with the most free space
+        if: success()
+        shell: pwsh
+        run: |
+          $best = Get-PSDrive -PSProvider FileSystem |
+            Sort-Object Free -Descending | Select-Object -First 1
+          $stage = Join-Path $best.Root 'itraji-full-stage'
+          New-Item -ItemType Directory -Force -Path `
+            "$stage\models", "$stage\llama", "$stage\out", `
+            "$stage\install-test" | Out-Null
+          "STAGE_DIR=$stage" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} |
+            Format-Table | Out-String | Write-Host
+          Write-Host "Staging dir: $stage"
+
+      - name: Download built-in AI model + verify size and SHA256
+        if: success()
+        shell: pwsh
+        run: |
+          $url = 'https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf'
+          $dest = Join-Path $env:STAGE_DIR 'models\Qwen2.5-14B-Instruct-Q4_K_M.gguf'
+          curl.exe -L --fail --retry 3 -o $dest $url
+          if ($LASTEXITCODE -ne 0) { throw "model download failed: curl exit $LASTEXITCODE" }
+          $f = Get-Item $dest
+          if ($f.Length -ne 8988110976) {
+            throw "model size mismatch: got $($f.Length), want 8988110976"
+          }
+          $h = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne 'e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008') {
+            throw "model SHA256 mismatch: got $h"
+          }
+          Write-Host "Model verified: $($f.Length) bytes, sha256=$h"
+
+      - name: Download llama.cpp engine (pinned like local_ai.py) + extract
+        if: success()
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:STAGE_DIR 'llama-engine.zip'
+          curl.exe -L --fail --retry 3 -o $zip 'https://github.com/ggml-org/llama.cpp/releases/download/b11803/llama-b11803-bin-win-cpu-x64.zip'
+          if ($LASTEXITCODE -ne 0) { throw "engine download failed: curl exit $LASTEXITCODE" }
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:STAGE_DIR 'llama') -Force
+          Remove-Item $zip
+          $srv = Get-ChildItem -Recurse (Join-Path $env:STAGE_DIR 'llama') `
+            -Filter 'llama-server.exe' | Select-Object -First 1
+          if (-not $srv) { throw 'llama-server.exe not found in engine zip' }
+          Write-Host "Engine verified: $($srv.FullName)"
+
+      - name: Build the FULL one-file installer (Inno Setup)
+        if: success()
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = (Get-Command ISCC.exe).Source }
+          $out = Join-Path $env:STAGE_DIR 'out'
+          & $iscc "/DFullPayloadDir=$env:STAGE_DIR" "/DFullOutDir=$out" installer-full.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
+          Get-Item (Join-Path $out 'ItrajiCliper-Setup-Full.exe') |
+            Select-Object Name, Length
+
+      - name: Verify the installer (silent install, model hash, integrity manifest)
+        if: success()
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:STAGE_DIR 'out\ItrajiCliper-Setup-Full.exe'
+          $idir = Join-Path $env:STAGE_DIR 'install-test'
+          $p = Start-Process $setup -Wait -PassThru -ArgumentList `
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$idir"
+          if ($p.ExitCode -ne 0) { throw "silent install exit code $($p.ExitCode)" }
+          $model = Join-Path $idir 'models\Qwen2.5-14B-Instruct-Q4_K_M.gguf'
+          $f = Get-Item $model
+          if ($f.Length -ne 8988110976) {
+            throw "installed model size mismatch: got $($f.Length), want 8988110976"
+          }
+          $h = (Get-FileHash $model -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne 'e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008') {
+            throw "installed model SHA256 mismatch: got $h"
+          }
+          if (-not (Get-ChildItem -Recurse (Join-Path $idir 'llama') -Filter 'llama-server.exe')) {
+            throw 'installed llama-server.exe missing under llama\'
+          }
+          if (-not (Test-Path (Join-Path $idir 'ClipMakerPC.exe'))) {
+            throw 'installed ClipMakerPC.exe missing'
+          }
+          $env:ITRAJI_INSTALL_DIR = $idir
+          python -c "import os, sys, licensing; ok, bad = licensing.verify_integrity(os.environ['ITRAJI_INSTALL_DIR']); print('verify_integrity:', ok, bad); sys.exit(0 if ok else 1)"
+          if ($LASTEXITCODE -ne 0) { throw 'integrity manifest check failed on installed payload' }
+          Write-Host 'Installer verification passed: model bytes + hash, engine, app exe, signed integrity manifest.'
+
+      - name: Write build summary
+        if: success()
+        shell: pwsh
+        run: |
+          $setup = Get-Item (Join-Path $env:STAGE_DIR 'out\ItrajiCliper-Setup-Full.exe')
+          $setupHash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          @(
+            '## ItrajiCliper-Setup-Full.exe'
+            ''
+            "Size: $($setup.Length) bytes"
+            "SHA256: $setupHash"
+            'Model: Qwen2.5-14B-Instruct-Q4_K_M.gguf, 8988110976 bytes, sha256 e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008 (verified before compile and again in the installed tree)'
+            'Silent-install verification on the runner: PASSED (model, engine, app exe, signed integrity manifest)'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Upload FULL installer as workflow artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ItrajiCliper-Setup-Full
+          path: ${{ env.STAGE_DIR }}/out/ItrajiCliper-Setup-Full.exe
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: File failure issue with log tail
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY="$(tail -c 6000 build.log 2>/dev/null || echo 'no build log captured')"
+          gh issue create --title "FULL Windows build failed (${GITHUB_SHA:0:7})" --body "Build log tail:
+          \`\`\`
+          $BODY
+          \`\`\`
+          [View the run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
