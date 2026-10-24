@@ -239,6 +239,22 @@ jobs:
           '@
           $fsi.FileSystemsToCreate = 3   # 1 = ISO9660, 2 = Joliet -> write both
           $fsi.VolumeName = 'ITRAJI CLIPER'
+          # IMAPI2FS sizes the result image against FreeMediaBlocks, whose
+          # default is only 332,800 blocks of BlockSize bytes (~650 MB, a
+          # CD). AddTree throws IMAPI_E_IMAGE_TOO_BIG once the estimated
+          # image size passes FreeMediaBlocks x BlockSize - that default
+          # is what failed the first ISO run at ~9.2 GB. Derive the limit
+          # from the actual payload instead: total part bytes (plus the
+          # README) converted to blocks, +15% headroom for the ISO9660 and
+          # Joliet metadata, + a flat block slack. Must be set BEFORE
+          # AddTree; the value (~5.15M blocks for ~9.2 GB) fits easily in
+          # the property's LONG range.
+          $payloadBytes = $total + (Get-Item (Join-Path $isoRoot 'README.txt')).Length
+          $blockSize = $fsi.BlockSize
+          if (-not $blockSize) { $blockSize = 2048 }
+          $blocksNeeded = [int][math]::Ceiling($payloadBytes * 1.15 / $blockSize) + 10000
+          $fsi.FreeMediaBlocks = $blocksNeeded
+          Write-Host "IMAPI2FS FreeMediaBlocks set to $blocksNeeded blocks x $blockSize bytes (~$([math]::Round($blocksNeeded * $blockSize / 1GB, 2)) GB) for $payloadBytes payload bytes"
           $fsi.Root.AddTree($isoRoot, $false)
           $result = $fsi.CreateResultImage()
           $isoPath = Join-Path $out 'ItrajiCliper-Full.iso'
