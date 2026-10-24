@@ -19,7 +19,6 @@ on:
     branches: [main]
     paths:
       - 'installer-full.iss'
-      - '.github/workflows/build-full.yml'
 
 permissions:
   contents: write   # file an issue with the log tail if the build fails
@@ -123,8 +122,21 @@ jobs:
           $out = Join-Path $env:STAGE_DIR 'out'
           & $iscc "/DFullPayloadDir=$env:STAGE_DIR" "/DFullOutDir=$out" installer-full.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
-          Get-Item (Join-Path $out 'ItrajiCliper-Setup-Full.exe') |
-            Select-Object Name, Length
+          $parts = Get-ChildItem $out -File | Sort-Object Name
+          $parts | Select-Object Name, Length |
+            Format-Table | Out-String | Write-Host
+          if (-not ($parts | Where-Object { $_.Name -eq 'ItrajiCliper-Setup-Full.exe' })) {
+            throw 'ItrajiCliper-Setup-Full.exe missing from out dir'
+          }
+          $bins = $parts | Where-Object { $_.Extension -eq '.bin' }
+          if (-not $bins) { throw 'disk spanning produced no .bin parts' }
+          foreach ($p in $parts) {
+            if ($p.Length -ge 2000000000) {
+              throw "part $($p.Name) is $($p.Length) bytes, >= the 2 GB release-asset limit"
+            }
+          }
+          $total = ($parts | Measure-Object Length -Sum).Sum
+          Write-Host "$($parts.Count) parts (exe + $($bins.Count) .bin), $total bytes total"
 
       - name: Verify the installer (silent install, model hash, integrity manifest)
         if: success()
@@ -159,23 +171,29 @@ jobs:
         if: success()
         shell: pwsh
         run: |
-          $setup = Get-Item (Join-Path $env:STAGE_DIR 'out\ItrajiCliper-Setup-Full.exe')
-          $setupHash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
-          @(
-            '## ItrajiCliper-Setup-Full.exe'
+          $out = Join-Path $env:STAGE_DIR 'out'
+          $parts = Get-ChildItem $out -File | Sort-Object Name
+          $total = ($parts | Measure-Object Length -Sum).Sum
+          $exeHash = (Get-FileHash (Join-Path $out 'ItrajiCliper-Setup-Full.exe') -Algorithm SHA256).Hash.ToLower()
+          $lines = @(
+            '## ItrajiCliper-Setup-Full (disk-spanned installer)'
             ''
-            "Size: $($setup.Length) bytes"
-            "SHA256: $setupHash"
-            'Model: Qwen2.5-14B-Instruct-Q4_K_M.gguf, 8988110976 bytes, sha256 e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008 (verified before compile and again in the installed tree)'
-            'Silent-install verification on the runner: PASSED (model, engine, app exe, signed integrity manifest)'
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            "Parts: $($parts.Count), total: $total bytes (the .exe and every .bin must stay in the same folder; the installer reads the parts automatically)"
+            "ItrajiCliper-Setup-Full.exe SHA256: $exeHash"
+          )
+          foreach ($p in $parts) {
+            $lines += "- $($p.Name): $($p.Length) bytes"
+          }
+          $lines += 'Model: Qwen2.5-14B-Instruct-Q4_K_M.gguf, 8988110976 bytes, sha256 e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008 (verified before compile and again in the installed tree)'
+          $lines += 'Silent-install verification on the runner: PASSED (model, engine, app exe, signed integrity manifest)'
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - name: Upload FULL installer as workflow artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ItrajiCliper-Setup-Full
-          path: ${{ env.STAGE_DIR }}/out/ItrajiCliper-Setup-Full.exe
+          path: ${{ env.STAGE_DIR }}/out/
           compression-level: 0
           if-no-files-found: error
 
