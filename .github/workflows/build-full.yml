@@ -210,8 +210,13 @@ jobs:
 
           public static class IsoImageWriter
           {
-              public static void Write(IStream stream, string destinationPath)
+              public static void Write(object streamObject, string destinationPath)
               {
+                  // PowerShell cannot cast a raw __ComObject to IStream on
+                  // its side of the call (run #7 died on exactly that), so
+                  // accept object here and cast inside C#, where the COM
+                  // QueryInterface cast works.
+                  IStream stream = (IStream)streamObject;
                   STATSTG stat;
                   stream.Stat(out stat, 1); // STATFLAG_NONAME
                   long size = stat.cbSize;
@@ -258,7 +263,7 @@ jobs:
           $fsi.Root.AddTree($isoRoot, $false)
           $result = $fsi.CreateResultImage()
           $isoPath = Join-Path $out 'ItrajiCliper-Full.iso'
-          [IsoImageWriter]::Write([System.Runtime.InteropServices.ComTypes.IStream]$result.ImageStream, $isoPath)
+          [IsoImageWriter]::Write($result.ImageStream, $isoPath)
           $isoItem = Get-Item $isoPath
           if ($isoItem.Length -lt 9000000000) { throw "ISO image suspiciously small: $($isoItem.Length) bytes" }
           $isoHash = (Get-FileHash $isoPath -Algorithm SHA256).Hash.ToLower()
