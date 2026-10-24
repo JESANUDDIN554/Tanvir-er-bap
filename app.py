@@ -2328,6 +2328,24 @@ def make_wsgi_app(api):
                                  "charset=utf-8"),
                                 ("Content-Length", str(len(data)))])
                 return [data]
+            if method == "GET" and path in ("/icon-192.png",
+                                            "/icon-512.png"):
+                # The activation page's brand logo + favicon. Without
+                # this pass-through the locked screen showed a broken
+                # image where the logo belongs (user screenshot,
+                # 2026-10-25) - the gate 404'd every static file.
+                ipath = os.path.join(ui_dir, path.lstrip("/"))
+                try:
+                    with open(ipath, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    return _wsgi_response(start_response,
+                                          "404 Not Found",
+                                          "text/plain", "not found")
+                start_response("200 OK",
+                               [("Content-Type", "image/png"),
+                                ("Content-Length", str(len(data)))])
+                return [data]
             if method == "POST" and path.startswith("/api/") \
                     and path[len("/api/"):] in ("license_status",
                                                 "activate_license"):
