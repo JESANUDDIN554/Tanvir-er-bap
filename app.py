@@ -14,6 +14,8 @@ import threading
 import time
 import uuid
 
+import requests
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if getattr(sys, "frozen", False):
     BASE_DIR = sys._MEIPASS  # PyInstaller bundle
@@ -32,6 +34,7 @@ from pipeline import (  # noqa: E402
     merge_clips, probe_duration, probe_video, set_custom_styles,
     generate_posting_package, remove_captions, detect_caption_band,
     preview_caption_removal,
+    generate_titles, generate_script, enhance_video,
     LANGUAGES, GENRES, RATIOS,
 )
 
@@ -45,6 +48,8 @@ _pipeline.FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 JOBS = {}
 BATCHES = {}
 _REMOVER_JOBS = {}  # Caption Remover runs (session-only, not Library)
+_GEN_JOBS = {}      # fal.ai generator runs (session-only)
+_ENHANCE_JOBS = {}  # Video Enhancer runs (session-only)
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"),
                               ".clipmaker_pc_settings.json")
 
@@ -202,6 +207,8 @@ DEFAULT_SETTINGS = {
                                    #   outline, logo_path, intro_path, outro_path}]
     "planner": [],                 # [{id, job_id, title, scheduled, done,
                                    #   export_name}] - local posting planner
+    "fal_key": "",                 # user's own fal.ai API key (Studio
+                                   # Generator) - never sent to the UI
 }
 
 # Clip-length presets -> (min_s, max_s) for moment detection.
@@ -287,6 +294,148 @@ def _remover_log(rid, text):
         del log[:len(log) - _JOB_LOG_CAP]
 
 
+# -- Studio Generator: fal.ai model catalog ------------------------------
+# Every entry was verified against the model's own fal.ai API docs page
+# (endpoint id + input schema) on 2026-10-24. Prices are approximate
+# per-generation costs from fal.ai's published pricing, shown with "~"
+# in the UI - fal.ai bills the user's own account directly.
+FAL_MODELS = [
+    {"id": "wan25", "name": "Wan 2.5 (Alibaba)", "kind": "video",
+     "endpoint": "fal-ai/wan-25-preview/text-to-video",
+     "price": "~$0.05/s at 480p",
+     "aspects": ["16:9", "9:16", "1:1"],
+     "durations": ["5", "10"],
+     "resolutions": ["480p", "720p", "1080p"],
+     "def_aspect": "16:9", "def_duration": "5",
+     "def_resolution": "1080p",
+     "note": "Great value, native audio, up to 1080p."},
+    {"id": "kling25", "name": "Kling 2.5 Turbo Pro", "kind": "video",
+     "endpoint": "fal-ai/kling-video/v2.5-turbo/pro/text-to-video",
+     "price": "~$0.07/s",
+     "aspects": ["16:9", "9:16", "1:1"],
+     "durations": ["5", "10"],
+     "resolutions": None,
+     "def_aspect": "16:9", "def_duration": "5", "def_resolution": None,
+     "note": "Cinematic motion, 1080p."},
+    {"id": "veo31", "name": "Veo 3.1 (Google)", "kind": "video",
+     "endpoint": "fal-ai/veo3.1",
+     "price": "~$0.40/s with audio",
+     "aspects": ["16:9", "9:16"],
+     "durations": ["4s", "6s", "8s"],
+     "resolutions": ["720p", "1080p", "4k"],
+     "def_aspect": "16:9", "def_duration": "8s",
+     "def_resolution": "1080p",
+     "note": "Top quality, generates matching audio + dialogue."},
+    {"id": "veo31fast", "name": "Veo 3.1 Fast (Google)", "kind": "video",
+     "endpoint": "fal-ai/veo3.1/fast",
+     "price": "~$0.15/s with audio",
+     "aspects": ["16:9", "9:16"],
+     "durations": ["4s", "6s", "8s"],
+     "resolutions": ["720p", "1080p", "4k"],
+     "def_aspect": "16:9", "def_duration": "8s",
+     "def_resolution": "1080p",
+     "note": "Veo 3.1 quality at draft speed and price."},
+    {"id": "seedance1pro", "name": "Seedance 1.0 Pro (ByteDance)",
+     "kind": "video",
+     "endpoint": "fal-ai/bytedance/seedance/v1/pro/text-to-video",
+     "price": "~$0.12/s",
+     "aspects": ["16:9", "9:16", "1:1"],
+     "durations": ["2", "3", "4", "5", "6", "7", "8", "9", "10",
+                   "11", "12"],
+     "resolutions": ["480p", "720p", "1080p"],
+     "def_aspect": "16:9", "def_duration": "5",
+     "def_resolution": "1080p",
+     "note": "Flexible durations, strong motion."},
+    {"id": "hailuo02pro", "name": "Hailuo-02 Pro (MiniMax)",
+     "kind": "video",
+     "endpoint": "fal-ai/minimax/hailuo-02/pro/text-to-video",
+     "price": "~$0.28 per video",
+     "aspects": None, "durations": None, "resolutions": None,
+     "def_aspect": None, "def_duration": None, "def_resolution": None,
+     "note": "Fixed format: 1080p, ~6s, physics-strong. Prompt only."},
+    {"id": "fluxdev", "name": "FLUX.1 dev (image)", "kind": "image",
+     "endpoint": "fal-ai/flux/dev",
+     "price": "~$0.025 per megapixel",
+     "aspects": ["16:9", "9:16", "1:1"],
+     "durations": None, "resolutions": None,
+     "def_aspect": "16:9", "def_duration": None, "def_resolution": None,
+     "note": "High-quality stills - thumbnails, posters, keyframes."},
+    {"id": "fluxschnell", "name": "FLUX.1 schnell (image)",
+     "kind": "image",
+     "endpoint": "fal-ai/flux/schnell",
+     "price": "~$0.003 per megapixel",
+     "aspects": ["16:9", "9:16", "1:1"],
+     "durations": None, "resolutions": None,
+     "def_aspect": "16:9", "def_duration": None, "def_resolution": None,
+     "note": "Fast, cheap stills for drafts."},
+]
+
+_FAL_IMAGE_SIZES = {"16:9": "landscape_16_9", "9:16": "portrait_16_9",
+                    "1:1": "square_hd"}
+
+
+def _fal_payload(model, prompt, aspect_ratio="", duration="",
+                 resolution=""):
+    """Build a fal.ai request body from the model's DOCUMENTED schema
+    only - a field is sent solely when the model's catalog entry lists
+    it, with the requested value when valid, else the default."""
+    payload = {"prompt": prompt}
+    if model.get("durations"):
+        payload["duration"] = (duration if duration
+                               in model["durations"]
+                               else model["def_duration"])
+    if model.get("resolutions"):
+        payload["resolution"] = (resolution if resolution
+                                 in model["resolutions"]
+                                 else model["def_resolution"])
+    aspect = aspect_ratio or model.get("def_aspect")
+    if model["kind"] == "image":
+        payload["image_size"] = _FAL_IMAGE_SIZES.get(
+            aspect, "landscape_16_9")
+        payload["num_images"] = 1
+    elif model.get("aspects"):
+        payload["aspect_ratio"] = (aspect if aspect in model["aspects"]
+                                   else model["def_aspect"])
+    if model["id"] in ("veo31", "veo31fast"):
+        payload["generate_audio"] = True
+    return payload
+
+
+def _fal_error_text(resp):
+    """fal.ai error bodies carry a human-readable "detail" - surface
+    it plainly (bad key, no balance, validation) instead of a code."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return (resp.text or f"HTTP {resp.status_code}")[:200]
+    detail = data.get("detail") if isinstance(data, dict) else None
+    if isinstance(detail, str) and detail.strip():
+        return detail.strip()[:240]
+    if isinstance(detail, list) and detail:
+        parts = []
+        for d in detail:
+            if isinstance(d, dict):
+                parts.append(str(d.get("msg") or d)[:120])
+            else:
+                parts.append(str(d)[:120])
+        if parts:
+            return "; ".join(parts)[:240]
+    if isinstance(data, dict) and data.get("message"):
+        return str(data["message"])[:240]
+    return f"HTTP {resp.status_code}"
+
+
+def _gen_public(st):
+    """A generator job as the UI may see it (never internal URLs with
+    no meaning to the page, never the key)."""
+    return {"id": st["id"], "status": st["status"],
+            "stage": st.get("stage", ""), "kind": st["kind"],
+            "model_name": st.get("model_name", ""),
+            "url": st.get("url"), "remote_url": st.get("remote_url"),
+            "error": st.get("error"),
+            "imported_job_id": st.get("imported_job_id")}
+
+
 class Api:
     # -- options -------------------------------------------------------
     def get_options(self):
@@ -305,7 +454,12 @@ class Api:
 
     # -- settings ------------------------------------------------------
     def get_settings(self):
-        return load_settings()
+        s = load_settings()
+        # The fal.ai key is a credential: the UI only ever learns
+        # WHETHER one is saved, never the key itself.
+        s["fal_key_set"] = bool((s.get("fal_key") or "").strip())
+        s.pop("fal_key", None)
+        return s
 
     def save_settings(self, settings):
         current = load_settings()
@@ -1079,6 +1233,352 @@ class Api:
         m["posting"] = pkg
         _save_job(job_id)
         return {"ok": True, "package": pkg, "cached": False}
+
+    # -- Studio: Title & Hook Generator ---------------------------------
+    def ai_titles(self, topic="", job_id=""):
+        """10 titles + 5 hooks with scores. Built-in AI when ready,
+        honest extractive "basic" mode from a project transcript
+        otherwise (see pipeline.generate_titles)."""
+        words = None
+        if job_id:
+            _load_library()
+            job = JOBS.get(job_id)
+            if not job:
+                return {"ok": False, "error": "Project not found."}
+            words = job.get("words") or None
+            if not words and not (topic or "").strip():
+                return {"ok": False, "error": "That project has no "
+                                              "transcript yet."}
+        settings = load_settings()
+        res = generate_titles(words=words, topic=topic or "",
+                              genre=settings.get("genre", ""))
+        return {"ok": True, **res}
+
+    # -- Studio: AI Scriptwriter -----------------------------------------
+    def ai_script(self, topic="", tone="Energetic", seconds=60):
+        """Hook / Body / CTA script from the Built-in AI. No fake
+        fallback: without the model this returns needs_model."""
+        return generate_script(topic or "", tone or "Energetic",
+                               seconds)
+
+    # -- Studio: Transcript tool ------------------------------------------
+    def get_transcript(self, job_id):
+        """A project's full transcript: plain text + timed segments."""
+        _load_library()
+        job = JOBS.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Project not found."}
+        words = sorted(job.get("words") or [],
+                       key=lambda w: w["start"])
+        if not words:
+            return {"ok": False, "error": "That project has no "
+                                          "transcript yet."}
+        segments = []
+        cur, cur_start = [], None
+        for w in words:
+            if cur_start is None:
+                cur_start = w["start"]
+            cur.append(w["word"])
+            if w["word"].rstrip().endswith((".", "!", "?")) \
+                    or len(cur) >= 14:
+                segments.append({"start": round(cur_start, 2),
+                                 "text": " ".join(cur)})
+                cur, cur_start = [], None
+        if cur:
+            segments.append({"start": round(cur_start, 2),
+                             "text": " ".join(cur)})
+        return {"ok": True, "title": job.get("title", ""),
+                "text": " ".join(w["word"] for w in words),
+                "segments": segments,
+                "word_count": len(words),
+                "duration": job.get("duration", 0)}
+
+    def export_transcript(self, job_id, fmt="txt"):
+        """Write the full transcript as .txt/.srt/.vtt next to the
+        project and return its download URL."""
+        _load_library()
+        job = JOBS.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Project not found."}
+        words = job.get("words") or []
+        if not words:
+            return {"ok": False, "error": "That project has no "
+                                          "transcript yet."}
+        fmt = (fmt or "txt").lower()
+        if fmt not in ("txt", "srt", "vtt"):
+            return {"ok": False, "error": "Unknown format."}
+        folder = os.path.join(BASE_DIR, "work", job_id)
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "transcript." + fmt)
+        try:
+            if fmt == "srt":
+                write_srt(words, 0, float(job.get("duration") or 0)
+                          or words[-1]["end"], path)
+            elif fmt == "vtt":
+                write_vtt(words, 0, float(job.get("duration") or 0)
+                          or words[-1]["end"], path)
+            else:
+                res = self.get_transcript(job_id)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(s["text"]
+                                      for s in res["segments"]))
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False,
+                    "error": "Export failed: " + str(e)[:160]}
+        return {"ok": True, "path": path,
+                "url": self._download_url(job_id, path)}
+
+    # -- Studio: AI Generator (fal.ai, user's own key) -------------------
+    def gen_models(self):
+        """The fal.ai model catalog + whether a key is saved. The key
+        itself never leaves the server."""
+        settings = load_settings()
+        return {"ok": True,
+                "has_key": bool((settings.get("fal_key") or "").strip()),
+                "models": FAL_MODELS}
+
+    def gen_video_start(self, model_id="", prompt="",
+                        aspect_ratio="", duration="", resolution=""):
+        """Submit a generation to fal.ai's queue (server-side, so the
+        user's key is never exposed to the page)."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        settings = load_settings()
+        key = (settings.get("fal_key") or "").strip()
+        if not key:
+            return {"ok": False, "error": "no_key",
+                    "message": "No fal.ai API key saved yet. Add yours "
+                               "in Settings - one key unlocks every "
+                               "model here, billed by fal.ai directly."}
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return {"ok": False, "error": "Describe the video or "
+                                          "image first."}
+        model = next((m for m in FAL_MODELS if m["id"] == model_id),
+                     None)
+        if model is None:
+            return {"ok": False, "error": "Unknown model."}
+        payload = _fal_payload(model, prompt, aspect_ratio, duration,
+                               resolution)
+        try:
+            r = requests.post(
+                "https://queue.fal.run/" + model["endpoint"],
+                headers={"Authorization": "Key " + key,
+                         "Content-Type": "application/json"},
+                json=payload, timeout=60)
+        except requests.RequestException as e:
+            return {"ok": False, "error": "Couldn't reach fal.ai: "
+                                          + str(e)[:160]}
+        if r.status_code >= 400:
+            return {"ok": False, "error": "fal_error",
+                    "message": "fal.ai said: " + _fal_error_text(r)}
+        try:
+            data = r.json()
+            request_id = data["request_id"]
+            status_url = data["status_url"]
+            response_url = data["response_url"]
+        except (ValueError, KeyError):
+            return {"ok": False,
+                    "error": "fal.ai returned an unexpected reply."}
+        gid = uuid.uuid4().hex[:12]
+        _GEN_JOBS[gid] = {
+            "id": gid, "status": "queued", "stage": "In queue on fal.ai",
+            "model_id": model["id"], "model_name": model["name"],
+            "kind": model["kind"], "prompt": prompt[:200],
+            "status_url": status_url, "response_url": response_url,
+            "created": time.time(), "url": None, "remote_url": None,
+            "error": None, "imported_job_id": None}
+        return {"ok": True, "gen_id": gid, "status": "queued"}
+
+    def gen_video_status(self, gen_id):
+        """Poll fal.ai for one generation; on completion, download
+        the result next to the app so it can be previewed and sent
+        to the Library like any other video."""
+        st = _GEN_JOBS.get(gen_id or "")
+        if not st:
+            return {"ok": False, "error": "That generation is gone "
+                                          "(the app was restarted)."}
+        if st["status"] in ("done", "error"):
+            return {"ok": True, **_gen_public(st)}
+        if time.time() - st["created"] > 1800:
+            st["status"] = "error"
+            st["error"] = "Timed out waiting for fal.ai (30 min)."
+            return {"ok": True, **_gen_public(st)}
+        settings = load_settings()
+        key = (settings.get("fal_key") or "").strip()
+        headers = {"Authorization": "Key " + key}
+        try:
+            r = requests.get(st["status_url"], headers=headers,
+                             timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except (requests.RequestException, ValueError):
+            st["stage"] = "Connection hiccup - still waiting…"
+            return {"ok": True, **_gen_public(st)}
+        status = (data.get("status") or "").upper()
+        if status == "IN_QUEUE":
+            st["status"] = "queued"
+            pos = data.get("queue_position")
+            st["stage"] = ("In queue on fal.ai"
+                           + (f" (#{pos})" if pos else "") + "…")
+            return {"ok": True, **_gen_public(st)}
+        if status == "IN_PROGRESS":
+            st["status"] = "running"
+            st["stage"] = "Generating on fal.ai…"
+            return {"ok": True, **_gen_public(st)}
+        if status != "COMPLETED":
+            st["status"] = "error"
+            st["error"] = ("fal.ai reported status: "
+                           + (status or "unknown"))
+            return {"ok": True, **_gen_public(st)}
+        # Completed: fetch the result payload.
+        try:
+            r = requests.get(st["response_url"], headers=headers,
+                             timeout=60)
+            if r.status_code >= 400:
+                st["status"] = "error"
+                st["error"] = "fal.ai said: " + _fal_error_text(r)
+                return {"ok": True, **_gen_public(st)}
+            payload = r.json()
+        except (requests.RequestException, ValueError) as e:
+            st["status"] = "error"
+            st["error"] = "Couldn't fetch the result: " + str(e)[:160]
+            return {"ok": True, **_gen_public(st)}
+        remote = None
+        if isinstance(payload.get("video"), dict):
+            remote = payload["video"].get("url")
+        if not remote and payload.get("images"):
+            first = payload["images"][0]
+            if isinstance(first, dict):
+                remote = first.get("url")
+        if not remote:
+            st["status"] = "error"
+            st["error"] = "fal.ai finished but returned no file."
+            return {"ok": True, **_gen_public(st)}
+        st["remote_url"] = remote
+        # Download locally so the file survives + can enter the Library.
+        folder_name = "gen-" + st["id"]
+        folder = os.path.join(BASE_DIR, "work", folder_name)
+        os.makedirs(folder, exist_ok=True)
+        ext = ".png" if st["kind"] == "image" else ".mp4"
+        if ".jpg" in remote or ".jpeg" in remote:
+            ext = ".jpg"
+        fname = "generated" + ext
+        fpath = os.path.join(folder, fname)
+        try:
+            with requests.get(remote, stream=True, timeout=300) as dr:
+                dr.raise_for_status()
+                with open(fpath, "wb") as f:
+                    for chunk in dr.iter_content(1 << 20):
+                        if chunk:
+                            f.write(chunk)
+            st["local_path"] = fpath
+            st["url"] = "/files/" + folder_name + "/" + fname
+        except requests.RequestException:
+            st["url"] = remote  # preview straight from fal.ai instead
+        st["status"] = "done"
+        st["stage"] = "Done"
+        return {"ok": True, **_gen_public(st)}
+
+    def gen_video_import(self, gen_id):
+        """Send a finished generated VIDEO into the Library through
+        the normal import path, so it can be clipped like any video."""
+        st = _GEN_JOBS.get(gen_id or "")
+        if not st or st["status"] != "done":
+            return {"ok": False, "error": "That generation isn't "
+                                          "finished yet."}
+        if st["kind"] != "video":
+            return {"ok": False, "error": "Only videos can be sent "
+                                          "to the Library."}
+        if st.get("imported_job_id"):
+            return {"ok": True, "job_id": st["imported_job_id"],
+                    "cached": True}
+        path = st.get("local_path")
+        if not path or not os.path.isfile(path):
+            return {"ok": False, "error": "The generated file isn't "
+                                          "on this PC (download "
+                                          "failed) - use the fal.ai "
+                                          "link instead."}
+        res = self.import_file(path)
+        if res.get("ok"):
+            st["imported_job_id"] = res["job_id"]
+        return res
+
+    # -- Studio: Video Enhancer -------------------------------------------
+    def enhance_start(self, source="", job_id=""):
+        """Queue an enhance run (upscale to 1080 + sharpen) for a
+        local file path or a Library project."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        path = (source or "").strip().strip('"').strip("'")
+        if job_id:
+            _load_library()
+            job = JOBS.get(job_id)
+            if not job:
+                return {"ok": False, "error": "Project not found."}
+            path = job.get("video_path") or ""
+        if not path or not os.path.isfile(path):
+            return {"ok": False, "error": "Pick a Library project or "
+                                          "paste a local video file "
+                                          "path first."}
+        eid = uuid.uuid4().hex[:12]
+        _ENHANCE_JOBS[eid] = {"id": eid, "status": "running", "pct": 0,
+                              "stage": "Starting", "error": None,
+                              "url": None, "source_name":
+                              os.path.basename(path)}
+        t = threading.Thread(target=self._run_enhance,
+                             args=(eid, path), daemon=True)
+        t.start()
+        return {"ok": True, "id": eid}
+
+    def _run_enhance(self, eid, src):
+        st = _ENHANCE_JOBS[eid]
+
+        def cb(pct, text):
+            st["pct"] = max(0, min(100, int(pct)))
+            st["stage"] = text
+
+        try:
+            settings = load_settings()
+            folder = os.path.join(BASE_DIR, "work", "enhance-" + eid)
+            os.makedirs(folder, exist_ok=True)
+            out = os.path.join(folder, "enhanced.mp4")
+            enhance_video(src, out, progress_cb=cb,
+                          quality_tier=settings.get(
+                              "quality_tier", "maximum"))
+            st["status"] = "done"
+            st["pct"] = 100
+            st["stage"] = "Done"
+            st["url"] = "/files/enhance-" + eid + "/enhanced.mp4"
+            st["folder"] = folder
+        except Exception as e:  # noqa: BLE001 - surfaced to the UI
+            st["status"] = "error"
+            st["error"] = str(e)[:300]
+
+    def enhance_status(self, eid):
+        st = _ENHANCE_JOBS.get(eid or "")
+        if not st:
+            return {"ok": False, "error": "That enhance job is gone "
+                                          "(the app was restarted)."}
+        return {"ok": True, **st}
+
+    def enhance_open_folder(self, eid):
+        st = _ENHANCE_JOBS.get(eid or "")
+        folder = (st or {}).get("folder") or os.path.join(
+            BASE_DIR, "work", "enhance-" + (eid or ""))
+        os.makedirs(folder, exist_ok=True)
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)  # noqa: S606
+            elif sys.platform == "darwin":
+                subprocess.run(["open", folder])
+            else:
+                subprocess.run(["xdg-open", folder])
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True}
 
     # -- per-clip trim -------------------------------------------------
     def trim_moment(self, job_id, index, start, end):

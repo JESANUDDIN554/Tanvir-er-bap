@@ -871,6 +871,264 @@ def generate_posting_package(words, moment, genre=""):
 
 
 # ---------------------------------------------------------------------------
+# Studio tools: Title & Hook Generator, AI Scriptwriter, Video Enhancer.
+# The prompts are plain templates in THIS file (deliberately NOT in the
+# encrypted corepack): they are product copy, not secrets, and keeping
+# them here means Studio features never need a corepack rebuild.
+# ---------------------------------------------------------------------------
+
+TITLES_PROMPT_TEMPLATE = """You are an expert short-form video title \
+writer for Facebook Reels / TikTok / YouTube Shorts.
+
+Source material:
+{source}
+
+Write 10 scroll-stopping titles and 5 opening hooks for a clip from \
+this material. Rules:
+- Titles: max 60 characters, punchy, curiosity-driven, no clickbait lies.
+- Hooks: the first spoken line / on-screen text, max 12 words each.
+- Score every item 0-100 for viral potential (honest, spread the scores).
+- Reply with ONLY a JSON object, no prose:
+{{"titles": [{{"text": "...", "score": 87}}], \
+"hooks": [{{"text": "...", "score": 82}}]}}"""
+
+SCRIPT_PROMPT_TEMPLATE = """You are a short-form video scriptwriter.
+
+Topic: {topic}
+Tone: {tone}
+Target length: about {seconds} seconds spoken (~{nwords} words total).
+
+Write the script with exactly these three section headers on their \
+own lines: HOOK, BODY, CTA.
+- HOOK: the first 3 seconds - one or two lines that stop the scroll.
+- BODY: the main content, spoken naturally, short sentences.
+- CTA: one line telling the viewer what to do next.
+Reply with ONLY the script text (with the three headers), no notes."""
+
+
+def _words_text(words, cap=6000):
+    return " ".join(w["word"] for w in words or [])[:cap]
+
+
+def _basic_titles(words):
+    """Extractive titles/hooks straight from the transcript (no AI).
+
+    Every string is verbatim transcript text; scores are a simple
+    energy heuristic, normalized by rank. Labeled "basic" by callers -
+    never presented as AI work."""
+    text = _words_text(words, cap=20000)
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text)
+             if len(s.strip().split()) >= 3]
+
+    def _score(s):
+        toks = [_clean_word(t) for t in s.split()]
+        energy = sum(1 for t in toks if t in OFFLINE_ENERGY_WORDS)
+        bang = 2 if s.endswith("!") else 1 if s.endswith("?") else 0
+        return energy * 3 + bang * 2 + min(len(toks), 20) * 0.1
+
+    def _trim(s, n=58):
+        s = s.strip()
+        return s if len(s) <= n else s[:n].rsplit(" ", 1)[0] + "…"
+
+    ranked = sorted(sents, key=_score, reverse=True)
+    titles, seen = [], set()
+    for s in ranked:
+        t = _trim(s)
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            titles.append(t)
+        if len(titles) == 10:
+            break
+    if len(titles) < 10:
+        # Short transcripts have few full sentences: pad with more
+        # verbatim fragments (comma clauses, sentence openers, then
+        # plain word windows) - still 100% transcript text.
+        frags = []
+        for s in ranked:
+            frags.extend(p.strip() for p in s.split(",")
+                         if len(p.strip().split()) >= 4)
+            frags.append(" ".join(s.split()[:7]))
+        words_all = text.split()
+        for off in range(0, max(0, len(words_all) - 5), 5):
+            frags.append(" ".join(words_all[off:off + 9]))
+        for fr in frags:
+            t = _trim(fr)
+            if t and len(t.split()) >= 3 and t.lower() not in seen:
+                seen.add(t.lower())
+                titles.append(t)
+            if len(titles) == 10:
+                break
+    hooks = []
+    for s in ranked:
+        if s.endswith(("!", "?")):
+            hooks.append(_trim(" ".join(s.split()[:12]), 70))
+        if len(hooks) == 5:
+            break
+    if len(hooks) < 5 and ranked:
+        opener = _trim(" ".join(text.split()[:10]), 60)
+        if opener and opener not in hooks:
+            hooks.insert(0, opener)
+
+    def _pack(items, top):
+        return [{"text": t, "score": max(35, top - 6 * i)}
+                for i, t in enumerate(items)]
+
+    return _pack(titles, 88), _pack(hooks, 84)
+
+
+def generate_titles(words=None, topic="", genre=""):
+    """10 titles + 5 hooks, each with a 0-100 score.
+
+    Written by the Built-in AI when its model is downloaded ("ai"
+    mode). Without the model, a transcript still yields honest
+    extractive titles ("basic" mode). With neither a model nor a
+    transcript there is nothing truthful to generate from, so the
+    result is mode "needs_model" and the UI offers the download.
+    """
+    words = words or []
+    topic = (topic or "").strip()
+    try:
+        import local_ai
+        ready = local_ai.model_ready()
+    except Exception:  # noqa: BLE001 - local AI unavailable
+        ready = False
+    if ready:
+        try:
+            if words:
+                source = ("Transcript:\n" + _words_text(words))
+                if topic:
+                    source += "\n\nCreator's angle: " + topic[:300]
+            else:
+                source = "Topic: " + topic[:500]
+            raw = local_ai.chat([{
+                "role": "user",
+                "content": TITLES_PROMPT_TEMPLATE.format(source=source)}])
+            data = local_ai.extract_json(raw)
+
+            def _clean(items, limit):
+                out = []
+                for it in items or []:
+                    if isinstance(it, dict):
+                        t = str(it.get("text", "")).strip()
+                        try:
+                            sc = int(float(it.get("score", 50)))
+                        except (TypeError, ValueError):
+                            sc = 50
+                    else:
+                        t, sc = str(it).strip(), 50
+                    if t:
+                        out.append({"text": t[:90],
+                                    "score": max(0, min(100, sc))})
+                    if len(out) == limit:
+                        break
+                return out
+
+            titles = _clean(data.get("titles"), 10)
+            hooks = _clean(data.get("hooks"), 5)
+            if titles:
+                return {"titles": titles, "hooks": hooks, "mode": "ai",
+                        "note": "Written by the Built-in AI."}
+            raise RuntimeError("the model returned no usable titles")
+        except Exception as e:  # noqa: BLE001 - honest fallback
+            if words:
+                t, h = _basic_titles(words)
+                return {"titles": t, "hooks": h, "mode": "basic",
+                        "note": ("Built-in AI request failed (%s) - "
+                                 "basic titles taken straight from the "
+                                 "transcript instead." % str(e)[:80])}
+            return {"titles": [], "hooks": [], "mode": "needs_model",
+                    "note": ("The Built-in AI didn't answer (%s). Try "
+                             "again in a moment." % str(e)[:80])}
+    if words:
+        t, h = _basic_titles(words)
+        return {"titles": t, "hooks": h, "mode": "basic",
+                "note": ("Basic mode (Built-in AI not downloaded): "
+                         "titles are verbatim lines from the "
+                         "transcript, scored by a simple heuristic.")}
+    return {"titles": [], "hooks": [], "mode": "needs_model",
+            "note": ("Download the Built-in AI (~9 GB, one time) to "
+                     "write titles from a topic - or pick a Library "
+                     "project to get basic titles from its transcript.")}
+
+
+def generate_script(topic, tone="Energetic", seconds=60):
+    """A Hook / Body / CTA short-form script from the Built-in AI.
+
+    There is deliberately NO extractive fallback: a script invented
+    by templates would be fake AI work. Without the model the result
+    is an honest needs_model state and the UI offers the download."""
+    topic = (topic or "").strip()
+    if not topic:
+        return {"ok": False, "error": "empty_topic",
+                "message": "Describe what the video is about first."}
+    try:
+        import local_ai
+        ready = local_ai.model_ready()
+    except Exception:  # noqa: BLE001
+        ready = False
+    if not ready:
+        return {"ok": False, "error": "needs_model",
+                "message": ("The AI Scriptwriter needs the Built-in "
+                            "AI model. Download it once (~9 GB) and "
+                            "it works fully offline, forever.")}
+    try:
+        seconds = max(15, min(300, int(seconds)))
+    except (TypeError, ValueError):
+        seconds = 60
+    try:
+        raw = local_ai.chat([{
+            "role": "user",
+            "content": SCRIPT_PROMPT_TEMPLATE.format(
+                topic=topic[:600], tone=(tone or "Energetic")[:40],
+                seconds=seconds, nwords=int(seconds * 2.5))}])
+    except Exception as e:  # noqa: BLE001 - surfaced, never faked
+        return {"ok": False, "error": "ai_failed",
+                "message": "Built-in AI request failed: " + str(e)[:200]}
+    script = (raw or "").strip()
+    if len(script) < 40:
+        return {"ok": False, "error": "ai_failed",
+                "message": "The Built-in AI returned an empty script - "
+                           "try again."}
+    return {"ok": True, "script": script, "mode": "ai"}
+
+
+def enhance_video(video_path, out_path, progress_cb=None,
+                  quality_tier="maximum"):
+    """Basic enhancer: upscale to a 1080 short side (Lanczos) when the
+    source is smaller, then an unsharp pass. Honestly a sharpen +
+    upscale - NOT an AI upscaler. Returns out_path."""
+    if not os.path.isfile(video_path):
+        raise RuntimeError("Video file not found: " + str(video_path))
+    W, H, _fps = probe_video(video_path)
+    if not W or not H:
+        raise RuntimeError("Could not read the video's dimensions.")
+    duration = probe_duration(video_path) or 0.0
+    short = min(W, H)
+    if short < 1080:
+        f = 1080.0 / short
+        tw = int(round(W * f / 2.0)) * 2
+        th = int(round(H * f / 2.0)) * 2
+        vf = (f"scale={tw}:{th}:flags=lanczos,"
+              "unsharp=5:5:0.8:5:5:0.0")
+    else:
+        vf = "unsharp=5:5:0.8:5:5:0.0"
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)),
+                exist_ok=True)
+    cmd = (["ffmpeg", "-y", "-i", video_path, "-vf", vf,
+            "-map", "0:v:0", "-map", "0:a?"]
+           + _encode_args(quality_tier)
+           + ["-c:a", "aac", "-b:a", "192k", out_path])
+    _run_ffmpeg_progress(cmd, duration, progress_cb, 3, 97,
+                         "Enhancing (upscale + sharpen)")
+    if not os.path.isfile(out_path) \
+            or os.path.getsize(out_path) < 1024:
+        raise RuntimeError("Enhance produced no output file.")
+    if progress_cb:
+        progress_cb(100, "Done")
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # ASS caption builder (karaoke word highlight + hook overlay)
 # ---------------------------------------------------------------------------
 

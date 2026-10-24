@@ -27,10 +27,18 @@ let clipCount = 8;
 let genre = "";
 /* navigation history state (Back button / logo home) */
 let navStack = [];
-let navNow = { view: "wizard", step: 1 };
+let navNow = { view: "hub" };
 let navApplying = false;
 let lastWizardStep = 1;
 let maxStepReached = 1;
+/* Studio hub + tool views (hub is home; tools are overlay views like
+   Library / Caption Remover) */
+let hubOpen = true;
+let toolOpen = null;
+const TOOL_VIEWS = {
+  generator: "generatorView", titles: "titlesView", script: "scriptView",
+  transcript: "transcriptView", enhancer: "enhancerView",
+};
 
 const $ = (id) => document.getElementById(id);
 
@@ -71,7 +79,7 @@ function setStep(n) {
     d.classList.toggle("done", s < n);
   });
   // navigation tracking: wizard step changes are history entries
-  if (!libraryOpen && !removerOpen) {
+  if (!libraryOpen && !removerOpen && !hubOpen && !toolOpen) {
     lastWizardStep = n;
     if (n > maxStepReached) maxStepReached = n;
     noteNav({ view: "wizard", step: n });
@@ -616,6 +624,24 @@ async function refreshLocalAiStatus() {
     show(btn); hide(barWrap); pct.textContent = "";
     if (st.error) {
       txt.textContent = "Download failed: " + st.error + " Check your connection and try again.";
+    }
+  }
+  // Studio hub card mirrors the same Built-in AI state.
+  const hBtn = $("hubAiDownloadBtn"), hTxt = $("hubAiText"),
+    hWrap = $("hubAiBarWrap"), hBar = $("hubAiBar"), hPct = $("hubAiPct");
+  if (hBtn && hTxt) {
+    if (st.ready) {
+      hTxt.textContent = "Built-in AI ready ✓ — the model is on your PC and works fully offline.";
+      hide(hBtn); hide(hWrap); hPct.textContent = "";
+    } else if (st.downloading) {
+      hide(hBtn); show(hWrap);
+      hBar.style.width = (st.pct || 0) + "%";
+      hPct.textContent = (st.stage || "Downloading…") + " — " + Math.round(st.pct || 0) + "%";
+    } else {
+      show(hBtn); hide(hWrap); hPct.textContent = "";
+      if (st.error) {
+        hTxt.textContent = "Download failed: " + st.error + " Check your connection and try again.";
+      }
     }
   }
 }
@@ -1449,13 +1475,19 @@ function noteNav(entry) {
 function applyNav(entry) {
   navApplying = true;
   try {
-    if (entry.view === "library") {
+    if (entry.view === "hub") {
+      showHub();
+    } else if (entry.view === "library") {
       showLibrary();
     } else if (entry.view === "remover") {
       showRemover();
+    } else if (TOOL_VIEWS[entry.view]) {
+      showTool(entry.view);
     } else {
       if (removerOpen) hideRemover();
       if (libraryOpen) hideLibrary();
+      closeStudioViews();
+      show($("step1"));
       setStep(entry.step || 1);
       const sec = $("step" + (entry.step || 1));
       if (sec) setTimeout(() =>
@@ -1479,12 +1511,12 @@ function goBack() {
 function updateBackBtn() {
   const b = $("backBtn");
   if (!b) return;
-  const atRoot = navNow.view === "wizard" && (navNow.step || 1) === 1;
+  const atRoot = navNow.view === "hub";
   b.disabled = navStack.length === 0 && atRoot;
 }
 function resetNav() {
   navStack = [];
-  navNow = { view: "wizard", step: 1 };
+  navNow = { view: "hub" };
   lastWizardStep = 1;
   maxStepReached = 1;
   updateBackBtn();
@@ -1492,7 +1524,7 @@ function resetNav() {
 $("backBtn").addEventListener("click", goBack);
 document.querySelectorAll(".step-dot").forEach((d) => {
   d.addEventListener("click", () => {
-    if (libraryOpen || removerOpen) return;
+    if (libraryOpen || removerOpen || hubOpen || toolOpen) return;
     const target = parseInt(d.dataset.step, 10);
     if (!target || target > maxStepReached) return;  // reached steps only
     if (navNow.view === "wizard" && (navNow.step || 1) === target) return;
@@ -1501,12 +1533,13 @@ document.querySelectorAll(".step-dot").forEach((d) => {
   });
 });
 /* Logo = Home (Addendum 8a): a navigation, never a reset - the
-   current project stays intact and can be re-entered any time. */
+   current project stays intact and can be re-entered any time.
+   Home is the Studio hub now. */
 function goHome() {
-  if (navNow.view === "wizard" && (navNow.step || 1) === 1
-      && !libraryOpen && !removerOpen) return;
-  noteNav({ view: "wizard", step: 1 });
-  applyNav({ view: "wizard", step: 1 });
+  if (navNow.view === "hub" && !libraryOpen && !removerOpen
+      && !toolOpen) return;
+  noteNav({ view: "hub" });
+  applyNav({ view: "hub" });
 }
 document.querySelectorAll(".home-link").forEach((el) => {
   el.addEventListener("click", goHome);
@@ -1519,6 +1552,7 @@ function showLibrary() {
   noteNav({ view: "library", step: lastWizardStep });
   $("libraryBtn").classList.add("on");
   $("removerBtn").classList.remove("on");
+  closeStudioViews();
   libraryOpen = true;
   stopPoll();
   hide($("step1")); hide($("step2")); hide($("step3"));
@@ -1547,7 +1581,7 @@ function openProject(id) {
 }
 
 $("libraryBtn").addEventListener("click", showLibrary);
-$("libBackBtn").addEventListener("click", hideLibrary);
+$("libBackBtn").addEventListener("click", backToStudio);
 
 /* ---------------- Caption Remover ---------------- */
 let removerOpen = false;
@@ -1561,6 +1595,7 @@ function showRemover() {
   noteNav({ view: "remover", step: lastWizardStep });
   $("removerBtn").classList.add("on");
   $("libraryBtn").classList.remove("on");
+  closeStudioViews();
   removerOpen = true;
   libraryOpen = false;
   stopPoll();
@@ -1580,7 +1615,7 @@ function hideRemover() {
   else { setStep(1); refreshQueue(); }
 }
 $("removerBtn").addEventListener("click", showRemover);
-$("removerBackBtn").addEventListener("click", hideRemover);
+$("removerBackBtn").addEventListener("click", backToStudio);
 
 function removerRegion() {
   if (removerRegionPreset === "auto") return { auto: true };
@@ -2024,6 +2059,536 @@ $("studioApplyAll").addEventListener("click", async () => {
     toast(`Captions applied to all ${mis.length} clips`);
 });
 
+/* ---------------- Studio hub + tools ----------------
+   The hub is home. Tool views follow the Library / Caption Remover
+   overlay pattern: noteNav on entry, applyNav dispatches back. */
+function backToStudio() {
+  if (navStack.length) goBack();
+  else applyNav({ view: "hub" });
+}
+
+function closeStudioViews() {
+  hubOpen = false;
+  hide($("hubView"));
+  if (toolOpen) { hide($(TOOL_VIEWS[toolOpen])); toolOpen = null; }
+  stopGenPoll();
+  stopEnhancerPoll();
+  const sb = $("studioBtn");
+  if (sb) sb.classList.remove("on");
+}
+
+function closeLibraryRemoverRaw() {
+  libraryOpen = false;
+  removerOpen = false;
+  hide($("libraryView"));
+  hide($("removerView"));
+  $("libraryBtn").classList.remove("on");
+  $("removerBtn").classList.remove("on");
+  if (removerTimer) { clearInterval(removerTimer); removerTimer = null; }
+}
+
+function showHub() {
+  noteNav({ view: "hub" });
+  closeLibraryRemoverRaw();
+  if (toolOpen) { hide($(TOOL_VIEWS[toolOpen])); toolOpen = null; }
+  stopGenPoll();
+  stopEnhancerPoll();
+  stopPoll();
+  hubOpen = true;
+  hide($("step1")); hide($("step2")); hide($("step3"));
+  show($("hubView"));
+  $("studioBtn").classList.add("on");
+  refreshLocalAiStatus();
+  startLocalAiPolling();
+}
+
+function showWizard(step) {
+  step = step || 1;
+  if (navNow.view === "wizard" && (navNow.step || 1) === step
+      && !libraryOpen && !removerOpen && !hubOpen && !toolOpen) return;
+  noteNav({ view: "wizard", step });
+  applyNav({ view: "wizard", step });
+}
+
+function showTool(name) {
+  noteNav({ view: name, step: lastWizardStep });
+  closeLibraryRemoverRaw();
+  hubOpen = false;
+  hide($("hubView"));
+  $("studioBtn").classList.remove("on");
+  if (toolOpen && toolOpen !== name) hide($(TOOL_VIEWS[toolOpen]));
+  stopPoll();
+  stopGenPoll();
+  stopEnhancerPoll();
+  toolOpen = name;
+  hide($("step1")); hide($("step2")); hide($("step3"));
+  show($(TOOL_VIEWS[name]));
+  if (name === "generator") initGenerator();
+  else if (name === "titles")
+    fillProjectSelect($("titlesProject"), "No project — topic only");
+  else if (name === "transcript")
+    fillProjectSelect($("transcriptProject"), "Pick a project…");
+  else if (name === "enhancer")
+    fillProjectSelect($("enhancerProject"), "Pick a project…");
+}
+
+$("studioBtn").addEventListener("click", goHome);
+document.querySelectorAll(".tool-back").forEach((b) =>
+  b.addEventListener("click", backToStudio));
+
+/* hub: quick import mirrors the Step-1 controls exactly */
+$("hubImportBtn").addEventListener("click", () => {
+  const url = $("hubUrlInput").value.trim();
+  if (!url) { toast("Paste a video link first", true); return; }
+  $("urlInput").value = url;
+  showWizard(1);
+  $("importBtn").click();
+});
+$("hubFileBtn").addEventListener("click", () => {
+  const p = $("hubPathInput").value.trim();
+  if (!p) { toast("Paste a local video file path first", true); return; }
+  $("localPathInput").value = p;
+  showWizard(1);
+  $("localFileBtn").click();
+});
+
+/* hub: tool cards */
+document.querySelectorAll(".tool-card").forEach((card) => {
+  card.addEventListener("click", () => {
+    const tool = card.dataset.tool;
+    if (tool === "clipmaker") showWizard(1);
+    else if (tool === "remover") showRemover();
+    else if (tool === "library") showLibrary();
+    else if (tool === "captionstudio") {
+      showLibrary();
+      toast("Pick a clip in the Library, then open Caption Studio on it");
+    } else if (tool === "settings") $("settingsBtn").click();
+    else showTool(tool);
+  });
+});
+
+/* hub: tool search filter */
+$("hubSearch").addEventListener("input", () => {
+  const q = $("hubSearch").value.trim().toLowerCase();
+  let any = false;
+  document.querySelectorAll(".tool-card").forEach((card) => {
+    const hit = !q || (card.dataset.name || "").includes(q)
+      || card.textContent.toLowerCase().includes(q);
+    card.style.display = hit ? "" : "none";
+    if (hit) any = true;
+  });
+  $("hubNoMatch").classList.toggle("hidden", any);
+});
+
+/* hub: Built-in AI download button (mirrors the Step-2 card) */
+async function startAiDownload() {
+  try {
+    await fetch("/api/local-ai/download", { method: "POST" });
+  } catch (e) { /* the status poll below will surface any problem */ }
+  startLocalAiPolling();
+  refreshLocalAiStatus();
+}
+$("hubAiDownloadBtn").addEventListener("click", startAiDownload);
+document.querySelectorAll(".ai-download-btn").forEach((b) =>
+  b.addEventListener("click", async () => {
+    await startAiDownload();
+    toast("Built-in AI download started — progress shows on the Studio home");
+  }));
+
+/* shared: fill a <select> with Library projects */
+async function fillProjectSelect(sel, firstLabel) {
+  if (!sel) return;
+  const cur = sel.value;
+  let projects = [];
+  try {
+    const res = await api.library();
+    projects = res.projects || [];
+  } catch (e) { /* keep the placeholder only */ }
+  sel.innerHTML = "";
+  const first = document.createElement("option");
+  first.value = "";
+  first.textContent = firstLabel;
+  sel.appendChild(first);
+  projects.forEach((p) => {
+    const o = document.createElement("option");
+    o.value = p.job_id;
+    o.textContent = p.title || "Untitled video";
+    sel.appendChild(o);
+  });
+  if (cur) sel.value = cur;
+}
+
+function copyText(text, okMsg) {
+  const done = () => toast(okMsg || "Copied");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done)
+      .catch(() => fallbackCopy(text, done));
+  } else fallbackCopy(text, done);
+}
+function fallbackCopy(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); done(); }
+  catch (e) { toast("Copy failed — select and copy manually", true); }
+  ta.remove();
+}
+
+/* ---------------- Studio: AI Video Generator (fal.ai) ---------------- */
+let genModels = [];
+let genTimer = null;
+let genCurrentId = null;
+
+function stopGenPoll() {
+  if (genTimer) { clearInterval(genTimer); genTimer = null; }
+}
+
+async function initGenerator() {
+  stopGenPoll();
+  genCurrentId = null;
+  hide($("genResult"));
+  hide($("genError"));
+  $("genStatusText").textContent = "";
+  let res;
+  try { res = await api.gen_models(); }
+  catch (e) {
+    $("genError").textContent = "Couldn't reach the local backend — is the app running?";
+    show($("genError"));
+    return;
+  }
+  genModels = res.models || [];
+  const hasKey = !!res.has_key;
+  $("genNoKey").classList.toggle("hidden", hasKey);
+  $("genControls").classList.toggle("hidden", !hasKey);
+  if (!hasKey) return;
+  const sel = $("genModel");
+  const cur = sel.value;
+  sel.innerHTML = "";
+  genModels.forEach((m) => {
+    const o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = `${m.name} — ${m.price}`;
+    sel.appendChild(o);
+  });
+  if (cur && genModels.some((m) => m.id === cur)) sel.value = cur;
+  genModelChanged();
+}
+
+function genModelDef() {
+  return genModels.find((m) => m.id === $("genModel").value)
+    || genModels[0];
+}
+
+function fillGenSelect(sel, values, def) {
+  sel.innerHTML = "";
+  (values || []).forEach((v) => {
+    const o = document.createElement("option");
+    o.value = v;
+    o.textContent = v;
+    sel.appendChild(o);
+  });
+  if (def) sel.value = def;
+}
+
+function genModelChanged() {
+  const m = genModelDef();
+  if (!m) return;
+  $("genModelNote").textContent = `${m.note} Endpoint: ${m.endpoint} · billed by fal.ai to your account.`;
+  fillGenSelect($("genAspect"), m.aspects || ["16:9"], m.def_aspect);
+  $("genDurationWrap").style.display = m.durations ? "" : "none";
+  if (m.durations) fillGenSelect($("genDuration"), m.durations, m.def_duration);
+  $("genResolutionWrap").style.display = m.resolutions ? "" : "none";
+  if (m.resolutions) fillGenSelect($("genResolution"), m.resolutions, m.def_resolution);
+}
+$("genModel").addEventListener("change", genModelChanged);
+$("genOpenSettingsBtn").addEventListener("click", () => $("settingsBtn").click());
+
+$("genRunBtn").addEventListener("click", async () => {
+  const m = genModelDef();
+  const prompt = $("genPrompt").value.trim();
+  hide($("genError"));
+  hide($("genResult"));
+  if (!m) { toast("Pick a model first", true); return; }
+  if (!prompt) { toast("Describe what to generate first", true); return; }
+  $("genRunBtn").disabled = true;
+  $("genStatusText").textContent = "Sending to fal.ai…";
+  let res;
+  try {
+    res = await api.gen_video_start(
+      m.id, prompt,
+      $("genAspect").value,
+      m.durations ? $("genDuration").value : "",
+      m.resolutions ? $("genResolution").value : "");
+  } catch (e) {
+    res = { ok: false, error: "Couldn't reach the local backend." };
+  }
+  $("genRunBtn").disabled = false;
+  if (!res.ok) {
+    if (res.error === "no_key") {
+      show($("genNoKey"));
+      hide($("genControls"));
+      $("genStatusText").textContent = "";
+      return;
+    }
+    $("genError").textContent = res.message || res.error || "Generation failed.";
+    show($("genError"));
+    $("genStatusText").textContent = "";
+    return;
+  }
+  genCurrentId = res.gen_id;
+  show($("genProgress"));
+  $("genStage").textContent = "In queue on fal.ai…";
+  $("genStatusText").textContent = "Generating… this can take a few minutes.";
+  stopGenPoll();
+  genTimer = setInterval(pollGenStatus, 3000);
+  pollGenStatus();
+});
+
+async function pollGenStatus() {
+  if (!genCurrentId) { stopGenPoll(); return; }
+  let st;
+  try { st = await api.gen_video_status(genCurrentId); }
+  catch (e) { return; }  // transient - next poll retries
+  if (!st.ok) {
+    stopGenPoll();
+    hide($("genProgress"));
+    $("genError").textContent = st.error || "Generation failed.";
+    show($("genError"));
+    $("genStatusText").textContent = "";
+    return;
+  }
+  if (st.status === "queued" || st.status === "running") {
+    $("genStage").textContent = st.stage || "Generating…";
+    return;
+  }
+  stopGenPoll();
+  hide($("genProgress"));
+  $("genStatusText").textContent = "";
+  if (st.status === "error") {
+    $("genError").textContent = st.error || "fal.ai reported an error.";
+    show($("genError"));
+    return;
+  }
+  // done
+  const isVideo = st.kind === "video";
+  $("genVideo").classList.toggle("hidden", !isVideo);
+  $("genImage").classList.toggle("hidden", isVideo);
+  if (isVideo) $("genVideo").src = st.url || "";
+  else $("genImage").src = st.url || "";
+  $("genDownload").href = st.url || "#";
+  $("genImportBtn").style.display = isVideo ? "" : "none";
+  $("genResultHint").textContent = isVideo
+    ? "Saved on this PC. Send it to the Library to clip it like any video."
+    : "Generated image — download it for a thumbnail, poster or keyframe.";
+  show($("genResult"));
+  toast("Generation finished");
+}
+
+$("genImportBtn").addEventListener("click", async () => {
+  if (!genCurrentId) return;
+  $("genImportBtn").disabled = true;
+  const res = await api.gen_video_import(genCurrentId);
+  $("genImportBtn").disabled = false;
+  if (!res.ok) {
+    toast(res.error || "Couldn't send it to the Library", true);
+    return;
+  }
+  toast("Added to your Library — transcribing now");
+  showWizard(1);
+  selectJob(res.job_id);
+});
+
+/* ---------------- Studio: Title & Hook Generator ---------------- */
+function scoreChip(score) {
+  const cls = score >= 70 ? "" : score >= 45 ? " mid" : " low";
+  return `<span class="score-chip${cls}">${score}</span>`;
+}
+function renderTitleRows(items) {
+  return (items || []).map((it) => `
+    <div class="title-row">${scoreChip(it.score)}
+      <span class="t-text">${escapeHtml(it.text)}</span>
+      <button type="button" class="ghost-btn small t-copy">Copy</button>
+    </div>`).join("");
+}
+$("titlesRunBtn").addEventListener("click", async () => {
+  const topic = $("titlesTopic").value.trim();
+  const job = $("titlesProject").value;
+  hide($("titlesError"));
+  hide($("titlesNeedModel"));
+  $("titlesOut").innerHTML = "";
+  $("titlesNote").textContent = "";
+  if (!topic && !job) {
+    toast("Type a topic or pick a Library project first", true);
+    return;
+  }
+  $("titlesRunBtn").disabled = true;
+  $("titlesStatus").textContent = "Writing… (the Built-in AI can take a minute)";
+  let res;
+  try { res = await api.ai_titles(topic, job); }
+  catch (e) { res = { ok: false, error: "Couldn't reach the local backend." }; }
+  $("titlesRunBtn").disabled = false;
+  $("titlesStatus").textContent = "";
+  if (!res.ok) {
+    $("titlesError").textContent = res.error || "Title generation failed.";
+    show($("titlesError"));
+    return;
+  }
+  $("titlesNote").textContent = res.note || "";
+  if (res.mode === "needs_model") {
+    show($("titlesNeedModel"));
+    return;
+  }
+  $("titlesOut").innerHTML =
+    `<div class="field-label" style="margin-top:14px">Titles</div>`
+    + renderTitleRows(res.titles)
+    + `<div class="field-label" style="margin-top:16px">Hooks</div>`
+    + renderTitleRows(res.hooks);
+  $("titlesOut").querySelectorAll(".title-row").forEach((row, i) => {
+    const items = [...(res.titles || []), ...(res.hooks || [])];
+    row.querySelector(".t-copy").addEventListener("click", () =>
+      copyText(items[i].text, "Copied"));
+  });
+});
+
+/* ---------------- Studio: AI Scriptwriter ---------------- */
+$("scriptRunBtn").addEventListener("click", async () => {
+  const topic = $("scriptTopic").value.trim();
+  hide($("scriptError"));
+  hide($("scriptNeedModel"));
+  hide($("scriptOutWrap"));
+  if (!topic) { toast("Describe the video first", true); return; }
+  $("scriptRunBtn").disabled = true;
+  $("scriptStatus").textContent = "Writing… (the Built-in AI can take a minute)";
+  let res;
+  try {
+    res = await api.ai_script(topic, $("scriptTone").value,
+      parseInt($("scriptLen").value, 10) || 60);
+  } catch (e) { res = { ok: false, error: "Couldn't reach the local backend." }; }
+  $("scriptRunBtn").disabled = false;
+  $("scriptStatus").textContent = "";
+  if (!res.ok) {
+    if (res.error === "needs_model") { show($("scriptNeedModel")); return; }
+    $("scriptError").textContent = res.message || res.error || "Script failed.";
+    show($("scriptError"));
+    return;
+  }
+  $("scriptOut").textContent = res.script;
+  show($("scriptOutWrap"));
+});
+$("scriptCopyBtn").addEventListener("click", () =>
+  copyText($("scriptOut").textContent, "Script copied"));
+
+/* ---------------- Studio: Transcript Tool ---------------- */
+$("transcriptLoadBtn").addEventListener("click", async () => {
+  const job = $("transcriptProject").value;
+  hide($("transcriptError"));
+  if (!job) { toast("Pick a Library project first", true); return; }
+  const res = await api.get_transcript(job);
+  if (!res.ok) {
+    $("transcriptError").textContent = res.error || "No transcript.";
+    show($("transcriptError"));
+    hide($("transcriptOutWrap"));
+    return;
+  }
+  $("transcriptText").value = (res.segments || [])
+    .map((s) => s.text).join("\n");
+  $("transcriptMeta").textContent =
+    `${res.title || "Video"} · ${res.word_count} words · ${fmtTime(res.duration || 0)}`;
+  show($("transcriptOutWrap"));
+});
+$("transcriptCopyBtn").addEventListener("click", () =>
+  copyText($("transcriptText").value, "Transcript copied"));
+document.querySelectorAll(".transcript-dl").forEach((b) =>
+  b.addEventListener("click", async () => {
+    const job = $("transcriptProject").value;
+    if (!job) { toast("Load a transcript first", true); return; }
+    const res = await api.export_transcript(job, b.dataset.fmt);
+    if (!res.ok) { toast(res.error || "Export failed", true); return; }
+    downloadUrl(res.url);
+  }));
+$("transcriptSrtBtn").addEventListener("click", async () => {
+  const job = $("transcriptProject").value;
+  const p = $("transcriptSrtPath").value.trim();
+  if (!job) { toast("Pick a Library project first", true); return; }
+  if (!p) { toast("Paste an .srt file path first", true); return; }
+  const res = await api.import_srt_transcript(job, p);
+  if (res.ok) {
+    toast(`Transcript replaced (${res.word_count} words)`);
+    $("transcriptLoadBtn").click();
+  } else toast(res.error || "SRT failed", true);
+});
+
+/* ---------------- Studio: Video Enhancer ---------------- */
+let enhancerTimer = null;
+let enhancerCurrentId = null;
+
+function stopEnhancerPoll() {
+  if (enhancerTimer) { clearInterval(enhancerTimer); enhancerTimer = null; }
+}
+$("enhancerRunBtn").addEventListener("click", async () => {
+  const path = $("enhancerPath").value.trim();
+  const job = $("enhancerProject").value;
+  hide($("enhancerError"));
+  hide($("enhancerResult"));
+  if (!path && !job) {
+    toast("Pick a Library project or paste a file path first", true);
+    return;
+  }
+  $("enhancerRunBtn").disabled = true;
+  const res = await api.enhance_start(path, job);
+  $("enhancerRunBtn").disabled = false;
+  if (!res.ok) {
+    $("enhancerError").textContent = res.error || "Enhance failed to start.";
+    show($("enhancerError"));
+    return;
+  }
+  enhancerCurrentId = res.id;
+  show($("enhancerProgress"));
+  $("enhancerBar").style.width = "0%";
+  $("enhancerStage").textContent = "Starting…";
+  $("enhancerStatusText").textContent = "Enhancing…";
+  stopEnhancerPoll();
+  enhancerTimer = setInterval(pollEnhancer, 1000);
+  pollEnhancer();
+});
+async function pollEnhancer() {
+  if (!enhancerCurrentId) { stopEnhancerPoll(); return; }
+  let st;
+  try { st = await api.enhance_status(enhancerCurrentId); }
+  catch (e) { return; }
+  if (!st.ok) {
+    stopEnhancerPoll();
+    hide($("enhancerProgress"));
+    $("enhancerError").textContent = st.error || "Enhance failed.";
+    show($("enhancerError"));
+    $("enhancerStatusText").textContent = "";
+    return;
+  }
+  if (st.status === "running") {
+    $("enhancerBar").style.width = (st.pct || 0) + "%";
+    $("enhancerStage").textContent = st.stage || "Enhancing…";
+    return;
+  }
+  stopEnhancerPoll();
+  hide($("enhancerProgress"));
+  $("enhancerStatusText").textContent = "";
+  if (st.status === "error") {
+    $("enhancerError").textContent = st.error || "Enhance failed.";
+    show($("enhancerError"));
+    return;
+  }
+  $("enhancerVideo").src = st.url || "";
+  $("enhancerDownload").href = st.url || "#";
+  show($("enhancerResult"));
+  toast("Enhance finished");
+}
+$("enhancerFolderBtn").addEventListener("click", async () => {
+  if (enhancerCurrentId) await api.enhance_open_folder(enhancerCurrentId);
+});
+
 /* ---------------- settings ---------------- */
 function openSettings() {
   show($("settingsModal"));
@@ -2048,12 +2613,33 @@ $("settingsBtn").addEventListener("click", async () => {
   } catch (e) { settings = settings || {}; }
   segSet("themeSeg", settings.theme === "light" ? "light" : "dark");
   $("accentPick").value = settings.accent || "#2effc8";
+  // fal.ai key: the field always starts EMPTY (the key is never sent
+  // back to the page) - the state line says whether one is saved.
+  $("falKeyInput").value = "";
+  $("falKeyState").textContent = settings.fal_key_set
+    ? "A key is saved on this PC. Type a new one to replace it."
+    : "No key saved.";
   openSettings();
 });
 $("closeSettingsBtn").addEventListener("click", closeSettings);
 $("saveSettingsBtn").addEventListener("click", async () => {
+  const fk = $("falKeyInput").value.trim();
+  if (fk) {
+    try {
+      await api.save_settings({ fal_key: fk });
+      settings.fal_key_set = true;
+    } catch (e) { /* surfaced below as a generic save */ }
+    $("falKeyInput").value = "";
+  }
   closeSettings();
   toast("Settings saved");
+});
+$("falKeyClearBtn").addEventListener("click", async () => {
+  try { await api.save_settings({ fal_key: "" }); } catch (e) { /* noop */ }
+  settings.fal_key_set = false;
+  $("falKeyInput").value = "";
+  $("falKeyState").textContent = "No key saved.";
+  toast("fal.ai key removed");
 });
 
 /* ---------------- theme (Dark default = web-app look) ---------------- */
@@ -2130,6 +2716,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     $("cookiesCheck").checked = !!settings.use_cookies;
   } catch (e) { /* offline-safe defaults below */ }
   applyTheme();
+  updateBackBtn();
+  refreshLocalAiStatus();
+  startLocalAiPolling();
   setTimeout(() => {
     const sp = document.getElementById("splash");
     if (sp) { sp.classList.add("gone"); setTimeout(() => sp.remove(), 750); }

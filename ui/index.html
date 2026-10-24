@@ -51,6 +51,10 @@
     <div class="step-line"></div>
     <div class="step-dot" data-step="3" title="Step 3 — Clips"><span class="dot-num">3</span><span class="dot-label">Clips</span></div>
   </div>
+  <button id="studioBtn" class="ghost-btn icon-btn" title="Studio — all your tools in one place">
+    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/></svg>
+    <span>Studio</span>
+  </button>
   <button id="libraryBtn" class="ghost-btn icon-btn" title="Library — your saved videos">
     <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
     <span>Library</span>
@@ -66,8 +70,105 @@
 </header>
 
 <main>
+  <!-- ============ STUDIO HUB (home) ============ -->
+  <section id="hubView" class="card step-card">
+    <div class="hub-hero">
+      <div class="card-kicker">Itraji Studio</div>
+      <h1>What are we creating today?</h1>
+      <p class="sub">Every tool runs on your PC. The Built-in AI works fully offline — only the Video Generator uses the cloud, with your own fal.ai key.</p>
+      <div class="row">
+        <input id="hubUrlInput" type="text" placeholder="Paste a video link to start clipping…" spellcheck="false">
+        <button id="hubImportBtn" class="primary">Import &amp; clip</button>
+      </div>
+      <div class="row row-tight">
+        <input id="hubPathInput" type="text" placeholder="…or a local file path, e.g. C:\Videos\myvideo.mp4" spellcheck="false">
+        <button id="hubFileBtn" class="ghost-btn">Use local file</button>
+      </div>
+      <div class="row row-tight">
+        <input id="hubSearch" type="text" placeholder="Search tools…" spellcheck="false" style="max-width:280px">
+      </div>
+    </div>
+
+    <div class="field-label" style="margin-top:20px">Creative tools</div>
+    <div class="tool-grid" id="hubCreativeGrid">
+      <button type="button" class="tool-card" data-tool="clipmaker" data-name="clip maker import video viral clips">
+        <span class="tool-emoji">✂️</span>
+        <span class="tool-name">Clip Maker</span>
+        <span class="tool-desc">Import a video and turn its best moments into viral clips.</span>
+        <span class="badge-row"><span class="badge badge-off">Offline</span></span>
+      </button>
+      <button type="button" class="tool-card" data-tool="generator" data-name="ai video generator generate create fal veo kling wan image">
+        <span class="tool-emoji">🎬</span>
+        <span class="tool-name">AI Video Generator</span>
+        <span class="tool-desc">Generate brand-new videos &amp; images from a text prompt — Veo, Kling, Wan and more.</span>
+        <span class="badge-row"><span class="badge badge-new">New</span><span class="badge badge-key">Needs API key</span></span>
+      </button>
+      <button type="button" class="tool-card" data-tool="remover" data-name="caption remover remove burned subtitles erase">
+        <span class="tool-emoji">🧹</span>
+        <span class="tool-name">Caption Remover</span>
+        <span class="tool-desc">Strip captions already burned into a video — auto-detected, rebuilt cleanly.</span>
+        <span class="badge-row"><span class="badge badge-off">Offline</span></span>
+      </button>
+      <button type="button" class="tool-card" data-tool="captionstudio" data-name="caption studio style captions fonts presets">
+        <span class="tool-emoji">💬</span>
+        <span class="tool-name">Caption Studio</span>
+        <span class="tool-desc">Style a clip's captions — 20 presets, fonts, positions, animations. Pick a clip in the Library.</span>
+        <span class="badge-row"><span class="badge badge-off">Offline</span></span>
+      </button>
+    </div>
+
+    <div class="field-label" style="margin-top:20px">Utility tools</div>
+    <div class="tool-grid" id="hubUtilityGrid">
+      <button type="button" class="tool-card" data-tool="library" data-name="library saved videos projects">
+        <span class="tool-emoji">📚</span>
+        <span class="tool-name">Library</span>
+        <span class="tool-desc">All your saved videos and projects, kept on this PC.</span>
+      </button>
+      <button type="button" class="tool-card" data-tool="titles" data-name="title hook generator viral titles hooks">
+        <span class="tool-emoji">🔥</span>
+        <span class="tool-name">Title &amp; Hook Generator</span>
+        <span class="tool-desc">10 titles + 5 hooks with viral scores, from a topic or a project's transcript.</span>
+        <span class="badge-row"><span class="badge badge-new">New</span><span class="badge badge-off">Offline</span></span>
+      </button>
+      <button type="button" class="tool-card" data-tool="script" data-name="ai scriptwriter script write hook body cta">
+        <span class="tool-emoji">📝</span>
+        <span class="tool-name">AI Scriptwriter</span>
+        <span class="tool-desc">A ready-to-record script — Hook, Body, CTA — from just a topic.</span>
+        <span class="badge-row"><span class="badge badge-new">New</span><span class="badge badge-off">Offline</span></span>
+      </button>
+      <button type="button" class="tool-card" data-tool="transcript" data-name="transcript tool srt vtt subtitles text export">
+        <span class="tool-emoji">📄</span>
+        <span class="tool-name">Transcript Tool</span>
+        <span class="tool-desc">Read, copy and download a project's transcript as TXT, SRT or VTT.</span>
+        <span class="badge-row"><span class="badge badge-new">New</span><span class="badge badge-off">Offline</span></span>
+      </button>
+      <button type="button" class="tool-card" data-tool="enhancer" data-name="video enhancer upscale sharpen 1080p quality">
+        <span class="tool-emoji">✨</span>
+        <span class="tool-name">Video Enhancer</span>
+        <span class="tool-desc">Sharpen + upscale a video to 1080p. Basic enhancement — not an AI upscale.</span>
+        <span class="badge-row"><span class="badge badge-new">New</span><span class="badge badge-off">Offline</span></span>
+      </button>
+      <button type="button" class="tool-card" data-tool="settings" data-name="settings theme accent fal api key">
+        <span class="tool-emoji">⚙️</span>
+        <span class="tool-name">Settings</span>
+        <span class="tool-desc">Theme, accent color, and your fal.ai API key for the Generator.</span>
+      </button>
+    </div>
+    <p class="hint hidden" id="hubNoMatch">No tool matches that search.</p>
+
+    <div id="hubAiCard" class="find-box" style="margin-top:20px">
+      <div class="field-label">Built-in AI <span class="hint">— a professional AI model that runs on your PC. No key, no internet.</span></div>
+      <p class="sub" id="hubAiText" style="margin-top:6px">First use needs a one-time download of the AI model (~9 GB). After that it works fully offline, forever.</p>
+      <div class="bar hidden" id="hubAiBarWrap" style="margin-top:10px"><div id="hubAiBar" class="fill"></div></div>
+      <div class="row row-tight" style="margin-top:10px">
+        <button id="hubAiDownloadBtn" class="ghost-btn" type="button">Download Built-in AI (~9 GB)</button>
+        <span class="hint" id="hubAiPct"></span>
+      </div>
+    </div>
+  </section>
+
   <!-- ============ STEP 1: SOURCE ============ -->
-  <section id="step1" class="card step-card">
+  <section id="step1" class="card step-card hidden">
     <div class="card-kicker">Step 1 · Source</div>
     <h1>Add your video</h1>
     <p class="sub">Paste a link or use a file from your PC — download, transcription and clipping all run locally.</p>
@@ -512,6 +613,218 @@
       </div>
     </details>
   </section>
+
+  <!-- ============ AI VIDEO GENERATOR (fal.ai) ============ -->
+  <section id="generatorView" class="card step-card hidden">
+    <div class="card-kicker">AI Video Generator</div>
+    <div class="row-between">
+      <h2>Generate a video or image from text</h2>
+      <button class="ghost-btn tool-back" type="button">← Back</button>
+    </div>
+    <p class="sub">Powered by fal.ai with <b>your own API key</b> — fal.ai bills your account directly at the model's price; Itraji adds nothing. Finished videos can go straight into your Library to be clipped.</p>
+
+    <div id="genNoKey" class="empty-state hidden">
+      <div class="empty-title">Add your fal.ai API key to generate</div>
+      <div class="empty-sub">One free fal.ai account + one key unlocks every model here (Veo, Kling, Wan, FLUX…). You pay fal.ai per generation — most clips cost cents. Get a key from your fal.ai dashboard, then paste it in Settings.</div>
+      <div class="row" style="justify-content:center;margin-top:14px">
+        <a class="ghost-btn" href="https://fal.ai/dashboard/keys" target="_blank" rel="noopener">Get a key at fal.ai ↗</a>
+        <button id="genOpenSettingsBtn" class="primary" type="button">Open Settings</button>
+      </div>
+    </div>
+
+    <div id="genControls">
+      <div class="field">
+        <label class="field-label" for="genModel">Model</label>
+        <select id="genModel" class="select" style="width:100%"></select>
+        <p class="hint" id="genModelNote" style="margin-top:6px"></p>
+      </div>
+      <div class="field">
+        <label class="field-label" for="genPrompt">Prompt</label>
+        <textarea id="genPrompt" rows="3" placeholder="A drone shot over a coastal city at golden hour, waves crashing, cinematic…" spellcheck="false"></textarea>
+      </div>
+      <div class="row row-tight">
+        <div class="field" style="flex:1;min-width:140px">
+          <label class="field-label" for="genAspect">Aspect ratio</label>
+          <select id="genAspect" class="select" style="width:100%"></select>
+        </div>
+        <div class="field" id="genDurationWrap" style="flex:1;min-width:120px">
+          <label class="field-label" for="genDuration">Duration (sec)</label>
+          <select id="genDuration" class="select" style="width:100%"></select>
+        </div>
+        <div class="field" id="genResolutionWrap" style="flex:1;min-width:120px">
+          <label class="field-label" for="genResolution">Resolution</label>
+          <select id="genResolution" class="select" style="width:100%"></select>
+        </div>
+      </div>
+      <div class="row">
+        <button id="genRunBtn" class="primary">Generate</button>
+        <span class="stage" id="genStatusText"></span>
+      </div>
+      <div id="genProgress" class="hidden">
+        <div class="bar shimmer"><div id="genBar" class="fill" style="width:35%"></div></div>
+        <div class="stage" id="genStage">Starting…</div>
+      </div>
+      <p id="genError" class="error hidden"></p>
+      <div id="genResult" class="hidden" style="margin-top:16px">
+        <video id="genVideo" class="hidden" controls playsinline style="width:100%;border-radius:12px;background:#000"></video>
+        <img id="genImage" class="hidden" alt="Generated image" style="width:100%;border-radius:12px">
+        <div class="row">
+          <button id="genImportBtn" class="primary" type="button">Send to Library / Clip it</button>
+          <a id="genDownload" class="ghost-btn" href="#" download>Download</a>
+          <span class="hint" id="genResultHint"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ TITLE & HOOK GENERATOR ============ -->
+  <section id="titlesView" class="card step-card hidden">
+    <div class="card-kicker">Title &amp; Hook Generator</div>
+    <div class="row-between">
+      <h2>Viral titles &amp; hooks</h2>
+      <button class="ghost-btn tool-back" type="button">← Back</button>
+    </div>
+    <p class="sub">The Built-in AI writes 10 titles and 5 hooks, each scored 0–100. Give it a topic, a project's transcript, or both.</p>
+    <div class="field">
+      <label class="field-label" for="titlesTopic">Topic / angle <span class="hint">— optional when a project is picked</span></label>
+      <input id="titlesTopic" type="text" placeholder="e.g. police chase ends in a river…" spellcheck="false">
+    </div>
+    <div class="field">
+      <label class="field-label" for="titlesProject">…or use a Library project's transcript</label>
+      <select id="titlesProject" class="select" style="width:100%"><option value="">No project — topic only</option></select>
+    </div>
+    <div class="row">
+      <button id="titlesRunBtn" class="primary">Generate titles</button>
+      <span class="stage" id="titlesStatus"></span>
+    </div>
+    <div id="titlesNeedModel" class="find-box hidden" style="margin-top:14px">
+      <div class="field-label">Built-in AI needed</div>
+      <p class="sub" id="titlesNeedModelText" style="margin-top:6px">Download the Built-in AI once (~9 GB) and this tool works fully offline — or pick a Library project above to get basic titles from its transcript right now.</p>
+      <button class="ghost-btn ai-download-btn" type="button">Download Built-in AI (~9 GB)</button>
+    </div>
+    <p id="titlesError" class="error hidden"></p>
+    <p class="hint" id="titlesNote" style="margin-top:12px"></p>
+    <div id="titlesOut"></div>
+  </section>
+
+  <!-- ============ AI SCRIPTWRITER ============ -->
+  <section id="scriptView" class="card step-card hidden">
+    <div class="card-kicker">AI Scriptwriter</div>
+    <div class="row-between">
+      <h2>Scripts that stop the scroll</h2>
+      <button class="ghost-btn tool-back" type="button">← Back</button>
+    </div>
+    <p class="sub">Describe the video; the Built-in AI writes a ready-to-record script — Hook, Body, CTA. Runs fully offline.</p>
+    <div class="field">
+      <label class="field-label" for="scriptTopic">What's the video about?</label>
+      <textarea id="scriptTopic" rows="2" placeholder="e.g. A traffic stop where the driver turns out to be a retired officer…" spellcheck="false"></textarea>
+    </div>
+    <div class="row row-tight">
+      <div class="field" style="flex:1;min-width:150px">
+        <label class="field-label" for="scriptTone">Tone</label>
+        <select id="scriptTone" class="select" style="width:100%">
+          <option>Energetic</option><option>Serious</option><option>Funny</option>
+          <option>Dramatic</option><option>Educational</option><option>Calm</option>
+        </select>
+      </div>
+      <div class="field" style="flex:1;min-width:150px">
+        <label class="field-label" for="scriptLen">Target length</label>
+        <select id="scriptLen" class="select" style="width:100%">
+          <option value="30">~30 seconds</option>
+          <option value="60" selected>~60 seconds</option>
+          <option value="90">~90 seconds</option>
+          <option value="180">~3 minutes</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <button id="scriptRunBtn" class="primary">Write my script</button>
+      <span class="stage" id="scriptStatus"></span>
+    </div>
+    <div id="scriptNeedModel" class="find-box hidden" style="margin-top:14px">
+      <div class="field-label">Built-in AI needed</div>
+      <p class="sub" style="margin-top:6px">The Scriptwriter runs on the Built-in AI model. Download it once (~9 GB) — after that it works fully offline, forever. No fake template scripts here.</p>
+      <button class="ghost-btn ai-download-btn" type="button">Download Built-in AI (~9 GB)</button>
+    </div>
+    <p id="scriptError" class="error hidden"></p>
+    <div id="scriptOutWrap" class="hidden" style="margin-top:14px">
+      <div class="script-out" id="scriptOut"></div>
+      <div class="row">
+        <button id="scriptCopyBtn" class="ghost-btn" type="button">Copy script</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ TRANSCRIPT TOOL ============ -->
+  <section id="transcriptView" class="card step-card hidden">
+    <div class="card-kicker">Transcript Tool</div>
+    <div class="row-between">
+      <h2>Read &amp; export transcripts</h2>
+      <button class="ghost-btn tool-back" type="button">← Back</button>
+    </div>
+    <p class="sub">A project's full transcript — copy it, or download it as TXT, SRT or VTT.</p>
+    <div class="field">
+      <label class="field-label" for="transcriptProject">Library project</label>
+      <div class="row row-tight">
+        <select id="transcriptProject" class="select" style="flex:1"><option value="">Pick a project…</option></select>
+        <button id="transcriptLoadBtn" class="primary" type="button">Load transcript</button>
+      </div>
+    </div>
+    <div class="field">
+      <label class="field-label" for="transcriptSrtPath">…or replace it with an SRT file <span class="hint">— applied to the picked project</span></label>
+      <div class="row row-tight">
+        <input id="transcriptSrtPath" type="text" placeholder="C:\Videos\subs.srt" spellcheck="false" style="flex:1">
+        <button id="transcriptSrtBtn" class="ghost-btn" type="button">Use SRT transcript</button>
+      </div>
+    </div>
+    <p id="transcriptError" class="error hidden"></p>
+    <div id="transcriptOutWrap" class="hidden">
+      <div class="row-between">
+        <span class="stage" id="transcriptMeta"></span>
+        <div class="row row-tight">
+          <button id="transcriptCopyBtn" class="ghost-btn small" type="button">Copy</button>
+          <button class="ghost-btn small transcript-dl" data-fmt="txt" type="button">Download .txt</button>
+          <button class="ghost-btn small transcript-dl" data-fmt="srt" type="button">Download .srt</button>
+          <button class="ghost-btn small transcript-dl" data-fmt="vtt" type="button">Download .vtt</button>
+        </div>
+      </div>
+      <textarea id="transcriptText" rows="14" readonly spellcheck="false" style="margin-top:10px"></textarea>
+    </div>
+  </section>
+
+  <!-- ============ VIDEO ENHANCER ============ -->
+  <section id="enhancerView" class="card step-card hidden">
+    <div class="card-kicker">Video Enhancer</div>
+    <div class="row-between">
+      <h2>Sharpen + upscale to 1080p</h2>
+      <button class="ghost-btn tool-back" type="button">← Back</button>
+    </div>
+    <p class="sub">Upscales smaller videos to a 1080p picture (Lanczos) and sharpens them. Honest basics: this is a sharpen + upscale, <b>not</b> an AI upscaler.</p>
+    <div class="field">
+      <label class="field-label" for="enhancerProject">Library project</label>
+      <select id="enhancerProject" class="select" style="width:100%"><option value="">Pick a project…</option></select>
+    </div>
+    <div class="field">
+      <label class="field-label" for="enhancerPath">…or a file on this PC</label>
+      <input id="enhancerPath" type="text" placeholder="C:\Videos\clip.mp4" spellcheck="false">
+    </div>
+    <div class="row">
+      <button id="enhancerRunBtn" class="primary">Enhance video</button>
+      <span class="stage" id="enhancerStatusText"></span>
+    </div>
+    <div id="enhancerProgress" class="hidden">
+      <div class="bar"><div id="enhancerBar" class="fill"></div></div>
+      <div class="stage" id="enhancerStage">Starting…</div>
+    </div>
+    <p id="enhancerError" class="error hidden"></p>
+    <div id="enhancerResult" class="hidden" style="margin-top:14px">
+      <video id="enhancerVideo" controls playsinline style="width:100%;border-radius:12px;background:#000"></video>
+      <div class="row">
+        <a id="enhancerDownload" class="primary-btn" href="#" download="enhanced.mp4">Download enhanced video</a>
+        <button id="enhancerFolderBtn" class="ghost-btn" type="button">Open folder</button>
+      </div>
+    </div>
+  </section>
 </main>
 
 <!-- caption editor + trim modal -->
@@ -652,6 +965,14 @@
         <label class="color-pick" title="Accent color">Accent <input type="color" id="accentPick" value="#2effc8"></label>
         <button id="accentReset" class="ghost-btn small" type="button">Reset accent</button>
       </div>
+    </div>
+    <div class="field">
+      <label class="field-label" for="falKeyInput">fal.ai API key <span class="hint">— for the AI Video Generator. Stored only on this PC, never shown back.</span></label>
+      <div class="row row-tight">
+        <input id="falKeyInput" type="password" placeholder="Paste your fal.ai API key" spellcheck="false" autocomplete="off" style="flex:1">
+        <button id="falKeyClearBtn" class="ghost-btn small" type="button">Remove key</button>
+      </div>
+      <p class="hint" id="falKeyState">No key saved.</p>
     </div>
     <div class="row">
       <button id="saveSettingsBtn" class="primary">Save settings</button>
