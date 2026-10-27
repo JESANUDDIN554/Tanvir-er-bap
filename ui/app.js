@@ -2612,6 +2612,7 @@ $("settingsBtn").addEventListener("click", async () => {
     settings = s || {};
   } catch (e) { settings = settings || {}; }
   segSet("themeSeg", settings.theme === "light" ? "light" : "dark");
+  segSet("windowSeg", settings.window_mode === "chrome" ? "chrome" : "own");
   $("accentPick").value = settings.accent || "#2effc8";
   // fal.ai key: the field always starts EMPTY (the key is never sent
   // back to the page) - the state line says whether one is saved.
@@ -2681,6 +2682,12 @@ document.querySelectorAll("#themeSeg .seg").forEach((b) =>
     settings.theme = b.dataset.value;
     applyTheme();
     try { await api.save_settings({ theme: settings.theme }); } catch (e) { /* offline */ }
+  }));
+document.querySelectorAll("#windowSeg .seg").forEach((b) =>
+  b.addEventListener("click", async () => {
+    segSet("windowSeg", b.dataset.value);
+    settings.window_mode = b.dataset.value;
+    try { await api.save_settings({ window_mode: settings.window_mode }); } catch (e) { /* offline */ }
   }));
 $("accentPick").addEventListener("input", async () => {
   settings.accent = $("accentPick").value;

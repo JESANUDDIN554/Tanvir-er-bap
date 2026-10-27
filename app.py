@@ -1,8 +1,8 @@
 """Itraji Cliper - desktop entry point.
 
-Runs a localhost HTTP server for the local UI and opens it in a
-desktop-style Chrome/Edge app window. Zero native dependencies
-(no pywebview / .NET needed).
+Runs a localhost HTTP server for the local UI and opens it in the
+app's own desktop window (pywebview over the system WebView2
+runtime), falling back to a Chrome/Edge --app window.
 All video work runs on this machine, including the optional
 Built-in AI (a local model) - nothing is sent to any cloud service.
 """
@@ -2237,7 +2237,8 @@ class Api:
 
 
 # ---------------------------------------------------------------------------
-# Localhost server + desktop-style window (no pywebview / .NET needed)
+# Localhost server + the app's own window (pywebview / WebView2),
+# with a Chrome/Edge --app window as fallback
 # ---------------------------------------------------------------------------
 import socket
 import subprocess
@@ -2586,17 +2587,12 @@ def _clamp_window_geometry(x0, y0, work_w, work_h):
     return (w, h, x, y)
 
 
-def _window_geometry_args():
-    """Chrome --window-size / --window-position clamped to the primary
-    monitor's work area (Windows only).
-
-    Without explicit geometry Chrome restores whatever size/position a
-    previous session left behind - which can be wider than the screen,
-    pushing the top-right buttons off-screen. Fully guarded: any
-    failure returns [] and Chrome keeps its default behavior.
-    """
+def _window_geometry():
+    """(w, h, x, y) for the app window, clamped to the primary
+    monitor's work area (Windows only) - or None. Shared by the own
+    (WebView2) window and the Chrome --app window (as flags)."""
     if os.name != "nt":
-        return []
+        return None
     try:
         import ctypes
 
@@ -2618,14 +2614,26 @@ def _window_geometry_args():
             x0 = y0 = 0
             work_w = ctypes.windll.user32.GetSystemMetrics(0)
             work_h = ctypes.windll.user32.GetSystemMetrics(1)
-        clamped = _clamp_window_geometry(x0, y0, work_w, work_h)
-        if clamped is None:
-            return []
-        w, h, x, y = clamped
-        return [f"--window-size={w},{h}",
-                f"--window-position={x},{y}"]
+        return _clamp_window_geometry(x0, y0, work_w, work_h)
     except Exception:  # noqa: BLE001 - geometry is a nicety, never fatal
+        return None
+
+
+def _window_geometry_args():
+    """Chrome --window-size / --window-position flags from
+    _window_geometry().
+
+    Without explicit geometry Chrome restores whatever size/position a
+    previous session left behind - which can be wider than the screen,
+    pushing the top-right buttons off-screen. Fully guarded: any
+    failure returns [] and Chrome keeps its default behavior.
+    """
+    geo = _window_geometry()
+    if geo is None:
         return []
+    w, h, x, y = geo
+    return [f"--window-size={w},{h}",
+            f"--window-position={x},{y}"]
 
 
 def _launch_window(url):
@@ -2654,6 +2662,68 @@ def _launch_window(url):
     import webbrowser
     webbrowser.open(url)
     return None
+
+
+def _window_mode():
+    """Which window hosts the UI: "own" (the app's own WebView2
+    window - the taskbar then shows Itraji Cliper with its own name
+    and logo, and pinning pins the app, not Chrome) or "chrome" (the
+    Chrome/Edge --app fallback). The ITRAJI_WINDOW env var wins, then
+    the Settings choice (window_mode), default "own"."""
+    env = os.environ.get("ITRAJI_WINDOW", "").strip().lower()
+    if env in ("own", "webview"):
+        return "own"
+    if env == "chrome":
+        return "chrome"
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("window_mode") == "chrome":
+            return "chrome"
+    except (OSError, ValueError):
+        pass
+    return "own"
+
+
+def _run_own_window(url):
+    """Open the UI in the app's OWN window (pywebview over the system
+    WebView2 runtime). The window belongs to this process - whose exe
+    carries the Itraji Cliper name and logo - so the taskbar button,
+    the pin and Alt-Tab all show the app itself, never Chrome.
+
+    webview.start() blocks until the user closes the window, which is
+    exactly the app's lifetime, so a normal return means "ran and
+    closed" -> True. Any failure BEFORE the window is shown (pywebview
+    missing, WebView2 runtime missing, no GUI) -> False, and the
+    caller falls back to the Chrome --app window. A failure after the
+    window was shown still counts as ran: re-opening Chrome on top of
+    a window the user just closed would be worse.
+    """
+    try:
+        import webview
+    except Exception:  # noqa: BLE001 - not installed: caller's fallback
+        return False
+    shown = {"yes": False}
+    try:
+        kwargs = {"title": "Itraji Cliper", "url": url,
+                  "width": 1280, "height": 860, "min_size": (900, 600)}
+        geo = _window_geometry()
+        if geo is not None:
+            w, h, x, y = geo
+            kwargs.update({"width": w, "height": h, "x": x, "y": y})
+        win = webview.create_window(**kwargs)
+
+        def _mark_shown():
+            shown["yes"] = True
+
+        try:
+            win.events.shown += _mark_shown
+        except Exception:  # noqa: BLE001 - event hook is best-effort
+            pass
+        webview.start()
+        return True
+    except Exception:  # noqa: BLE001 - see docstring
+        return shown["yes"]
 
 
 def _auto_update_ytdlp():
@@ -2885,6 +2955,15 @@ def main():
         # Server binds first, then the window opens the moment the port
         # accepts connections - the UI's splash screen covers the warmup.
         _wait_port_open(port)
+
+        # First choice: the app's OWN window (WebView2 via pywebview),
+        # so the taskbar shows Itraji Cliper itself. It blocks until
+        # the window closes, then the app exits. Any failure to open
+        # it falls through to the Chrome --app window below.
+        if _window_mode() == "own":
+            _update_lockfile_mode("webview")
+            if _run_own_window(url):
+                return
 
         proc = _launch_window(url)
         _update_lockfile_mode("app" if proc is not None else "fallback")

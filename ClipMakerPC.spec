@@ -25,9 +25,10 @@ if not _os.path.exists("icon.ico"):
         _f.write(_b64.b64decode(_ICO_B64))
 _icon = "icon.ico"
 
-# NOTE: no pywebview / pythonnet / clr_loader anymore. The app is a
-# localhost HTTP server (waitress, pure python) + a Chrome/Edge --app
-# window, so there is nothing native to bundle for the window itself.
+# NOTE: the app is a localhost HTTP server (waitress, pure python) +
+# its own window via pywebview (WebView2; pythonnet/clr_loader ride
+# along as pywebview's Windows deps), with a Chrome/Edge --app window
+# as runtime fallback if the own window cannot open.
 a = Analysis(
     ["app.py"],
     pathex=[],
@@ -39,6 +40,7 @@ a = Analysis(
         ("fonts", "fonts"),  # bundled OFL caption fonts (Caption Studio)
     ],
     hiddenimports=[
+        "webview",
         "faster_whisper",
         "ctranslate2",
         "onnxruntime",

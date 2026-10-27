@@ -1,6 +1,7 @@
 # ClipMaker PC dependencies
 # Install on Windows with: pip install -r requirements.txt
 waitress>=2.1.2  # pure-python localhost HTTP server (serves the UI; no native/window deps)
+pywebview>=5.1; sys_platform == "win32"  # the app's own window (WebView2); Chrome --app stays as fallback
 faster-whisper>=1.1.0
 yt-dlp>=2024.8.6
 requests>=2.32.0
