@@ -13,5 +13,6 @@ commercial use), provided the fonts are not sold on their own.
 | ArchivoBlack-Regular.ttf | Archivo Black | github.com/google/fonts (ofl/archivoblack) |
 | Montserrat-Bold.ttf | Montserrat | github.com/JulietaUla/Montserrat (fonts/ttf) |
 | Montserrat-ExtraBold.ttf | Montserrat ExtraBold | github.com/JulietaUla/Montserrat (fonts/ttf) |
+| NotoEmoji-Regular.ttf | Noto Emoji (monochrome emoji fallback for caption emoji) | github.com/google/fonts (ofl/notoemoji) |
 
 The full OFL 1.1 text: https://openfontlicense.org/open-font-license-official-text/
