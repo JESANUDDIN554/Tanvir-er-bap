@@ -49,6 +49,71 @@ if os.name == "nt":
 
 
 # ---------------------------------------------------------------------------
+# Linux/macOS: register the bundled fonts folder with fontconfig for
+# child processes. ffmpeg's subtitles filter only uses fontsdir for
+# NAMED fonts - glyph FALLBACK (the path caption emoji take, since the
+# caption fonts contain no emoji) goes through fontconfig, which has
+# never heard of the bundled folder, so on a machine whose only emoji
+# font is a bitmap color font libass cannot rasterize, every caption
+# emoji renders as a tofu box even with a good emoji font bundled.
+# A generated config that includes the system config plus the bundled
+# folder fixes fallback for every child call. FONTS_DIR is wired by
+# app.py after import, so it is read lazily at call time.
+# ---------------------------------------------------------------------------
+if os.name == "posix":
+    _sp_run_posix = subprocess.run
+    _sp_popen_posix = subprocess.Popen
+    _fc_conf_for = [None, None]  # [fonts_dir, config_path]
+
+    def _fontconfig_file():
+        fonts_dir = globals().get("FONTS_DIR") or ""
+        if not fonts_dir or not os.path.isdir(fonts_dir):
+            return None
+        if not os.path.isfile("/etc/fonts/fonts.conf"):
+            return None
+        if _fc_conf_for[0] != fonts_dir:
+            try:
+                path = os.path.join(tempfile.gettempdir(),
+                                    "itraji-fonts.conf")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write('<?xml version="1.0"?>\n'
+                            '<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n'
+                            "<fontconfig>\n"
+                            '  <include ignore_missing="yes">'
+                            "/etc/fonts/fonts.conf</include>\n"
+                            "  <dir>" + fonts_dir + "</dir>\n"
+                            "</fontconfig>\n")
+                _fc_conf_for[0], _fc_conf_for[1] = fonts_dir, path
+            except OSError:
+                return None
+        return _fc_conf_for[1]
+
+    def _fontconfig_env(kwargs):
+        # Respect an explicit caller env and a user's own config.
+        if kwargs.get("env") is not None:
+            return
+        if os.environ.get("FONTCONFIG_FILE"):
+            return
+        conf = _fontconfig_file()
+        if conf:
+            env = dict(os.environ)
+            env["FONTCONFIG_FILE"] = conf
+            kwargs["env"] = env
+
+    def _run_fontconfig(*args, **kwargs):
+        _fontconfig_env(kwargs)
+        return _sp_run_posix(*args, **kwargs)
+
+    class _PopenFontconfig(_sp_popen_posix):
+        def __init__(self, *args, **kwargs):
+            _fontconfig_env(kwargs)
+            super().__init__(*args, **kwargs)
+
+    subprocess.run = _run_fontconfig
+    subprocess.Popen = _PopenFontconfig
+
+
+# ---------------------------------------------------------------------------
 # Encode quality tiers (Step 2 "Render quality"). The user's standing
 # preference is maximum picture quality over render speed, so "maximum"
 # is the default everywhere.
@@ -266,6 +331,17 @@ def transcribe(video_path, model_name="base", progress_cb=None,
     if progress_cb:
         progress_cb(15, "Transcribing audio")
 
+    # Digital silence (a muted capture, a silent export) carries no
+    # signal at all, yet the speech model still hallucinates words
+    # over it - stamped minutes past the end of the file. No signal
+    # means no speech: return an empty transcript, which every caller
+    # already reports honestly.
+    import numpy as np
+    if not len(audio) or float(np.abs(audio).max()) < 1e-4:
+        if progress_cb:
+            progress_cb(100, "Transcription complete (0 words)")
+        return []
+
     try:
         lang = None if language in (None, "auto", "") else language
         segments, _info = model.transcribe(
@@ -298,6 +374,18 @@ def transcribe(video_path, model_name="base", progress_cb=None,
                     "word": tok,
                 })
     words = [w for w in words if w["word"]]
+    # Word timings must live inside the audio they came from. On
+    # near-silent or pathological input the decoder can emit words
+    # stamped far past the end of the file, and every downstream
+    # window (detection, captions, exports) trusts those numbers.
+    audio_dur = len(audio) / 16000.0
+    bounded = []
+    for w in words:
+        if w["start"] >= audio_dur:
+            continue
+        w["end"] = min(w["end"], audio_dur)
+        bounded.append(w)
+    words = bounded
     if progress_cb:
         progress_cb(100, f"Transcription complete ({len(words)} words)")
     return words
@@ -1985,11 +2073,22 @@ def write_xml_timeline(clips, out_path, fps=30):
     def stamp(s):
         return f"{max(1, int(round(s * fps)))}/{fps}s"
 
+    # The sequence format must match the clips themselves: hardcoding
+    # 1080x1920 handed 16:9 / 1:1 projects a portrait timeline canvas.
+    width, height = 1080, 1920
+    if clips:
+        try:
+            _w, _h, _f = probe_video(clips[0]["path"])
+            if _w and _h:
+                width, height = int(_w), int(_h)
+        except Exception:  # noqa: BLE001 - keep the 9:16 default
+            pass
     fcpxml = ET.Element("fcpxml", version="1.9")
     resources = ET.SubElement(fcpxml, "resources")
     ET.SubElement(resources, "format", id="f1",
                   name="FFVideoFormatRateUndefined",
-                  frameDuration=f"1/{fps}s", width="1080", height="1920")
+                  frameDuration=f"1/{fps}s", width=str(width),
+                  height=str(height))
     for i, c in enumerate(clips, 1):
         a = ET.SubElement(resources, "asset", id=f"r{i}",
                           name=str(c.get("title", f"clip{i}"))[:80],
@@ -2393,6 +2492,26 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
         pass
     if failed or proc.returncode != 0 or not os.path.exists(out_path):
         raise RuntimeError("ffmpeg encode failed: " + err[-2000:])
+    # A "successful" encode can still be a stub: when OpenCV's bundled
+    # FFmpeg cannot decode the source codec (AV1 is the common case -
+    # YouTube serves it at 1080p), cap.read() fails on frame 0, the
+    # loop writes nothing, and ffmpeg happily muxes an audio-only file
+    # with exit code 0. Count what was actually written against the
+    # kept timeline; if the pipe starved, drop the stub and let the
+    # plain ffmpeg path (which decodes AV1 fine) do the render.
+    expected_frames = sum(e - s for s, e in keep_segs) * fps
+    if written < expected_frames * 0.9:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        if progress_cb:
+            progress_cb(10, "Face tracking couldn't read this video's "
+                            "codec - rendering without it")
+        return _render_plain(video_path, start, end, keep_segs,
+                             ass_path, W, H, ratio, out_path,
+                             progress_cb, punch_zoom=punch_zoom,
+                             enc_preset=enc_preset, enc_crf=enc_crf)
     return out_path
 
 
@@ -3104,6 +3223,58 @@ def _run_ffmpeg_progress(cmd, duration, progress_cb, lo, hi, stage):
                            + " | ".join(tail[-6:])[:400])
 
 
+def _cv2_can_read(video_path):
+    """True when OpenCV can actually decode this file. Some downloads
+    arrive as AV1, which the FFmpeg bundled inside OpenCV cannot
+    decode on many systems: the capture opens fine, then every read
+    fails - detection sees no frames and the AI engines process zero
+    frames before erroring out."""
+    import cv2
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        return False
+    ok, _frame = cap.read()
+    cap.release()
+    return bool(ok)
+
+
+def _opencv_working_copy(video_path):
+    """An H.264 copy of a video OpenCV cannot decode, made by ffmpeg
+    (which handles AV1/VP9 fine). Cached in the temp dir keyed by the
+    source's path+size+mtime, so band detection and the removal run
+    share one conversion. Returns the copy's path, or None when the
+    conversion failed (callers then carry on with the original and
+    surface whatever honest error follows)."""
+    import hashlib
+    try:
+        st = os.stat(video_path)
+        key = hashlib.sha1(
+            f"{os.path.abspath(video_path)}|{st.st_size}|"
+            f"{st.st_mtime_ns}".encode()).hexdigest()[:16]
+    except OSError:
+        return None
+    out = os.path.join(tempfile.gettempdir(),
+                       "itraji-cv2-" + key + ".mp4")
+    if os.path.isfile(out) and os.path.getsize(out) > 1024:
+        return out
+    tmp = out + ".part.mp4"
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", video_path,
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "14",
+         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", tmp],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0 or not os.path.isfile(tmp) \
+            or os.path.getsize(tmp) <= 1024:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    os.replace(tmp, out)
+    return out
+
+
 def remove_captions(video_path, region, mode, out_path,
                     progress_cb=None, quality_tier="maximum"):
     """Remove burned-in captions from a band of the frame.
@@ -3117,6 +3288,17 @@ def remove_captions(video_path, region, mode, out_path,
         mode = "temporal"
     if mode not in ("crop", "fill", "ai", "temporal"):
         raise ValueError("Unknown caption-removal mode: " + str(mode))
+    if mode in ("temporal", "ai") and not _cv2_can_read(video_path):
+        # The AI engines read frames through OpenCV; on a codec it
+        # cannot decode (AV1 downloads) they would process zero
+        # frames. Convert once via ffmpeg and work on the copy -
+        # same pictures, same audio, a codec OpenCV understands.
+        if progress_cb:
+            progress_cb(1, "Converting video (its codec needs a "
+                           "working copy first)")
+        copy_path = _opencv_working_copy(video_path)
+        if copy_path:
+            video_path = copy_path
     W, H, _fps = probe_video(video_path)
     if not W or not H:
         raise RuntimeError("Could not read the video's dimensions.")
@@ -3801,6 +3983,13 @@ def detect_caption_band(video_path, samples=24):
     OCR model cannot be loaded or sees text it cannot cluster.
     found=False means 'no caption band we trust' - callers fall back
     to the standard bottom band and say so."""
+    if not _cv2_can_read(video_path):
+        # Both detectors sample frames through OpenCV; on a codec it
+        # cannot decode (AV1 downloads) they would see zero frames
+        # and report a confident 'no captions' for a captioned video.
+        copy_path = _opencv_working_copy(video_path)
+        if copy_path:
+            video_path = copy_path
     try:
         r = _detect_band_ocr(video_path, samples=min(samples, 18))
         if r is not None:
@@ -3935,6 +4124,12 @@ def find_preview_section(video_path, region, seconds=5.0):
         return (0.0, min(seconds, duration or seconds))
     y0, y1 = _remover_band(region, H)
     band_h = max(2, y1 - y0)
+    if not _cv2_can_read(video_path):
+        # Same codec shim as detect_caption_band: without it the
+        # scan sees zero frames and silently previews from t=0.
+        copy_path = _opencv_working_copy(video_path)
+        if copy_path:
+            video_path = copy_path
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return (0.0, min(seconds, duration))

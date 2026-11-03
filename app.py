@@ -748,7 +748,11 @@ class Api:
         if gate:
             return gate
         job = JOBS.get(job_id)
-        if not job or job["status"] != "transcribed":
+        # "moments" is a valid re-detect state: after a successful scan
+        # (or a keyword find) the job keeps its transcript, and asking
+        # for a fresh scan - another length, the other mode - must not
+        # be mistaken for "no video imported".
+        if not job or job["status"] not in ("transcribed", "moments"):
             return {"ok": False, "error": "Import a video first."}
         clip_min, clip_max = self._clip_len_range(clip_len)
         job["status"] = "working"
@@ -803,7 +807,9 @@ class Api:
         if gate:
             return gate
         job = JOBS.get(job_id)
-        if not job or job["status"] != "transcribed":
+        # Same re-detect rule as detect_offline: "moments" still has a
+        # transcript and may be scanned again.
+        if not job or job["status"] not in ("transcribed", "moments"):
             return {"ok": False, "error": "Import a video first."}
         if not local_ai.model_ready():
             return {"ok": False, "error": "local_ai_missing",
@@ -2106,17 +2112,22 @@ class Api:
         os.close(ass_fd)
         out = os.path.join(outdir, f"captions_preview_{index}.mp4")
         try:
-            from pipeline import build_ass, _ffmpeg_ass_path
+            from pipeline import (build_ass, _ffmpeg_ass_path,
+                                  _fontsdir_opt)
             dur = max(1.0, m["end"] - m["start"])
             build_ass(words, m["start"], m["end"],
                       style,
                       m.get("hook", ""), ass_path, res=(540, 960),
                       emojis=bool(emojis),
                       highlight=bool(highlight))
+            # fontsdir included so the preview uses the same bundled
+            # caption fonts as a real render (it silently fell back to
+            # system fonts before, so previews could lie about fonts).
             cmd = ["ffmpeg", "-y", "-v", "error",
                    "-f", "lavfi", "-i",
                    f"color=c=black:s=540x960:d={dur:.2f}:r=30",
-                   "-vf", f"subtitles={_ffmpeg_ass_path(ass_path)}",
+                   "-vf", f"subtitles={_ffmpeg_ass_path(ass_path)}"
+                          f"{_fontsdir_opt()}",
                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
             r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
