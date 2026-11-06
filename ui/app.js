@@ -621,10 +621,19 @@ async function refreshLocalAiStatus() {
     hide(btn); show(barWrap);
     bar.style.width = (st.pct || 0) + "%";
     pct.textContent = (st.stage || "Downloading…") + " — " + Math.round(st.pct || 0) + "%";
+    // A new attempt replaces any stale failure message from the last one.
+    txt.textContent = "First use needs a one-time download of the AI model (~9 GB). After that it works fully offline, forever.";
   } else {
     show(btn); hide(barWrap); pct.textContent = "";
     if (st.error) {
       txt.textContent = "Download failed: " + st.error + " Check your connection and try again.";
+      if (st.pct > 0) {
+        // The partial download is kept: say it stopped and the next
+        // click resumes, rather than leaving the line blank or stale.
+        pct.textContent = (st.stage && st.stage.indexOf("Download stopped") === 0)
+          ? st.stage
+          : "Download stopped at " + Math.round(st.pct) + "% - click Download to resume";
+      }
     }
   }
   // Studio hub card mirrors the same Built-in AI state.
@@ -638,10 +647,19 @@ async function refreshLocalAiStatus() {
       hide(hBtn); show(hWrap);
       hBar.style.width = (st.pct || 0) + "%";
       hPct.textContent = (st.stage || "Downloading…") + " — " + Math.round(st.pct || 0) + "%";
+      // A new attempt replaces any stale failure message from the last one.
+      hTxt.textContent = "First use needs a one-time download of the AI model (~9 GB). After that it works fully offline, forever.";
     } else {
       show(hBtn); hide(hWrap); hPct.textContent = "";
       if (st.error) {
         hTxt.textContent = "Download failed: " + st.error + " Check your connection and try again.";
+        if (st.pct > 0) {
+          // The partial download is kept: say it stopped and the next
+          // click resumes, rather than leaving the line blank or stale.
+          hPct.textContent = (st.stage && st.stage.indexOf("Download stopped") === 0)
+            ? st.stage
+            : "Download stopped at " + Math.round(st.pct) + "% - click Download to resume";
+        }
       }
     }
   }

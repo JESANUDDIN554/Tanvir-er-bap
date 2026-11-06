@@ -8,8 +8,9 @@ No key and no internet are needed once the one-time downloads
 Downloads land in the app's data area (mirrors app.py's BASE_DIR
 resolution):  <data>/llama/  for the engine,  <data>/models/  for the
 GGUF. Test hooks: ITRAJI_LOCAL_MODEL_URL / ITRAJI_LOCAL_MODEL_FILE /
-ITRAJI_LLAMA_URL override the model/engine downloads, and
-ITRAJI_LOCAL_DATA_DIR overrides the data area.
+ITRAJI_LOCAL_MODEL_MIRROR_URL / ITRAJI_LLAMA_URL override the
+model/engine downloads, and ITRAJI_LOCAL_DATA_DIR overrides the
+data area.
 """
 
 import atexit
@@ -25,6 +26,7 @@ import tarfile
 import threading
 import time
 import zipfile
+from urllib.parse import urlparse
 
 import requests
 
@@ -78,6 +80,27 @@ MODEL_SHA256 = ("e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577"
                 "dafca87c008")
 _MODEL_OVERRIDDEN = bool(os.environ.get("ITRAJI_LOCAL_MODEL_URL")
                          or os.environ.get("ITRAJI_LOCAL_MODEL_FILE"))
+# Mirror of the same model file (same repo path on hf-mirror.com).
+# Some networks cannot reliably resolve huggingface.co - the failure
+# that stranded a user at 99%, every resume re-request dying in DNS -
+# so the download falls back to this host on host-level failures.
+# The bytes are identical, and the finished file is still verified
+# against MODEL_SHA256: the hash gate decides, never the host.
+_MODEL_MIRROR_URL = (os.environ.get("ITRAJI_LOCAL_MODEL_MIRROR_URL")
+                     or "https://hf-mirror.com/bartowski/"
+                        "Qwen2.5-14B-Instruct-GGUF/resolve/main/"
+                        "Qwen2.5-14B-Instruct-Q4_K_M.gguf")
+
+
+def _model_urls():
+    """Download sources for the model file, best first. With a test
+    override of the model URL the mirror stays out of the way unless
+    ITRAJI_LOCAL_MODEL_MIRROR_URL is set explicitly."""
+    urls = [MODEL_URL]
+    if (not _MODEL_OVERRIDDEN
+            or os.environ.get("ITRAJI_LOCAL_MODEL_MIRROR_URL")):
+        urls.append(_MODEL_MIRROR_URL)
+    return urls
 
 
 def model_path():
@@ -433,8 +456,35 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
     _verify_part(tmp, total, expected_sha256)
 
 
+def _is_host_failure(exc):
+    """True when a download failure happened at the host level - the
+    name would not resolve, or no connection could be established -
+    as opposed to a mid-stream drop. Only host-level failures are
+    worth switching download servers over: a drop resumes from the
+    .part on any host, but a host that cannot even be reached will
+    fail every retry the same way."""
+    cur, seen = exc, set()
+    while isinstance(cur, BaseException) and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, socket.gaierror):
+            return True
+        if type(cur).__name__ in ("NameResolutionError",
+                                  "NewConnectionError",
+                                  "ConnectTimeoutError",
+                                  "ReadTimeoutError"):
+            return True
+        nxt = getattr(cur, "reason", None)  # urllib3 MaxRetryError
+        if not isinstance(nxt, BaseException):
+            nxt = cur.__cause__ or cur.__context__
+        cur = nxt
+    text = str(exc)
+    return ("Failed to resolve" in text
+            or "NameResolutionError" in text
+            or "Failed to establish a new connection" in text)
+
+
 def _download_file(url, dest, stage, expected_size=None,
-                   expected_sha256=None):
+                   expected_sha256=None, fallback_urls=()):
     """Stream url -> dest via a .part file + atomic rename, resuming
     across dropped connections and app restarts (see the section
     comment above for the .part lifecycle).
@@ -443,19 +493,44 @@ def _download_file(url, dest, stage, expected_size=None,
     a short backoff, each time resuming from the bytes already on disk;
     progress in _download_state counts those resumed bytes. The file is
     renamed to dest only after verification (byte count against the
-    known total, SHA-256 when pinned)."""
+    known total, SHA-256 when pinned).
+
+    fallback_urls are mirror locations of the SAME file. When the
+    current host fails at the host level (DNS / connect - see
+    _is_host_failure) or keeps answering 5xx, the next attempt
+    switches to the mirror and resumes mid-file from the same .part:
+    Range offsets are host-independent because the bytes are
+    identical, and the final size + SHA-256 gate verifies the
+    assembled file, never the host it came from."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = dest + ".part"
+    urls = [url] + [u for u in fallback_urls if u != url]
+    which = 0
+    server_errors = 0
     for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        active_stage = (stage if which == 0
+                        else stage + " - backup server")
         try:
-            _download_once(url, tmp, stage, expected_size,
-                           expected_sha256)
+            _download_once(urls[which], tmp, active_stage,
+                           expected_size, expected_sha256)
             break
         except _PermanentDownloadError:
             raise
-        except Exception:
+        except Exception as e:  # noqa: BLE001 - classified below
             if attempt >= _DOWNLOAD_ATTEMPTS:
+                if len(urls) > 1 and which > 0:
+                    names = " or ".join(
+                        urlparse(u).hostname or u for u in urls)
+                    raise RuntimeError(
+                        f"could not download from either server "
+                        f"({names}): {e}") from e
                 raise
+            if str(e).startswith("server error (HTTP 5"):
+                server_errors += 1
+            if which + 1 < len(urls) and (
+                    _is_host_failure(e) or server_errors >= 2):
+                which += 1
+                server_errors = 0
             time.sleep(min(2 ** attempt, 16))
     os.replace(tmp, dest)
     _set_state(pct=100)
@@ -515,11 +590,13 @@ def ensure_model():
     if model_ready():
         return model_path()
     expected = None if _MODEL_OVERRIDDEN else MODEL_SIZE
-    _download_file(MODEL_URL, model_path(),
+    urls = _model_urls()
+    _download_file(urls[0], model_path(),
                    "Downloading Built-in AI model (~9 GB)",
                    expected_size=expected,
                    expected_sha256=None if _MODEL_OVERRIDDEN
-                   else MODEL_SHA256)
+                   else MODEL_SHA256,
+                   fallback_urls=urls[1:])
     if not model_ready():
         raise RuntimeError("Built-in AI model download finished but the "
                            "file failed its size check - please retry.")
@@ -533,8 +610,17 @@ def _download_worker():
         _set_state(active=False, done=True, pct=100, error=None,
                    stage="Built-in AI ready")
     except Exception as e:  # noqa: BLE001 - surfaced to the UI
+        with _state_lock:
+            pct = _download_state["pct"]
+        # The stage wording must say the download STOPPED (the .part
+        # is kept and the next click resumes) - a stage still reading
+        # "Downloading..." after a failure is a stale label that made
+        # a dead download look alive at 99%.
+        stage = ("Download stopped at %d%% - click Download to resume"
+                 % pct if pct else
+                 "Download stopped - click Download to resume")
         _set_state(active=False, done=False,
-                   error=str(e)[:300], stage="Download failed")
+                   error=str(e)[:300], stage=stage)
 
 
 def start_download():
