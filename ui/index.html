@@ -115,6 +115,12 @@
         <span class="tool-desc">Style a clip's captions — 20 presets, fonts, positions, animations. Pick a clip in the Library.</span>
         <span class="badge-row"><span class="badge badge-off">Offline</span></span>
       </button>
+      <button type="button" class="tool-card" data-tool="hookmaker" data-name="hook maker hooks opening intro viral first seconds">
+        <span class="tool-emoji">🪝</span>
+        <span class="tool-name">Hook Maker</span>
+        <span class="tool-desc">For videos with a slow start: finds the most gripping moment, writes hook lines from the transcript, and builds a ready-to-post hook clip.</span>
+        <span class="badge-row"><span class="badge badge-new">New</span><span class="badge badge-off">Offline</span></span>
+      </button>
     </div>
 
     <div class="field-label" style="margin-top:20px">Utility tools</div>
@@ -822,6 +828,67 @@
       <div class="row">
         <a id="enhancerDownload" class="primary-btn" href="#" download="enhanced.mp4">Download enhanced video</a>
         <button id="enhancerFolderBtn" class="ghost-btn" type="button">Open folder</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ HOOK MAKER ============ -->
+  <section id="hookmakerView" class="card step-card hidden">
+    <div class="card-kicker">Hook Maker</div>
+    <div class="row-between">
+      <h2>Give a slow-start video a hook</h2>
+      <button class="ghost-btn tool-back" type="button">← Back</button>
+    </div>
+    <p class="sub">Some videos have no hook — the good part is buried in the middle. Hook Maker reads the transcript, finds the single most gripping moment, writes hook lines from what is actually said, and renders a 3–8 second hook clip: use it on its own, or stitched in front of a full clip.</p>
+    <div class="field">
+      <label class="field-label" for="hookProject">Library project</label>
+      <div class="row row-tight">
+        <select id="hookProject" class="select" style="flex:1"><option value="">Pick a project…</option></select>
+        <button id="hookAnalyzeBtn" class="primary" type="button">Analyze video</button>
+        <button id="hookImportBtn" class="ghost-btn" type="button">Import a new video</button>
+      </div>
+    </div>
+    <p id="hookError" class="error hidden"></p>
+    <div id="hookResults" class="hidden">
+      <p class="hint" id="hookModeNote" style="margin-top:4px"></p>
+
+      <div class="field-label" style="margin-top:16px">1 · Pick a hook line <span class="hint">— it becomes the big opening text on the clip</span></div>
+      <div id="hookList"></div>
+
+      <div class="field-label" style="margin-top:18px">2 · The hook moment <span class="hint">— the strongest seconds in the video; nudge the window if you want</span></div>
+      <div class="find-box">
+        <p class="sub" id="hookMomentText" style="margin-top:0"></p>
+        <p class="hint" id="hookMomentMeta"></p>
+        <div class="row row-tight" style="margin-top:10px">
+          <label class="hint" for="hookStartInput">Start (s)</label>
+          <button class="ghost-btn small" type="button" data-nudge="start,-2">−2s</button>
+          <input id="hookStartInput" type="number" min="0" step="0.5" style="max-width:100px">
+          <button class="ghost-btn small" type="button" data-nudge="start,2">+2s</button>
+          <label class="hint" for="hookEndInput" style="margin-left:10px">End (s)</label>
+          <button class="ghost-btn small" type="button" data-nudge="end,-2">−2s</button>
+          <input id="hookEndInput" type="number" min="0" step="0.5" style="max-width:100px">
+          <button class="ghost-btn small" type="button" data-nudge="end,2">+2s</button>
+          <span class="stage" id="hookWindowMeta"></span>
+        </div>
+      </div>
+
+      <div class="field-label" style="margin-top:18px">3 · Render</div>
+      <div class="row">
+        <button id="hookRenderBtn" class="primary" type="button">Render hook clip</button>
+        <span class="stage" id="hookStatus"></span>
+      </div>
+      <div class="row row-tight" style="margin-top:10px">
+        <select id="hookClipSelect" class="select" style="flex:1"></select>
+        <button id="hookComboBtn" class="ghost-btn" type="button">Render hook + clip</button>
+      </div>
+      <div id="hookProgress" class="hidden" style="margin-top:12px">
+        <div class="bar shimmer"><div id="hookBar" class="fill"></div></div>
+        <div class="stage" id="hookStage">Rendering…</div>
+      </div>
+      <p id="hookRenderError" class="error hidden"></p>
+      <div id="hookOutWrap" class="hidden" style="margin-top:14px">
+        <div class="field-label">Your hook renders <span class="hint">— also saved in the project, under Step 3 clips</span></div>
+        <div id="hookOut"></div>
       </div>
     </div>
   </section>

@@ -38,6 +38,7 @@ let toolOpen = null;
 const TOOL_VIEWS = {
   generator: "generatorView", titles: "titlesView", script: "scriptView",
   transcript: "transcriptView", enhancer: "enhancerView",
+  hookmaker: "hookmakerView",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -2073,6 +2074,7 @@ function closeStudioViews() {
   if (toolOpen) { hide($(TOOL_VIEWS[toolOpen])); toolOpen = null; }
   stopGenPoll();
   stopEnhancerPoll();
+  stopHookPoll();
   const sb = $("studioBtn");
   if (sb) sb.classList.remove("on");
 }
@@ -2093,6 +2095,7 @@ function showHub() {
   if (toolOpen) { hide($(TOOL_VIEWS[toolOpen])); toolOpen = null; }
   stopGenPoll();
   stopEnhancerPoll();
+  stopHookPoll();
   stopPoll();
   hubOpen = true;
   hide($("step1")); hide($("step2")); hide($("step3"));
@@ -2120,6 +2123,7 @@ function showTool(name) {
   stopPoll();
   stopGenPoll();
   stopEnhancerPoll();
+  stopHookPoll();
   toolOpen = name;
   hide($("step1")); hide($("step2")); hide($("step3"));
   show($(TOOL_VIEWS[name]));
@@ -2130,6 +2134,12 @@ function showTool(name) {
     fillProjectSelect($("transcriptProject"), "Pick a project…");
   else if (name === "enhancer")
     fillProjectSelect($("enhancerProject"), "Pick a project…");
+  else if (name === "hookmaker") {
+    stopHookPoll();
+    fillProjectSelect($("hookProject"), "Pick a project…").then(() => {
+      if (jobId) $("hookProject").value = jobId;
+    });
+  }
 }
 
 $("studioBtn").addEventListener("click", goHome);
@@ -2588,6 +2598,219 @@ async function pollEnhancer() {
 $("enhancerFolderBtn").addEventListener("click", async () => {
   if (enhancerCurrentId) await api.enhance_open_folder(enhancerCurrentId);
 });
+
+/* ---------------- Studio: Hook Maker ---------------- */
+let hookTimer = null;
+let hookData = null;        // last hook_analyze result
+let hookJobId = null;       // project the analysis belongs to
+let hookSelText = "";       // chosen hook line
+
+function stopHookPoll() {
+  if (hookTimer) { clearInterval(hookTimer); hookTimer = null; }
+}
+
+function hookWindow() {
+  const s = parseFloat($("hookStartInput").value);
+  const e = parseFloat($("hookEndInput").value);
+  return [isNaN(s) ? 0 : s, isNaN(e) ? 0 : e];
+}
+
+function syncHookWindowMeta() {
+  if (!hookData) return;
+  let [s, e] = hookWindow();
+  const dur = hookData.duration || 0;
+  if (dur > 0) {
+    s = Math.max(0, Math.min(s, Math.max(0, dur - 1)));
+    e = Math.max(s + 1, Math.min(e, dur));
+  }
+  if (e - s > 15) e = s + 15;
+  if (e - s < 1) e = s + 1;
+  $("hookStartInput").value = s.toFixed(1);
+  $("hookEndInput").value = e.toFixed(1);
+  $("hookWindowMeta").textContent =
+    `${(e - s).toFixed(1)}s window · ${fmtTime(s)} – ${fmtTime(e)}`;
+}
+
+document.querySelectorAll("[data-nudge]").forEach((b) =>
+  b.addEventListener("click", () => {
+    const [which, d] = b.dataset.nudge.split(",");
+    const input = which === "start" ? $("hookStartInput")
+                                    : $("hookEndInput");
+    input.value = (parseFloat(input.value) || 0) + parseFloat(d);
+    syncHookWindowMeta();
+  }));
+["hookStartInput", "hookEndInput"].forEach((id) =>
+  $(id).addEventListener("change", syncHookWindowMeta));
+
+$("hookImportBtn").addEventListener("click", () => showWizard(1));
+$("hookAnalyzeBtn").addEventListener("click", async () => {
+  const job = $("hookProject").value;
+  hide($("hookError"));
+  hide($("hookResults"));
+  hide($("hookRenderError"));
+  stopHookPoll();
+  hookData = null;
+  hookSelText = "";
+  if (!job) { toast("Pick a Library project first", true); return; }
+  $("hookAnalyzeBtn").disabled = true;
+  let res;
+  try { res = await api.hook_analyze(job); }
+  catch (e) { res = { ok: false, error: "Couldn't reach the local backend." }; }
+  $("hookAnalyzeBtn").disabled = false;
+  if (!res.ok) {
+    $("hookError").textContent = res.error || "Analysis failed.";
+    show($("hookError"));
+    return;
+  }
+  hookData = res;
+  hookJobId = job;
+  $("hookModeNote").textContent = res.note || "";
+  const list = $("hookList");
+  list.innerHTML = "";
+  (res.hooks || []).forEach((h, i) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "title-row hook-row" + (i === 0 ? " sel" : "");
+    row.innerHTML = `${scoreChip(h.score)}<span class="t-text">${escapeHtml(h.text)}</span>`;
+    row.addEventListener("click", () => {
+      list.querySelectorAll(".hook-row").forEach((r) =>
+        r.classList.remove("sel"));
+      row.classList.add("sel");
+      hookSelText = h.text;
+    });
+    list.appendChild(row);
+    if (i === 0) hookSelText = h.text;
+  });
+  const m = res.moment;
+  if (m) {
+    $("hookMomentText").textContent = "“" + (m.text || "") + "”";
+    const srcLabel = m.source === "moment" ? "your top detected moment"
+      : m.source === "detected" ? "found by detection"
+      : "best transcript segment";
+    $("hookMomentMeta").textContent =
+      `${fmtTime(m.segment_start)} – ${fmtTime(m.segment_end)} · ${srcLabel} · score ${m.score}. ` +
+      "The render window below is trimmed to its most intense seconds.";
+    $("hookStartInput").value = Number(m.start).toFixed(1);
+    $("hookEndInput").value = Number(m.end).toFixed(1);
+  } else {
+    $("hookMomentText").textContent =
+      "No strong moment found in the transcript.";
+    $("hookMomentMeta").textContent = "";
+    $("hookStartInput").value = "0";
+    $("hookEndInput").value = "5";
+  }
+  syncHookWindowMeta();
+  const sel = $("hookClipSelect");
+  sel.innerHTML = "";
+  (res.clips || []).forEach((c, i) => {
+    const o = document.createElement("option");
+    o.value = i;
+    o.textContent = `${fmtTime(c.start)} – ${fmtTime(c.end)} · ${c.title || "Clip"} (score ${c.virality})`;
+    sel.appendChild(o);
+  });
+  if (!(res.clips || []).length) {
+    const o = document.createElement("option");
+    o.value = "";
+    o.textContent = "No clips detected — render the hook clip on its own";
+    sel.appendChild(o);
+  }
+  $("hookComboBtn").disabled = !(res.clips || []).length;
+  hide($("hookOutWrap"));
+  $("hookOut").innerHTML = "";
+  show($("hookResults"));
+});
+
+async function hookStartRender(kind) {
+  if (!hookData || !hookJobId) {
+    toast("Analyze a video first", true);
+    return;
+  }
+  if (!hookSelText) { toast("Pick a hook line first", true); return; }
+  const [s, e] = hookWindow();
+  hide($("hookRenderError"));
+  let res;
+  try {
+    if (kind === "combo") {
+      const c = (hookData.clips || [])[
+        parseInt($("hookClipSelect").value, 10)];
+      if (!c) { toast("No clip picked", true); return; }
+      res = await api.hook_combo(hookJobId, hookSelText, s, e,
+        c.index, c.start, c.end, c.title || "");
+    } else {
+      res = await api.hook_render(hookJobId, hookSelText, s, e);
+    }
+  } catch (err) {
+    res = { ok: false, error: "Couldn't reach the local backend." };
+  }
+  if (!res.ok) {
+    $("hookRenderError").textContent =
+      res.message || res.error || "Render failed to start.";
+    show($("hookRenderError"));
+    return;
+  }
+  $("hookRenderBtn").disabled = true;
+  $("hookComboBtn").disabled = true;
+  show($("hookProgress"));
+  $("hookBar").style.width = "0%";
+  $("hookStage").textContent = "Rendering…";
+  $("hookStatus").textContent = "Rendering…";
+  stopHookPoll();
+  hookTimer = setInterval(pollHook, 1000);
+  pollHook();
+}
+
+async function pollHook() {
+  if (!hookJobId) { stopHookPoll(); return; }
+  let st;
+  try { st = await api.job_status(hookJobId); }
+  catch (e) { return; }
+  if (st.status === "missing") { stopHookPoll(); return; }
+  if (st.status === "working") {
+    $("hookBar").style.width = (st.progress || 0) + "%";
+    $("hookStage").textContent = st.stage || "Rendering…";
+    return;
+  }
+  stopHookPoll();
+  hide($("hookProgress"));
+  $("hookStatus").textContent = "";
+  $("hookRenderBtn").disabled = false;
+  $("hookComboBtn").disabled =
+    !(hookData && (hookData.clips || []).length);
+  if (st.render_error) {
+    $("hookRenderError").textContent = st.render_error;
+    show($("hookRenderError"));
+    return;
+  }
+  renderHookOut(st.renders || []);
+  toast("Hook render finished");
+}
+
+function renderHookOut(renders) {
+  const mine = (renders || []).filter((r) =>
+    r.hook_clip || r.title === "Hook + clip");
+  if (!mine.length) return;
+  const wrap = $("hookOut");
+  wrap.innerHTML = "";
+  mine.forEach((r) => {
+    const row = document.createElement("div");
+    row.className = "hook-out-row";
+    const label = document.createElement("span");
+    label.className = "t-text";
+    label.textContent = r.title || "Hook clip";
+    row.appendChild(label);
+    const a = document.createElement("a");
+    a.className = "ghost-btn small";
+    a.href = r.url || "#";
+    a.setAttribute("download", "");
+    a.textContent = "Download";
+    row.appendChild(a);
+    wrap.appendChild(row);
+  });
+  show($("hookOutWrap"));
+}
+
+$("hookRenderBtn").addEventListener("click", () => hookStartRender("single"));
+$("hookComboBtn").addEventListener("click", () => hookStartRender("combo"));
 
 /* ---------------- settings ---------------- */
 function openSettings() {

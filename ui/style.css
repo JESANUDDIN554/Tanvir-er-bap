@@ -870,6 +870,12 @@ input[type=range]:focus-visible {
 .title-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; margin-top: 8px;
   border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
 .title-row .t-text { flex: 1; min-width: 0; font-weight: 600; font-size: 14px; }
+.hook-row { cursor: pointer; width: 100%; text-align: left; color: inherit; font: inherit; }
+.hook-row:hover { border-color: var(--border-strong); }
+.hook-row.sel { border-color: var(--accent); background: var(--accent-dim); }
+.hook-out-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; margin-top: 8px;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.hook-out-row .t-text { flex: 1; min-width: 0; font-weight: 600; font-size: 14px; }
 .script-out { white-space: pre-wrap; word-break: break-word; border: 1px solid var(--border);
   border-radius: 12px; background: var(--surface); padding: 16px; font-size: 14.5px; line-height: 1.65; }
 #transcriptText, #genPrompt, #scriptTopic, #titlesView textarea { width: 100%; }

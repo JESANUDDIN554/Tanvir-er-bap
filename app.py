@@ -35,6 +35,7 @@ from pipeline import (  # noqa: E402
     generate_posting_package, remove_captions, detect_caption_band,
     preview_caption_removal,
     generate_titles, generate_script, enhance_video,
+    generate_hooks, find_hook_moment,
     LANGUAGES, GENRES, RATIOS,
 )
 
@@ -1267,6 +1268,329 @@ class Api:
         return generate_script(topic or "", tone or "Energetic",
                                seconds)
 
+    # -- Studio: Hook Maker ----------------------------------------------
+    # For videos with no hook of their own: analyze finds the most
+    # gripping moment + hook lines from the transcript, then renders a
+    # 3-8s hook clip (chosen hook text burned in as the opening
+    # overlay), alone or stitched in front of one of the video's clips.
+
+    def _hook_opts(self):
+        """Render opts for hook clips: the standard Settings-based
+        assembly, with two deliberate overrides - filler/silence
+        cutting stays OFF (a hook is 3-8 raw seconds, and skipping
+        the cuts keeps the caption timing an exact rebase of the
+        source window) and the ratio is always 9:16 (a hook clip is
+        a ready-to-post vertical, whatever ratio the wizard last
+        used for other work)."""
+        opts = self._render_opts(None)
+        opts["remove_fillers"] = False
+        opts["remove_silences"] = False
+        opts["ratio"] = "9:16"
+        return opts
+
+    def _hook_window(self, job, start, end):
+        """Validate a hook window against the video: returns
+        (start, end) floats, or None when unusable."""
+        try:
+            s, e = float(start), float(end)
+        except (TypeError, ValueError):
+            return None
+        dur = float(job.get("duration") or 0)
+        if dur <= 0:
+            return None
+        s = max(0.0, min(s, dur))
+        e = max(0.0, min(e, dur))
+        if e - s < 1.0 or e - s > 15.0:
+            return None
+        return round(s, 2), round(e, 2)
+
+    def hook_analyze(self, job_id):
+        """Hook lines + the strongest hook moment for one project."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        _load_library()
+        job = JOBS.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Project not found."}
+        if job.get("status") == "working":
+            return {"ok": False, "state": "working",
+                    "error": "That video is still importing / "
+                             "transcribing - wait for it to finish, "
+                             "then analyze."}
+        words = job.get("words") or []
+        if not words:
+            return {"ok": False, "state": "no_transcript",
+                    "error": "That project has no transcript yet - a "
+                             "hook is built from what is said in the "
+                             "video."}
+        # session cache: re-analyzing an unchanged project (notably
+        # with the Built-in AI, whose chat call is slow) returns
+        # instantly; a fresh detection run changes the moment count
+        # and so invalidates it
+        cache = job.get("_hook_cache") or {}
+        if cache.get("n_words") == len(words) \
+                and cache.get("n_moments") == len(job.get("moments")
+                                                  or []) \
+                and cache.get("result"):
+            return dict(cache["result"])
+        settings = load_settings()
+        res = generate_hooks(words, genre=settings.get("genre", ""))
+        moment = find_hook_moment(words, job.get("duration", 0),
+                                  job.get("moments") or None)
+        clips = [{"index": i, "start": m["start"], "end": m["end"],
+                  "title": m.get("title", ""),
+                  "virality": m.get("virality", 0)}
+                 for i, m in enumerate(job.get("moments") or [])]
+        if not clips and moment and moment["source"] == "detected":
+            clips = [{"index": -1,
+                      "start": moment["segment_start"],
+                      "end": moment["segment_end"],
+                      "title": "Strongest detected moment",
+                      "virality": moment["score"]}]
+        out = {"ok": True, "hooks": res["hooks"], "mode": res["mode"],
+               "note": res["note"], "moment": moment, "clips": clips,
+               "duration": job.get("duration", 0),
+               "title": job.get("title", "")}
+        job["_hook_cache"] = {"n_words": len(words),
+                              "n_moments": len(job.get("moments")
+                                               or []),
+                              "result": out}
+        return out
+
+    def _hook_begin(self, job_id, stage):
+        """Shared start for hook renders: render lock + status flip.
+        Returns (job, lock, error_dict)."""
+        job = JOBS.get(job_id)
+        if not job:
+            return None, None, {"ok": False,
+                                "error": "Project not found."}
+        lock = job.setdefault("_render_lock", threading.Lock())
+        if not lock.acquire(blocking=False):
+            return None, None, {
+                "ok": False, "error": "render_in_progress",
+                "message": "A render is already running for this "
+                           "video - wait for it to finish."}
+        job["_hook_prev_status"] = job.get("status", "transcribed")
+        job["status"] = "working"
+        job["stage"] = stage
+        job["progress"] = 0
+        job.pop("render_error", None)
+        return job, lock, None
+
+    def _hook_end(self, job, ok, stage):
+        if ok:
+            job["status"] = "done"
+            job["stage"] = stage
+            job["progress"] = 100
+        else:
+            job["status"] = job.pop("_hook_prev_status", "transcribed")
+            job["stage"] = stage
+        job.pop("_hook_prev_status", None)
+        lock = job.get("_render_lock")
+        if lock is not None:
+            try:
+                lock.release()
+            except RuntimeError:
+                pass  # already released
+
+    def _hook_out_path(self, job, outdir, prefix):
+        """Next free hook-render filename in the job's clips folder.
+        The sequence counter is session-only, so names already
+        referenced by saved renders (e.g. after an app restart) are
+        skipped - a new render never overwrites a registered one."""
+        used = {os.path.basename(r.get("path", ""))
+                for r in job.get("renders", [])}
+        seq = int(job.get("_hook_seq", 0))
+        while True:
+            seq += 1
+            name = f"{prefix}_{seq:02d}.mp4"
+            if name not in used:
+                break
+        job["_hook_seq"] = seq
+        return os.path.join(outdir, name)
+
+    def _render_hook_file(self, job_id, job, hook_text, start, end,
+                          score):
+        """Render the hook clip itself and register it in the job's
+        renders (its words are stored rebased onto the clip timeline,
+        so SRT/VTT exports and merges treat it like a merged entry).
+        Returns the render entry's index in job["renders"]."""
+        outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
+        os.makedirs(outdir, exist_ok=True)
+        out = self._hook_out_path(job, outdir, "hook")
+        moment = {"start": start, "end": end, "title": "Hook",
+                  "hook": hook_text, "virality": score}
+        self._call_render_clip(job_id, job, moment, out,
+                               self._hook_opts())
+        rebased = [{"start": round(max(0.0, w["start"] - start), 3),
+                    "end": round(max(0.0, w["end"] - start), 3),
+                    "word": w["word"]}
+                   for w in job["words"]
+                   if w["end"] > start and w["start"] < end]
+        job.setdefault("renders", []).append({
+            "path": out, "title": "Hook clip",
+            "virality": score, "moment_index": -1,
+            "words": rebased, "merged_duration": round(end - start, 2),
+            "hook_clip": True, "hook_text": hook_text,
+            "url": self._download_url(job_id, out)})
+        _job_log(job_id, "Render finished - " + os.path.basename(out))
+        return len(job["renders"]) - 1
+
+    def hook_render(self, job_id, hook_text, start, end):
+        """Render just the hook clip (3-8s, chosen hook text as the
+        opening overlay + standard captions)."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        _load_library()
+        job = JOBS.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Project not found."}
+        hook_text = (hook_text or "").strip()
+        if not hook_text:
+            return {"ok": False,
+                    "error": "Pick a hook line first."}
+        win = self._hook_window(job, start, end)
+        if not win:
+            return {"ok": False,
+                    "error": "That hook window doesn't fit the video "
+                             "(needs 1-15s inside it)."}
+        job, lock, err = self._hook_begin(job_id, "Rendering hook clip")
+        if err:
+            return err
+        t = threading.Thread(
+            target=self._run_hook_render,
+            args=(job_id, hook_text[:90], win[0], win[1]),
+            daemon=True)
+        t.start()
+        return {"ok": True}
+
+    def _run_hook_render(self, job_id, hook_text, start, end):
+        job = JOBS[job_id]
+        try:
+            self._render_hook_file(job_id, job, hook_text, start, end,
+                                   90)
+            self._hook_end(job, True, "Hook clip ready")
+        except Exception as e:  # noqa: BLE001
+            job["render_error"] = "Hook render failed: " + str(e)[:220]
+            _job_log(job_id, "ERROR: " + job["render_error"])
+            self._hook_end(job, False, "Hook render failed")
+        _save_job(job_id)
+
+    def hook_combo(self, job_id, hook_text, start, end,
+                   clip_index=-1, clip_start=None, clip_end=None,
+                   clip_title=""):
+        """Render hook + one clip with the hook stitched in front.
+
+        clip_index >= 0 picks one of the job's detected moments (an
+        existing render of it is reused when present); otherwise
+        clip_start/clip_end give the segment directly."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        _load_library()
+        job = JOBS.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Project not found."}
+        hook_text = (hook_text or "").strip()
+        if not hook_text:
+            return {"ok": False, "error": "Pick a hook line first."}
+        win = self._hook_window(job, start, end)
+        if not win:
+            return {"ok": False,
+                    "error": "That hook window doesn't fit the video "
+                             "(needs 1-15s inside it)."}
+        try:
+            clip_index = int(clip_index)
+        except (TypeError, ValueError):
+            clip_index = -1
+        moment = None
+        if 0 <= clip_index < len(job.get("moments") or []):
+            moment = job["moments"][clip_index]
+        else:
+            # a raw segment (e.g. the detected candidate when the job
+            # has no moments of its own): validate against the plain
+            # video bounds - a clip may be longer than a hook window
+            if clip_start is not None:
+                try:
+                    cs, ce = float(clip_start), float(clip_end)
+                except (TypeError, ValueError):
+                    cs, ce = -1.0, -1.0
+                dur = float(job.get("duration") or 0)
+                if 0 <= cs < ce <= dur and ce - cs >= 1.0:
+                    moment = {"start": round(cs, 2),
+                              "end": round(ce, 2),
+                              "title": clip_title or "Clip",
+                              "hook": "", "virality": 0}
+            if moment is None:
+                return {"ok": False,
+                        "error": "Pick a clip to put the hook in "
+                                 "front of."}
+        job, lock, err = self._hook_begin(
+            job_id, "Rendering hook + clip")
+        if err:
+            return err
+        t = threading.Thread(
+            target=self._run_hook_combo,
+            args=(job_id, hook_text[:90], win[0], win[1], moment,
+                  clip_index),
+            daemon=True)
+        t.start()
+        return {"ok": True}
+
+    def _run_hook_combo(self, job_id, hook_text, start, end, moment,
+                        clip_index):
+        job = JOBS[job_id]
+        try:
+            ih = self._render_hook_file(
+                job_id, job, hook_text, start, end,
+                int(moment.get("virality", 0) or 0) or 90)
+            job["stage"] = "Rendering hook + clip"
+            # the clip itself: reuse an existing straight render of
+            # the moment when there is one, else render it now (with
+            # no hook overlay of its own - the hook segment carries
+            # the hook)
+            ic = None
+            if clip_index >= 0:
+                for i, r in enumerate(job.get("renders", [])):
+                    if r.get("moment_index") == clip_index \
+                            and not r.get("hook_clip") \
+                            and not r.get("merged") \
+                            and os.path.isfile(r.get("path", "")):
+                        ic = i
+                        break
+            if ic is None:
+                outdir = os.path.join(BASE_DIR, "work", job_id,
+                                      "clips")
+                os.makedirs(outdir, exist_ok=True)
+                out = self._hook_out_path(job, outdir, "hookclip")
+                cm = dict(moment)
+                cm["hook"] = ""
+                self._call_render_clip(job_id, job, cm, out,
+                                       self._hook_opts())
+                job["renders"].append({
+                    "path": out, "title": moment.get("title", "Clip"),
+                    "virality": int(moment.get("virality", 0) or 0),
+                    "moment_index": clip_index,
+                    "url": self._download_url(job_id, out)})
+                _job_log(job_id, "Render finished - "
+                         + os.path.basename(out))
+                ic = len(job["renders"]) - 1
+            merged = self.merge_selected(job_id, [ih, ic],
+                                         transition="cut")
+            if not merged.get("ok"):
+                raise RuntimeError(merged.get("error")
+                                   or "merge failed")
+            job["renders"][-1]["title"] = "Hook + clip"
+            self._hook_end(job, True, "Hook + clip ready")
+        except Exception as e:  # noqa: BLE001
+            job["render_error"] = ("Hook + clip failed: "
+                                   + str(e)[:220])
+            _job_log(job_id, "ERROR: " + job["render_error"])
+            self._hook_end(job, False, "Hook + clip failed")
+        _save_job(job_id)
+
     # -- Studio: Transcript tool ------------------------------------------
     def get_transcript(self, job_id):
         """A project's full transcript: plain text + timed segments."""
@@ -1646,27 +1970,9 @@ class Api:
         return {"ok": True, "found": len(fresh), "unmatched": unmatched}
 
     # -- render ----------------------------------------------------------
-    def render(self, job_id, indices, options=None):
-        gate = _license_gate()
-        if gate:
-            return gate
-        job = JOBS.get(job_id)
-        if not job or not job.get("moments"):
-            return {"ok": False, "error": "Nothing to render yet."}
-        try:
-            indices = [int(i) for i in (indices or [])]
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "Bad clip selection."}
-        if not indices or any(i < 0 or i >= len(job["moments"])
-                              for i in indices):
-            return {"ok": False, "error": "Clip selection out of range."}
-        # one render per job at a time: two threads writing the same
-        # 01_title.mp4 filenames corrupt each other's output
-        lock = job.setdefault("_render_lock", threading.Lock())
-        if not lock.acquire(blocking=False):
-            return {"ok": False, "error": "render_in_progress",
-                    "message": "A render is already running for this "
-                               "video - wait for it to finish."}
+    def _render_opts(self, options=None):
+        """Assemble render options: per-call values layered over the
+        Settings defaults (shared by Clip Maker and Hook Maker)."""
         settings = load_settings()
         opts = dict(options or {})
         # defaults from settings, overridable per render call
@@ -1674,7 +1980,7 @@ class Api:
                     "remove_fillers", "remove_silences", "auto_censor",
                     "emojis", "highlight", "speaker_colors", "hook_overlay",
                     "cta_overlay", "cta_text", "safe_zone", "punch_zoom",
-                    "enhance_clarity", "logo_path"):
+                    "enhance_clarity", "logo_path", "quality_tier"):
             opts.setdefault(key, settings.get(key))
         opts.setdefault("caption_style", "bold-pop")
         opts.setdefault("ratio", "9:16")
@@ -1699,6 +2005,30 @@ class Api:
         logo = (opts.get("logo_path")
                 or settings.get("logo_path", "")).strip()
         opts["logo_path"] = logo or None
+        return opts
+
+    def render(self, job_id, indices, options=None):
+        gate = _license_gate()
+        if gate:
+            return gate
+        job = JOBS.get(job_id)
+        if not job or not job.get("moments"):
+            return {"ok": False, "error": "Nothing to render yet."}
+        try:
+            indices = [int(i) for i in (indices or [])]
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Bad clip selection."}
+        if not indices or any(i < 0 or i >= len(job["moments"])
+                              for i in indices):
+            return {"ok": False, "error": "Clip selection out of range."}
+        # one render per job at a time: two threads writing the same
+        # 01_title.mp4 filenames corrupt each other's output
+        lock = job.setdefault("_render_lock", threading.Lock())
+        if not lock.acquire(blocking=False):
+            return {"ok": False, "error": "render_in_progress",
+                    "message": "A render is already running for this "
+                               "video - wait for it to finish."}
+        opts = self._render_opts(options)
         job["last_render_opts"] = {k: opts.get(k) for k in
                                    ("caption_style", "ratio", "quality",
                                     "face_track", "remove_fillers",
@@ -1727,6 +2057,35 @@ class Api:
                     lock.release()
                 except RuntimeError:
                     pass  # already released
+
+    def _call_render_clip(self, job_id, job, moment, out, opts):
+        """One render_clip call with the standard opts mapping -
+        shared by batch renders (below) and Hook Maker."""
+        render_clip(job["video_path"], moment, job["words"],
+                    opts.get("caption_style", "bold-pop"),
+                    out, _job_progress(job_id),
+                    face_track=bool(opts.get("face_track", True)),
+                    remove_fillers=bool(opts.get("remove_fillers")),
+                    remove_silences=bool(opts.get("remove_silences")),
+                    auto_censor=bool(opts.get("auto_censor")),
+                    emojis=bool(opts.get("emojis")),
+                    highlight=bool(opts.get("highlight")),
+                    ratio=opts.get("ratio", "9:16"),
+                    quality=opts.get("quality", "1080p"),
+                    custom_styles=opts.get("custom_styles", []),
+                    edited_words=moment.get("edited_words"),
+                    speaker_colors=opts.get("speaker_colors"),
+                    hook_overlay=bool(opts.get("hook_overlay",
+                                               True)),
+                    cta_text=opts.get("cta_text"),
+                    safe_zone=bool(opts.get("safe_zone")),
+                    punch_zoom=bool(opts.get("punch_zoom")),
+                    enhance_clarity=bool(
+                        opts.get("enhance_clarity")),
+                    logo_path=opts.get("logo_path"),
+                    quality_tier=opts.get("quality_tier",
+                                          "maximum"),
+                    caption_params=opts.get("caption_params"))
 
     def _render_clips(self, job_id, indices, opts):
         job = JOBS[job_id]
@@ -1761,31 +2120,7 @@ class Api:
                 # named by MOMENT index (stable across batches), so
                 # two batches can never overwrite each other's files
                 out = os.path.join(outdir, f"{i + 1:02d}_{safe}{tag}.mp4")
-                render_clip(job["video_path"], m, job["words"],
-                            opts.get("caption_style", "bold-pop"),
-                            out, _job_progress(job_id),
-                            face_track=bool(opts.get("face_track", True)),
-                            remove_fillers=bool(opts.get("remove_fillers")),
-                            remove_silences=bool(opts.get("remove_silences")),
-                            auto_censor=bool(opts.get("auto_censor")),
-                            emojis=bool(opts.get("emojis")),
-                            highlight=bool(opts.get("highlight")),
-                            ratio=opts.get("ratio", "9:16"),
-                            quality=opts.get("quality", "1080p"),
-                            custom_styles=opts.get("custom_styles", []),
-                            edited_words=m.get("edited_words"),
-                            speaker_colors=opts.get("speaker_colors"),
-                            hook_overlay=bool(opts.get("hook_overlay",
-                                                       True)),
-                            cta_text=opts.get("cta_text"),
-                            safe_zone=bool(opts.get("safe_zone")),
-                            punch_zoom=bool(opts.get("punch_zoom")),
-                            enhance_clarity=bool(
-                                opts.get("enhance_clarity")),
-                            logo_path=opts.get("logo_path"),
-                            quality_tier=opts.get("quality_tier",
-                                                  "maximum"),
-                            caption_params=opts.get("caption_params"))
+                self._call_render_clip(job_id, job, m, out, opts)
                 _rd = {"path": out, "title": m["title"],
                        "virality": m["virality"],
                        "moment_index": i,

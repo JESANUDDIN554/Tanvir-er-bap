@@ -1180,6 +1180,327 @@ def generate_script(topic, tone="Energetic", seconds=60):
     return {"ok": True, "script": script, "mode": "ai"}
 
 
+# ---------------------------------------------------------------------------
+# Studio: Hook Maker. For videos whose own opening is too slow to stop
+# the scroll: find the single most gripping moment in the video, write
+# hook lines from what is actually said, and (in app.py) render a short
+# hook clip from it. Same honesty rules as Titles: AI-written only when
+# the Built-in AI is present; otherwise the hooks are the transcript's
+# own lines, labeled "basic" - never presented as AI work.
+# ---------------------------------------------------------------------------
+
+HOOKS_PROMPT_TEMPLATE = """You are an expert short-form video hook \
+writer for Facebook Reels / TikTok / YouTube Shorts. The video below \
+has a weak, slow opening, so its hook must be MANUFACTURED from the \
+most gripping thing that actually happens in it.
+
+Transcript:
+{transcript}
+{genre_line}
+Write 10 scroll-stopping hook lines for this video. A hook is the \
+first on-screen text / spoken line of a clip. Rules:
+- Every hook must be grounded in something that REALLY happens or is \
+said in the transcript - no invented events, no clickbait lies.
+- Max 12 words each. Punchy, specific, curiosity-driven: a question, \
+a shock, a warning, or the most intense moment teased without \
+spoiling it.
+- Score every hook 0-100 for scroll-stopping power (honest, spread \
+the scores).
+- Reply with ONLY a JSON object, no prose:
+{{"hooks": [{{"text": "...", "score": 87}}]}}"""
+
+# Extra high-stakes vocabulary for hook scoring (bodycam / news heavy,
+# on top of OFFLINE_ENERGY_WORDS).
+_HOOK_STAKES_WORDS = {
+    "dead", "died", "dies", "killed", "blood", "crash", "crashed",
+    "fire", "knife", "attack", "attacked", "screaming", "screams",
+    "help", "stop", "warning", "danger", "handcuffs", "tased",
+    "taser", "ran", "running", "fight", "shot", "shooting",
+    "stolen", "robbery", "hostage", "exploded", "trapped",
+}
+
+_HOOK_OPENERS = {
+    "what", "why", "how", "who", "when", "watch", "look", "listen",
+    "stop", "wait", "never", "imagine", "this",
+}
+
+
+def _transcript_sentences(words):
+    """Group timed words into sentences.
+
+    Returns [{start, end, text, words}]. A sentence closes on terminal
+    punctuation or after 30 words (whisper pauses are unreliable)."""
+    sents, cur = [], []
+    for w in words or []:
+        cur.append(w)
+        t = (w.get("word") or "").strip()
+        if t.endswith((".", "!", "?")) or len(cur) >= 30:
+            sents.append(cur)
+            cur = []
+    if cur:
+        sents.append(cur)
+    out = []
+    for ws in sents:
+        text = " ".join(w["word"] for w in ws).strip()
+        if text:
+            out.append({"start": ws[0]["start"], "end": ws[-1]["end"],
+                        "text": text, "words": ws})
+    return out
+
+
+def _score_hook_sentence(sent):
+    """Hook-likeness of one sentence, 0-100 (heuristic, honest).
+
+    Rewards questions / exclamations, high-stakes and energy words,
+    numbers, direct openers (what/why/watch/…) and a punchy length;
+    calm filler scores low."""
+    ws = sent["words"]
+    toks = [_clean_word(w["word"]) for w in ws]
+    n = max(len(toks), 1)
+    energy = sum(1 for t in toks if t in OFFLINE_ENERGY_WORDS)
+    stakes = sum(1 for t in toks if t in _HOOK_STAKES_WORDS)
+    score = min(42, (energy * 2 + stakes * 3) * 7)
+    text = sent["text"].rstrip()
+    if text.endswith("?"):
+        score += 22
+    elif text.endswith("!"):
+        score += 16
+    if any(any(ch.isdigit() for ch in w["word"]) for w in ws):
+        score += 10
+    if toks and toks[0] in _HOOK_OPENERS:
+        score += 8
+    if 4 <= n <= 14:
+        score += 12
+    elif n <= 20:
+        score += 5
+    elif n > 26:
+        score -= 8
+    return max(5, min(97, round(score)))
+
+
+def _basic_hooks(words):
+    """Extractive hook lines: the transcript's own most gripping
+    lines, ranked (plus a curiosity-cut opener variant of the best
+    ones). Verbatim transcript text - labeled "basic" by callers,
+    never presented as AI work."""
+    sents = _transcript_sentences(words)
+    if not sents:
+        return []
+    ranked = sorted(sents, key=_score_hook_sentence, reverse=True)
+
+    def _trim(text, n=90):
+        text = " ".join(text.split())
+        return text if len(text) <= n else \
+            text[:n].rsplit(" ", 1)[0] + "…"
+
+    out, seen = [], set()
+
+    def _add(text, score):
+        t = _trim(text)
+        key = t.lower().strip(" .…")
+        if len(t.split()) >= 3 and key and key not in seen:
+            seen.add(key)
+            out.append({"text": t,
+                        "score": max(25, min(97, int(score)))})
+
+    for s in ranked:
+        _add(s["text"], _score_hook_sentence(s))
+        if len(out) >= 7:
+            break
+    # curiosity cuts: the opening words of the best sentences, cut
+    # mid-thought so the viewer has to keep watching to finish it.
+    for s in ranked:
+        toks = s["text"].split()
+        if len(toks) >= 9:
+            _add(" ".join(toks[:7]) + "…",
+                 _score_hook_sentence(s) - 4)
+        if len(out) >= 10:
+            break
+    out.sort(key=lambda h: h["score"], reverse=True)
+    return out[:10]
+
+
+def generate_hooks(words, genre=""):
+    """8-10 ranked hook lines written from the transcript.
+
+    Built-in AI when its model is downloaded ("ai" mode); honest
+    extractive lines otherwise ("basic" mode). With no transcript
+    there is nothing truthful to hook from ("needs_transcript")."""
+    words = words or []
+    if not words:
+        return {"hooks": [], "mode": "needs_transcript",
+                "note": "A hook is built from what is said in the "
+                        "video - this project has no transcript yet."}
+    try:
+        import local_ai
+        ready = local_ai.model_ready()
+    except Exception:  # noqa: BLE001 - local AI unavailable
+        ready = False
+    if ready:
+        try:
+            genre_line = ("\nContent type: " + genre.strip()[:60] + "\n"
+                          if (genre or "").strip() else "")
+            raw = local_ai.chat([{
+                "role": "user",
+                "content": HOOKS_PROMPT_TEMPLATE.format(
+                    transcript=_words_text(words, cap=9000),
+                    genre_line=genre_line)}])
+            data = local_ai.extract_json(raw)
+            hooks = []
+            for it in data.get("hooks") or []:
+                if isinstance(it, dict):
+                    t = str(it.get("text", "")).strip()
+                    try:
+                        sc = int(float(it.get("score", 50)))
+                    except (TypeError, ValueError):
+                        sc = 50
+                else:
+                    t, sc = str(it).strip(), 50
+                if t:
+                    hooks.append({"text": t[:90],
+                                  "score": max(0, min(100, sc))})
+                if len(hooks) == 10:
+                    break
+            if len(hooks) >= 4:
+                hooks.sort(key=lambda h: h["score"], reverse=True)
+                return {"hooks": hooks, "mode": "ai",
+                        "note": "Written by the Built-in AI from this "
+                                "video's transcript."}
+            raise RuntimeError("the model returned too few hooks")
+        except Exception as e:  # noqa: BLE001 - honest fallback
+            hooks = _basic_hooks(words)
+            if hooks:
+                return {"hooks": hooks, "mode": "basic",
+                        "note": ("Built-in AI request failed (%s) - "
+                                 "hooks are the transcript's own most "
+                                 "gripping lines instead."
+                                 % str(e)[:80])}
+    hooks = _basic_hooks(words)
+    if hooks:
+        return {"hooks": hooks, "mode": "basic",
+                "note": ("Basic mode (Built-in AI not downloaded): "
+                         "hooks are the transcript's own most gripping "
+                         "lines, lightly trimmed and ranked. Download "
+                         "the Built-in AI for hooks written from "
+                         "scratch.")}
+    return {"hooks": [], "mode": "needs_transcript",
+            "note": "No usable spoken lines were found in the "
+                    "transcript to build a hook from."}
+
+
+def hook_render_window(words, start, end, lo=3.0, hi=8.0,
+                       target=6.0):
+    """The window a hook clip should render: [start, end] unchanged
+    when it already fits the 3-8s hook range; longer segments are
+    trimmed to their most intense ~target-second sub-window, scored
+    with the same heuristic the offline detector uses."""
+    start, end = float(start), float(end)
+    if end - start <= hi:
+        return round(start, 2), round(end, 2)
+    win = [w for w in words or []
+           if w["end"] > start and w["start"] < end]
+    best_s, best_v = start, -1.0
+    dense_s, dense_n = start, -1
+    t = start
+    while t + target <= end + 0.001:
+        ww = [w for w in win if w["end"] > t and w["start"] < t + target]
+        if len(ww) > dense_n:
+            dense_n, dense_s = len(ww), t
+        if len(ww) >= 4:
+            v, _h, _f, _val, _p = _score_offline_window(ww, None, target)
+            if v > best_v:
+                best_v, best_s = v, t
+        t += 0.5
+    if best_v < 0:
+        # sparse speech: no window held enough words to score - take
+        # the wordiest window instead of the segment's dead start
+        best_s = dense_s
+    return round(best_s, 2), round(best_s + target, 2)
+
+
+def find_hook_moment(words, duration=0.0, moments=None):
+    """The single strongest hook moment in a video.
+
+    Preference order: the top-scoring detected moment (the job's own
+    moments when given, else a fresh offline detection pass); when no
+    moments exist at all - or detection only found a weak one and a
+    transcript sentence is clearly stronger - the best transcript
+    segment (top hook-scored sentence, widened toward ~5s). Returns
+    {start, end, text, score, source, moment_index, segment_start,
+    segment_end} or None. The start/end are the RENDER window
+    (already trimmed to the hook range); segment_* keep the full
+    picked segment for reference."""
+    words = words or []
+    if not words:
+        return None
+    dur = float(duration or 0) or words[-1]["end"]
+
+    def _pack(m, source, index):
+        rs, re_ = hook_render_window(words, m["start"], m["end"])
+        text = " ".join(w["word"] for w in words
+                        if w["end"] > rs and w["start"] < re_).strip()
+        return {"start": rs, "end": re_, "text": text,
+                "score": int(m.get("virality", 0) or 0),
+                "source": source, "moment_index": index,
+                "segment_start": round(float(m["start"]), 2),
+                "segment_end": round(float(m["end"]), 2)}
+
+    def _segment():
+        """Best-sentence segment moment, or None."""
+        sents = _transcript_sentences(words)
+        if not sents:
+            return None
+        best = max(sents, key=_score_hook_sentence)
+        s, e = best["start"], best["end"]
+        # widen toward ~5s with neighbouring words so the hook has
+        # room to breathe (a lone 1.5s sentence makes a jumpy clip).
+        # The sentence's word dicts are the same objects as in
+        # `words`, so locate the span by identity.
+        ws = sorted(words, key=lambda w: w["start"])
+        i0 = next((i for i, w in enumerate(ws)
+                   if w is best["words"][0]), None)
+        if i0 is not None:
+            i1 = i0 + len(best["words"]) - 1
+            while e - s < 4.5:
+                grew = False
+                if i1 + 1 < len(ws) and ws[i1 + 1]["start"] - e <= 1.2:
+                    i1 += 1
+                    e = ws[i1]["end"]
+                    grew = True
+                if e - s >= 4.5:
+                    break
+                if i0 - 1 >= 0 and s - ws[i0 - 1]["end"] <= 1.2:
+                    i0 -= 1
+                    s = ws[i0]["start"]
+                    grew = True
+                if not grew:
+                    break
+        seg = {"start": max(0.0, s), "end": min(dur, e),
+               "virality": _score_hook_sentence(best)}
+        out = _pack(seg, "segment", -1)
+        out["score"] = int(seg["virality"])
+        return out
+
+    if moments:
+        top = max(range(len(moments)),
+                  key=lambda i: moments[i].get("virality", 0) or 0)
+        return _pack(moments[top], "moment", top)
+    try:
+        cand = detect_moments_offline(words, 15, 60, max_clips=4)
+    except Exception:  # noqa: BLE001 - fall through to segments
+        cand = []
+    if cand:
+        top_v = int(cand[0].get("virality", 0) or 0)
+        if top_v < 30:
+            # detection only found a weak moment (long calm video):
+            # a clearly stronger spoken line makes the better hook
+            seg = _segment()
+            if seg and seg["score"] > top_v + 15:
+                return seg
+        return _pack(cand[0], "detected", -1)
+    return _segment()
+
+
 def enhance_video(video_path, out_path, progress_cb=None,
                   quality_tier="maximum"):
     """Basic enhancer: upscale to a 1080 short side (Lanczos) when the
