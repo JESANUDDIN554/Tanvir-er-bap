@@ -13,6 +13,8 @@ ITRAJI_LOCAL_DATA_DIR overrides the data area.
 """
 
 import atexit
+import errno
+import hashlib
 import json
 import os
 import re
@@ -71,6 +73,9 @@ MODEL_URL = (os.environ.get("ITRAJI_LOCAL_MODEL_URL")
                 "Qwen2.5-14B-Instruct-Q4_K_M.gguf")
 # Exact byte size of the pinned model on Hugging Face (blobs API).
 MODEL_SIZE = 8988110976
+# SHA-256 of the pinned model file (Hugging Face blobs API, LFS hash).
+MODEL_SHA256 = ("e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577"
+                "dafca87c008")
 _MODEL_OVERRIDDEN = bool(os.environ.get("ITRAJI_LOCAL_MODEL_URL")
                          or os.environ.get("ITRAJI_LOCAL_MODEL_FILE"))
 
@@ -149,41 +154,214 @@ def _set_state(**kw):
         _download_state.update(kw)
 
 
-def _download_file(url, dest, stage, expected_size=None):
-    """Stream url -> dest via a .part file + atomic rename.
+# ---------------------------------------------------------------------------
+# Downloads with HTTP Range resume.
+#
+# A download streams into <dest>.part and is atomically renamed to <dest>
+# only after the finished .part passes verification (exact byte count
+# against the known total, plus SHA-256 where one is pinned). The .part
+# lifecycle is deliberate:
+#   * kept across transient failures and app restarts, so the next
+#     attempt (or the next Download click) RESUMES from it via a Range
+#     request instead of restarting a multi-GB file from zero;
+#   * deleted only when it is provably wrong: larger than the known
+#     total, or failing the final size/checksum verification.
+# ---------------------------------------------------------------------------
 
-    Updates _download_state pct/stage as bytes arrive and verifies the
-    final size when it is knowable (explicit arg, pinned model size,
-    or the response's own Content-Length)."""
+_DOWNLOAD_ATTEMPTS = 5  # per file, resuming from the .part between tries
+
+
+class _PermanentDownloadError(RuntimeError):
+    """A download failure retrying cannot fix (HTTP 4xx, disk full,
+    corrupt .part). Surfaces immediately instead of burning attempts."""
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _content_range_total(value):
+    """'bytes 100-199/1234' (or 'bytes */1234') -> 1234, else None."""
+    if not value:
+        return None
+    m = re.search(r"/(\d+)\s*$", value)
+    return int(m.group(1)) if m else None
+
+
+def _header_total(headers, expected_size, status, have):
+    """Best known total byte count for a response, or None."""
+    if expected_size:
+        return expected_size
+    if status == 206:
+        total = _content_range_total(headers.get("Content-Range"))
+        if total:
+            return total
+    linked = headers.get("X-Linked-Size")
+    if linked:
+        try:
+            return int(linked)
+        except ValueError:
+            pass
+    length = headers.get("Content-Length")
+    if length:
+        try:
+            n = int(length)
+        except ValueError:
+            return None
+        # On a 206 the Content-Length is only the remaining range.
+        return have + n if status == 206 else n
+    return None
+
+
+def _verify_part(tmp, total, expected_sha256):
+    """Final gate before the atomic rename. Raises
+    _PermanentDownloadError (and removes the .part) when the finished
+    file is provably wrong; a short file is a transient failure."""
+    size = os.path.getsize(tmp)
+    if total:
+        if size > total:
+            _remove_quietly(tmp)
+            raise _PermanentDownloadError(
+                f"download overshot: got {size} of {total} bytes - "
+                "discarded, please retry")
+        if size < total:
+            raise RuntimeError(
+                f"download incomplete: got {size} of {total} bytes")
+    if expected_sha256 and _sha256_file(tmp) != expected_sha256:
+        _remove_quietly(tmp)
+        raise _PermanentDownloadError(
+            "download failed its checksum verification - "
+            "discarded, please retry")
+
+
+def _download_once(url, tmp, stage, expected_size, expected_sha256):
+    """One download attempt into tmp, resuming from its current size.
+
+    Returns when tmp holds the complete, verified file. Raises
+    _PermanentDownloadError for failures retrying cannot fix and any
+    other exception (requests errors, short reads) for transient ones;
+    in the transient case tmp keeps every byte written so far."""
+    have = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
+    if expected_size and have > expected_size:
+        _remove_quietly(tmp)  # foreign/oversized .part: start clean
+        have = 0
+    if expected_size and have == expected_size and have > 0:
+        # A previous run finished the bytes but died before the rename.
+        _verify_part(tmp, expected_size, expected_sha256)
+        return
+    _set_state(stage=stage, error=None)
+    restarts = 0
+    while True:
+        headers = {"Range": f"bytes={have}-"} if have > 0 else {}
+        with requests.get(url, headers=headers, stream=True,
+                          timeout=(15, 120)) as r:
+            if r.status_code == 416 and have > 0:
+                # The .part already reaches (or passes) the end. A 416
+                # carries the real total in Content-Range ("bytes */N");
+                # its Content-Length is just the error page, ignore it.
+                total = _content_range_total(
+                    r.headers.get("Content-Range")) or expected_size
+                if total and have == total:
+                    _verify_part(tmp, total, expected_sha256)
+                    return
+                _remove_quietly(tmp)
+                have = 0
+                restarts += 1
+                if restarts > 1:
+                    raise RuntimeError(
+                        "server refused the resume range twice")
+                continue
+            if r.status_code >= 400:
+                if r.status_code in (408, 429) or r.status_code >= 500:
+                    raise RuntimeError(
+                        f"server error (HTTP {r.status_code})")
+                raise _PermanentDownloadError(
+                    f"server refused the download (HTTP {r.status_code})")
+            if r.status_code == 206:
+                m = re.match(r"bytes\s+(\d+)-",
+                             r.headers.get("Content-Range") or "")
+                if not m or int(m.group(1)) != have:
+                    # Server disagrees about where the resume starts:
+                    # truncate and restart this file once, cleanly.
+                    _remove_quietly(tmp)
+                    have = 0
+                    restarts += 1
+                    if restarts > 1:
+                        raise RuntimeError(
+                            "server sent an unusable resume range twice")
+                    continue
+            elif have > 0:
+                have = 0  # Range ignored (200): restart from zero
+            total = _header_total(r.headers, expected_size,
+                                  r.status_code, have)
+            if total and have > total:
+                _remove_quietly(tmp)
+                raise _PermanentDownloadError(
+                    "partial file is larger than the download itself - "
+                    "discarded, please retry")
+            if total and have == total:
+                _verify_part(tmp, total, expected_sha256)
+                return
+            if total:
+                _set_state(pct=min(99, int(have / total * 100)))
+            done = have
+            try:
+                with open(tmp, "ab" if have > 0 else "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            _set_state(
+                                pct=min(99, int(done / total * 100)))
+            except OSError as e:
+                if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                    raise _PermanentDownloadError(
+                        f"not enough free disk space ({e})")
+                raise
+            break
+    _verify_part(tmp, total, expected_sha256)
+
+
+def _download_file(url, dest, stage, expected_size=None,
+                   expected_sha256=None):
+    """Stream url -> dest via a .part file + atomic rename, resuming
+    across dropped connections and app restarts (see the section
+    comment above for the .part lifecycle).
+
+    Transient failures are retried up to _DOWNLOAD_ATTEMPTS times with
+    a short backoff, each time resuming from the bytes already on disk;
+    progress in _download_state counts those resumed bytes. The file is
+    renamed to dest only after verification (byte count against the
+    known total, SHA-256 when pinned)."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = dest + ".part"
-    try:
-        with requests.get(url, stream=True, timeout=(15, 120)) as r:
-            r.raise_for_status()
-            total = expected_size \
-                or int(r.headers.get("Content-Length") or 0) or None
-            done = 0
-            _set_state(stage=stage, pct=0, error=None)
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1 << 20):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        _set_state(pct=min(99, int(done / total * 100)))
-        if total and done != total:
-            raise RuntimeError(
-                f"download incomplete: got {done} of {total} bytes")
-        os.replace(tmp, dest)
-        _set_state(pct=100)
-        return dest
-    except BaseException:
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
         try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
+            _download_once(url, tmp, stage, expected_size,
+                           expected_sha256)
+            break
+        except _PermanentDownloadError:
+            raise
+        except Exception:
+            if attempt >= _DOWNLOAD_ATTEMPTS:
+                raise
+            time.sleep(min(2 ** attempt, 16))
+    os.replace(tmp, dest)
+    _set_state(pct=100)
+    return dest
 
 
 def _extract_engine(archive, dest_dir):
@@ -241,7 +419,9 @@ def ensure_model():
     expected = None if _MODEL_OVERRIDDEN else MODEL_SIZE
     _download_file(MODEL_URL, model_path(),
                    "Downloading Built-in AI model (~9 GB)",
-                   expected_size=expected)
+                   expected_size=expected,
+                   expected_sha256=None if _MODEL_OVERRIDDEN
+                   else MODEL_SHA256)
     if not model_ready():
         raise RuntimeError("Built-in AI model download finished but the "
                            "file failed its size check - please retry.")
