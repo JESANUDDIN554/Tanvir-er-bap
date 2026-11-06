@@ -2653,6 +2653,52 @@ def _COREPACK_READY():
     return _p.corepack_loaded()
 
 
+def _work_in_progress():
+    """Short labels for work that closing the app would cut off: the
+    Built-in AI download, and any job in its "working" state (import,
+    transcription, detection, render, caption removal, enhance...).
+    Drives the confirm-on-close guard in both window modes; the
+    download check self-heals first (see local_ai), so a wedged
+    download whose worker is long gone does not claim to be work."""
+    what = []
+    try:
+        if local_ai.download_state().get("active"):
+            what.append("the Built-in AI download")
+    except Exception:  # noqa: BLE001 - the guard must never break
+        pass
+    try:
+        if any(j.get("status") == "working" for j in list(JOBS.values())):
+            what.append("video processing")
+    except Exception:  # noqa: BLE001
+        pass
+    return what
+
+
+_CLOSE_GUARD_SNIPPET = b"""
+<script>
+/* Close guard (injected by app.py, not part of ui/index.html): while
+   work is running - the Built-in AI download or any processing job -
+   arm beforeunload so closing the window/tab asks first, instead of
+   silently cutting a 9 GB download or a render. In the app's own
+   (WebView2) window the native closing handler asks instead; this
+   guard is what covers the Chrome/Edge --app window and plain tabs. */
+(function () {
+  var active = false;
+  function check() {
+    fetch("/api/work-status").then(function (r) { return r.json(); })
+      .then(function (d) { active = !!(d && d.active); })
+      .catch(function () { });
+  }
+  check();
+  setInterval(check, 3000);
+  window.addEventListener("beforeunload", function (e) {
+    if (active) { e.preventDefault(); e.returnValue = ""; }
+  });
+})();
+</script>
+"""
+
+
 def make_wsgi_app(api):
     ui_dir = os.path.abspath(os.path.join(BASE_DIR, "ui"))
 
@@ -2721,6 +2767,18 @@ def make_wsgi_app(api):
                                   "application/json",
                                   json.dumps(api.local_ai_download(),
                                              default=str))
+
+        # --- work in progress: GET /api/work-status -------------------
+        # Polled by the close guard injected into the main page: while
+        # anything is active, the page arms beforeunload so closing
+        # the window/tab asks first (Chrome mode). The own (WebView2)
+        # window asks natively instead - see _run_own_window.
+        if method == "GET" and path == "/api/work-status":
+            what = _work_in_progress()
+            return _wsgi_response(
+                start_response, "200 OK", "application/json",
+                json.dumps({"ok": True, "active": bool(what),
+                            "what": what}))
 
         # --- API: POST /api/<method> {"args": [...]} ---------------------
         if method == "POST" and path.startswith("/api/"):
@@ -2866,6 +2924,16 @@ def make_wsgi_app(api):
                                   "text/plain", "not found")
         ctype = _MIME.get(os.path.splitext(fpath)[1].lower(),
                           "application/octet-stream")
+        if rel == "index.html":
+            # The main page gets the close guard (see
+            # _CLOSE_GUARD_SNIPPET). Injected at serve time so the
+            # on-disk file - and its signed integrity hash - is
+            # untouched.
+            if b"</body>" in data:
+                data = data.replace(b"</body>",
+                                    _CLOSE_GUARD_SNIPPET + b"</body>", 1)
+            else:
+                data = data + _CLOSE_GUARD_SNIPPET
         return _wsgi_response(start_response, "200 OK", ctype, data)
 
     return app
@@ -2905,18 +2973,22 @@ def _focus_existing_window():
 
     A duplicate launch must NEVER open a second window or a browser tab -
     the user asked for exactly one window. Best effort via the window
-    title; silently does nothing when the window can't be found.
+    title; returns True only when a window was actually found (the
+    caller uses that to tell a live instance from a windowless ghost).
     """
     if os.name != "nt":
-        return
+        return False
     try:
         import ctypes
-        hwnd = ctypes.windll.user32.FindWindowW(None, "Itraji Cliper")
-        if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-    except Exception:  # noqa: BLE001 - focusing is a courtesy, never fatal
+        for title in ("Itraji Cliper", "Itraji Cliper — Activation"):
+            hwnd = ctypes.windll.user32.FindWindowW(None, title)
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                return True
+    except Exception:  # noqa: BLE001 - focusing is a courtesy
         pass
+    return False
 
 
 def _clamp_window_geometry(x0, y0, work_w, work_h):
@@ -3059,6 +3131,30 @@ def _run_own_window(url):
             kwargs.update({"width": w, "height": h, "x": x, "y": y})
         win = webview.create_window(**kwargs)
 
+        def _on_closing():
+            """Confirm-on-close: while work is running (the Built-in
+            AI download, a render...), ask first - the user's words:
+            a "you sure to off" message. Cancelling keeps everything
+            running; confirming closes cleanly. Any failure in the
+            guard itself allows the close: the app must never become
+            unclosable."""
+            try:
+                what = _work_in_progress()
+                if not what:
+                    return True
+                return bool(win.create_confirmation_dialog(
+                    "Itraji Cliper",
+                    "You sure to off? " + " and ".join(what) +
+                    " still in progress. Closing stops it - a stopped"
+                    " download can be resumed later."))
+            except Exception:  # noqa: BLE001 - never trap the user
+                return True
+
+        try:
+            win.events.closing += _on_closing
+        except Exception:  # noqa: BLE001 - event hook is best-effort
+            pass
+
         def _mark_shown():
             shown["yes"] = True
 
@@ -3184,6 +3280,78 @@ def _release_lockfile():
             pass
 
 
+def _owner_serves_app(port):
+    """True when 127.0.0.1:<port> answers like this app - the
+    local-ai status endpoint, in its normal or its locked form.
+    Distinguishes the real owner from a recycled pid, or from a
+    process that holds the lock but never got its server up."""
+    for _ in range(3):
+        try:
+            r = requests.get(
+                "http://127.0.0.1:%d/api/local-ai/status" % port,
+                timeout=1.5)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict) and (
+                        "downloading" in data
+                        or data.get("error") == "locked"):
+                    return True
+        except Exception:  # noqa: BLE001 - any failure: not (yet) ours
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _replace_ghost_owner(owner_mode):
+    """Cleanly replace a windowless ghost owner (Windows only).
+
+    The ghost is real: the app process can outlive its window (the
+    Chrome process kept alive by background mode after the --app
+    window closed, or a launcher that handed off), still holding the
+    lock and the port, still telling the UI a cut download is
+    "downloading" - while owning no window the user can see or close.
+    Every later launch just defers to it, so the app looks dead.
+
+    Replace ONLY when every check holds: a duplicate launch already
+    failed to find/focus the owner's window (the caller did); the
+    owner's window mode is a dedicated-window mode ("app"/"webview")
+    - a plain-tab "fallback" owner is a live browser session by
+    design and is never replaced; the lock is not fresh (an instance
+    still starting up keeps its grace period); and the recorded port
+    verifiably serves this app. Then terminate the owner and wait
+    for it to die so the caller can re-acquire. Any doubt -> False:
+    defer, exactly as before.
+    """
+    if os.name != "nt":
+        return False
+    if owner_mode not in ("app", "webview"):
+        return False
+    info = _read_lockfile()
+    if not info:
+        return False
+    try:
+        if time.time() - os.path.getmtime(LOCKFILE) < 30:
+            return False  # owner is still starting up - hands off
+    except OSError:
+        return False
+    port, pid = info.get("port"), info.get("pid")
+    if not port or not pid or not _owner_serves_app(port):
+        return False
+    if not _pid_alive(pid):
+        return True  # died on its own - the re-acquire will see that
+    import signal
+    for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            return False
+        for _ in range(50):
+            if not _pid_alive(pid):
+                return True
+            time.sleep(0.1)
+    return not _pid_alive(pid)
+
+
 def _acquire_single_instance():
     """Returns (owned, owner_mode).
 
@@ -3218,7 +3386,22 @@ def _acquire_single_instance():
                 if (_read_lockfile() or {}).get("port"):
                     break
                 time.sleep(0.1)
-            return False, (_read_lockfile() or {}).get("mode")
+            info = _read_lockfile() or {}
+            port = info.get("port")
+            if not port:
+                return False, info.get("mode")
+            if _owner_serves_app(port):
+                return False, info.get("mode")
+            # The pid is alive and a port is recorded, but nothing on
+            # that port answers like this app: the pid was recycled
+            # by an unrelated process (or the owner died between the
+            # checks). The lock is bogus - drop it and take over,
+            # WITHOUT touching the unrelated process.
+            try:
+                os.remove(LOCKFILE)
+            except OSError:
+                pass
+            continue
         # stale lock (owner died without cleaning up): drop it, retry
         try:
             os.remove(LOCKFILE)
@@ -3266,8 +3449,16 @@ def main():
     # is how a plain Chrome tab appeared next to the app window.)
     owned, _owner_mode = _acquire_single_instance()
     if not owned:
-        _focus_existing_window()
-        return
+        if _focus_existing_window():
+            return
+        # No window could be found for the recorded owner: it may be
+        # a windowless ghost still serving a dead session (see
+        # _replace_ghost_owner - the checks are strict). Replace it
+        # and take over; otherwise exit quietly, as before.
+        if _replace_ghost_owner(_owner_mode):
+            owned, _owner_mode = _acquire_single_instance()
+        if not owned:
+            return
 
     # Die gracefully on SIGTERM (task manager / kill): turn it into a
     # KeyboardInterrupt so the finally below still releases the lock.

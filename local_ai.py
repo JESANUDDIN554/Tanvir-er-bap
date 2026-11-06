@@ -144,8 +144,24 @@ _state_lock = threading.Lock()
 _download_thread = None
 
 
+def _heal_state_locked():
+    """Caller holds _state_lock. If the state claims a download is
+    running but the worker thread is gone (the app was cut mid-
+    download, or the thread died without reporting), the claim is a
+    wedge: the UI hides the Download button for as long as the state
+    says "downloading". Reset to idle - the .part on disk is
+    untouched, so the next click resumes where it stopped."""
+    if _download_state["active"] and (
+            _download_thread is None
+            or not _download_thread.is_alive()):
+        _download_state.update(
+            active=False, done=False,
+            stage="Download stopped - click Download to resume")
+
+
 def download_state():
     with _state_lock:
+        _heal_state_locked()
         return dict(_download_state)
 
 
@@ -174,6 +190,85 @@ _DOWNLOAD_ATTEMPTS = 5  # per file, resuming from the .part between tries
 class _PermanentDownloadError(RuntimeError):
     """A download failure retrying cannot fix (HTTP 4xx, disk full,
     corrupt .part). Surfaces immediately instead of burning attempts."""
+
+
+# ---------------------------------------------------------------------------
+# Stall watchdog.
+#
+# A connection can keep the socket alive while effectively delivering
+# nothing: a hung CDN edge, or a mirror dripping a few bytes every
+# couple of seconds - just often enough to reset the 120 s read
+# timeout, while the buffered reader waits for a full 1 MB chunk that
+# never completes. The worker then blocks inside iter_content
+# forever, the state claims "downloading" forever, and the UI hides
+# the Download button behind a frozen progress bar (the "dead
+# download" users hit after cutting the app mid-download: the wedged
+# process outlives its window and every relaunch talks to it).
+#
+# The worker stamps every chunk it writes; if no byte has landed for
+# _STALL_SECONDS the watchdog shuts the in-flight response's socket
+# down - shutdown() is what actually wakes a blocked recv; a plain
+# close() can leave it hanging - turning the hang into an ordinary
+# transient failure that the retry loop resumes from the .part.
+# ---------------------------------------------------------------------------
+
+_STALL_SECONDS = float(os.environ.get("ITRAJI_DL_STALL_SECONDS", "120"))
+_progress = {"at": 0.0, "response": None}
+_progress_lock = threading.Lock()
+
+
+def _mark_progress(response="keep"):
+    """Stamp download progress. response: "keep" leaves the tracked
+    in-flight response alone; a response object tracks it; None
+    clears it (no response in flight right now)."""
+    with _progress_lock:
+        _progress["at"] = time.time()
+        if response != "keep":
+            _progress["response"] = response
+
+
+def _force_close(response):
+    """Interrupt a response whose read is blocked in the worker."""
+    try:
+        raw = getattr(response, "raw", None)
+        conn = (getattr(raw, "_connection", None)
+                or getattr(raw, "connection", None))
+        sock = getattr(conn, "sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001 - fall back to a plain close
+        pass
+    try:
+        response.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _stall_watchdog():
+    """Daemon companion to the download worker: while a download is
+    active, force-close a response that has delivered nothing for
+    _STALL_SECONDS. Exits when the download state goes inactive."""
+    while True:
+        with _state_lock:
+            if not _download_state["active"]:
+                return
+        with _progress_lock:
+            resp = _progress["response"]
+            idle = time.time() - _progress["at"]
+        if resp is not None and idle > _STALL_SECONDS:
+            _force_close(resp)
+            # re-arm: the retry registers its own response and gets a
+            # fresh window; without this the watchdog would spin on
+            # the corpse while the worker backs off.
+            _mark_progress(None)
+        time.sleep(2)
 
 
 def _sha256_file(path):
@@ -253,6 +348,7 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
     other exception (requests errors, short reads) for transient ones;
     in the transient case tmp keeps every byte written so far."""
     have = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
+    _mark_progress(None)  # new attempt: no response in flight yet
     if expected_size and have > expected_size:
         _remove_quietly(tmp)  # foreign/oversized .part: start clean
         have = 0
@@ -315,6 +411,7 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
                 return
             if total:
                 _set_state(pct=min(99, int(have / total * 100)))
+            _mark_progress(r)  # the watchdog watches this response
             done = have
             try:
                 with open(tmp, "ab" if have > 0 else "wb") as f:
@@ -323,6 +420,7 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
                             continue
                         f.write(chunk)
                         done += len(chunk)
+                        _mark_progress()
                         if total:
                             _set_state(
                                 pct=min(99, int(done / total * 100)))
@@ -446,6 +544,7 @@ def start_download():
     present) this just returns the current state."""
     global _download_thread
     with _state_lock:
+        _heal_state_locked()
         if _download_state["active"]:
             return dict(_download_state)
         if model_ready():
@@ -456,6 +555,8 @@ def start_download():
         _download_thread = threading.Thread(target=_download_worker,
                                             daemon=True)
         _download_thread.start()
+        _mark_progress(None)
+        threading.Thread(target=_stall_watchdog, daemon=True).start()
         return dict(_download_state)
 
 
