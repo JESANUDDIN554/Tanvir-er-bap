@@ -41,6 +41,23 @@ const TOOL_VIEWS = {
   hookmaker: "hookmakerView",
 };
 
+/* Opus-style shell: the sidebar active pill + topbar title follow the
+   current view. Pure presentation - navigation itself is unchanged. */
+const VIEW_TITLES = {
+  hub: "Home", wizard: "Clip Maker", library: "Library",
+  remover: "Caption Remover", generator: "AI Video Generator",
+  titles: "Title & Hook Generator", script: "AI Scriptwriter",
+  transcript: "Transcript Tool", enhancer: "Video Enhancer",
+  hookmaker: "Hook Maker", captionstudio: "Caption Studio",
+};
+function syncSidebar(view) {
+  document.querySelectorAll(".side-item").forEach((b) =>
+    b.classList.toggle("on", b.dataset.nav === view));
+  const t = $("viewTitle");
+  if (t && VIEW_TITLES[view]) t.textContent = VIEW_TITLES[view];
+  document.body.dataset.view = view;
+}
+
 const $ = (id) => document.getElementById(id);
 
 /* HTTP bridge to the Python backend. */
@@ -682,6 +699,49 @@ async function refreshLocalAiStatus() {
       }
     }
   }
+  // Settings card + sidebar mini-card mirror the same Built-in AI state.
+  const sBtn = $("settingsAiDownloadBtn"), sTxt = $("settingsAiText"),
+    sWrap = $("settingsAiBarWrap"), sBar = $("settingsAiBar"),
+    sPct = $("settingsAiPct");
+  if (sBtn && sTxt) {
+    if (st.ready) {
+      sTxt.textContent = "Built-in AI ready ✓ — the model is on your PC and works fully offline.";
+      hide(sBtn); hide(sWrap); sPct.textContent = "";
+    } else if (st.downloading) {
+      hide(sBtn); show(sWrap);
+      sBar.style.width = (st.pct || 0) + "%";
+      sPct.textContent = (st.stage || "Downloading…") + " — " + Math.round(st.pct || 0) + "%";
+      sTxt.textContent = "First use needs a one-time download of the AI model (~9 GB). After that it works fully offline, forever.";
+    } else {
+      show(sBtn); hide(sWrap); sPct.textContent = "";
+      if (st.error) {
+        sTxt.textContent = "Download failed: " + st.error + " Check your connection and try again.";
+        if (st.pct > 0) {
+          sPct.textContent = (st.stage && st.stage.indexOf("Download stopped") === 0)
+            ? st.stage
+            : "Download stopped at " + Math.round(st.pct) + "% - click Download to resume";
+        }
+      }
+    }
+  }
+  const sideTxt = $("sideAiText"), sideDot = $("sideAiDot");
+  if (sideTxt && sideDot) {
+    if (st.ready) {
+      sideTxt.textContent = "Ready — works offline";
+      sideDot.className = "side-ai-dot ready";
+    } else if (st.downloading) {
+      sideTxt.textContent = "Downloading… " + Math.round(st.pct || 0) + "%";
+      sideDot.className = "side-ai-dot busy";
+    } else if (st.error) {
+      sideTxt.textContent = st.pct > 0
+        ? "Stopped at " + Math.round(st.pct) + "% — resume in Settings"
+        : "Download stopped — see Settings";
+      sideDot.className = "side-ai-dot err";
+    } else {
+      sideTxt.textContent = "Not downloaded (~9 GB)";
+      sideDot.className = "side-ai-dot";
+    }
+  }
 }
 
 $("localAiDownloadBtn").addEventListener("click", async () => {
@@ -1047,6 +1107,7 @@ function renderMoments(moments) {
     ].join("");
     div.innerHTML = `
       <input type="checkbox" data-i="${i}" checked aria-label="Select clip">
+      <div class="moment-thumb"><img src="/files/${jobId}/thumb.jpg" alt="" loading="lazy" onerror="this.remove()"><span class="moment-dur">${Math.round(m.end - m.start)}s</span></div>
       <div class="moment-body">
         <div class="moment-title">${escapeHtml(m.title)}${tags}</div>
         <div class="moment-meta">${fmtTime(m.start)} → ${fmtTime(m.end)} · ${Math.round(m.end - m.start)}s</div>
@@ -1062,7 +1123,7 @@ function renderMoments(moments) {
         <button class="ghost-btn small pkgBtn" data-i="${i}">📝 Posting package</button>
         <div class="pkg-panel hidden" data-i="${i}"></div>
       </div>
-      <div class="vbadge ${badgeClass(m.virality)}">
+      <div class="vbadge ${badgeClass(m.virality)}" style="--p:${m.virality}">
         <span class="vscore" data-v="${m.virality}">0</span>
         <span class="vlabel">virality</span>
       </div>`;
@@ -1540,6 +1601,7 @@ function applyNav(entry) {
       closeStudioViews();
       show($("step1"));
       setStep(entry.step || 1);
+      syncSidebar("wizard");
       const sec = $("step" + (entry.step || 1));
       if (sec) setTimeout(() =>
         sec.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
@@ -1610,6 +1672,7 @@ function showLibrary() {
   hide($("removerView"));
   show($("libraryView"));
   refreshLibrary();
+  syncSidebar("library");
 }
 
 function hideLibrary() {
@@ -1654,6 +1717,7 @@ function showRemover() {
   hide($("libraryView"));
   show($("removerView"));
   updateRemoverRegionBox();
+  syncSidebar("remover");
 }
 function hideRemover() {
   noteNav({ view: "wizard", step: lastWizardStep });
@@ -2157,6 +2221,8 @@ function showHub() {
   $("studioBtn").classList.add("on");
   refreshLocalAiStatus();
   startLocalAiPolling();
+  syncSidebar("hub");
+  refreshHomeRecents();
 }
 
 function showWizard(step) {
@@ -2194,9 +2260,95 @@ function showTool(name) {
       if (jobId) $("hookProject").value = jobId;
     });
   }
+  syncSidebar(name);
+}
+
+/* Home: recent projects - same cards as the Library. Opening one is a
+   plain navigation; project state lives outside this system. */
+function openProjectFromHome(id) {
+  closeStudioViews();
+  hide($("libraryView"));
+  hide($("removerView"));
+  libraryOpen = false;
+  removerOpen = false;
+  openProject(id);
+  syncSidebar("wizard");
+}
+
+async function refreshHomeRecents() {
+  const grid = $("homeRecents");
+  if (!grid) return;
+  let projects = [];
+  try {
+    const res = await api.library();
+    projects = res.projects || [];
+  } catch (e) { /* offline: the empty state below stays honest */ }
+  const recent = projects.slice(0, 6);
+  grid.innerHTML = "";
+  $("homeRecentsEmpty").classList.toggle("hidden", recent.length > 0);
+  recent.forEach((j) => {
+    const card = document.createElement("div");
+    card.className = "lib-card";
+    const date = j.created
+      ? new Date(j.created * 1000).toLocaleDateString(undefined,
+          { month: "short", day: "numeric", year: "numeric" })
+      : "";
+    card.innerHTML = `
+      <div class="lib-thumb">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="3"/><path d="M10 9l5 3-5 3z" fill="currentColor" stroke="none"/></svg>
+        <img src="/files/${j.job_id}/thumb.jpg" alt="" onerror="this.remove()">
+      </div>
+      <div class="lib-body">
+        <div class="lib-title" title="${escapeHtml(j.title || "Video")}">${escapeHtml(j.title || "Video")}</div>
+        <div class="lib-meta">${fmtTime(j.duration)}${date ? " · " + date : ""}</div>
+        <div class="lib-status"><span class="job-dot ${j.status}"></span><span>${escapeHtml(libStatusText(j))}</span></div>
+        <div class="lib-actions">
+          <button class="primary small lib-open">Open</button>
+          <button class="ghost-btn small lib-del">Delete</button>
+        </div>
+      </div>`;
+    card.querySelector(".lib-open").addEventListener("click",
+      () => openProjectFromHome(j.job_id));
+    const del = card.querySelector(".lib-del");
+    del.addEventListener("click", async () => {
+      if (!del.dataset.armed) {
+        del.dataset.armed = "1";
+        del.textContent = "Sure?";
+        setTimeout(() => {
+          delete del.dataset.armed;
+          del.textContent = "Delete";
+        }, 2600);
+        return;
+      }
+      const res2 = await api.delete_job(j.job_id);
+      if (res2.ok) {
+        if (jobId === j.job_id) jobId = null;
+        toast("Deleted from Library");
+        refreshHomeRecents();
+        refreshLibrary();
+        refreshQueue();
+      } else {
+        toast(res2.error || "Delete failed", true);
+      }
+    });
+    grid.appendChild(card);
+  });
 }
 
 $("studioBtn").addEventListener("click", goHome);
+$("navClipBtn").addEventListener("click", () => showWizard(1));
+$("navHookBtn").addEventListener("click", () => showTool("hookmaker"));
+$("navGenBtn").addEventListener("click", () => showTool("generator"));
+$("navStudioBtn").addEventListener("click", () => {
+  showLibrary();
+  toast("Pick a clip in the Library, then open Caption Studio on it");
+});
+$("navTitlesBtn").addEventListener("click", () => showTool("titles"));
+$("navScriptBtn").addEventListener("click", () => showTool("script"));
+$("navTranscriptBtn").addEventListener("click", () => showTool("transcript"));
+$("navEnhBtn").addEventListener("click", () => showTool("enhancer"));
+$("sideAiCard").addEventListener("click", () => $("settingsBtn").click());
+$("homeSeeAllBtn").addEventListener("click", showLibrary);
 document.querySelectorAll(".tool-back").forEach((b) =>
   b.addEventListener("click", backToStudio));
 
@@ -2243,6 +2395,12 @@ $("hubSearch").addEventListener("input", () => {
   });
   $("hubNoMatch").classList.toggle("hidden", any);
 });
+$("hubSearch").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  const first = [...document.querySelectorAll(".tool-card")]
+    .find((c) => c.style.display !== "none");
+  if (first) first.click();
+});
 
 /* hub: Built-in AI download button (mirrors the Step-2 card) */
 async function startAiDownload() {
@@ -2253,6 +2411,7 @@ async function startAiDownload() {
   refreshLocalAiStatus();
 }
 $("hubAiDownloadBtn").addEventListener("click", startAiDownload);
+$("settingsAiDownloadBtn").addEventListener("click", startAiDownload);
 document.querySelectorAll(".ai-download-btn").forEach((b) =>
   b.addEventListener("click", async () => {
     await startAiDownload();
@@ -2979,6 +3138,12 @@ $("accentReset").addEventListener("click", async () => {
   applyTheme();
   try { await api.save_settings({ accent: settings.accent }); } catch (e) { /* offline */ }
 });
+$("themeQuickBtn").addEventListener("click", async () => {
+  settings.theme = settings.theme === "light" ? "dark" : "light";
+  segSet("themeSeg", settings.theme);
+  applyTheme();
+  try { await api.save_settings({ theme: settings.theme }); } catch (e) { /* offline */ }
+});
 
 /* ---------------- modals: Esc + backdrop click ---------------- */
 function closeModal(id) {
@@ -3016,7 +3181,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (e) { /* offline-safe defaults below */ }
   applyTheme();
   updateBackBtn();
+  syncSidebar("hub");
   refreshLocalAiStatus();
+  refreshHomeRecents();
   startLocalAiPolling();
   setTimeout(() => {
     const sp = document.getElementById("splash");

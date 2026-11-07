@@ -17,7 +17,7 @@
   @font-face { font-family: "Archivo Black"; src: url("fonts/ArchivoBlack-Regular.ttf"); }
 </style>
 </head>
-<body>
+<body data-view="hub">
 
 <!-- Splash -->
 <div id="splash">
@@ -32,7 +32,8 @@
   </div>
 </div>
 
-<header class="topbar">
+<div class="app-shell">
+<aside id="sidebar">
   <div class="brand home-link" id="brandHome" title="Home" role="button" tabindex="0" aria-label="Home — back to the start screen">
     <img class="brand-logo" src="icon-192.png" width="34" height="34" alt="" style="border-radius:20%">
     <div class="brand-text">
@@ -40,10 +41,37 @@
       <div class="brand-ver">v2.0</div>
     </div>
   </div>
+  <nav class="side-nav" aria-label="Main">
+    <button id="studioBtn" class="side-item on" data-nav="hub" title="Home — Studio dashboard"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/></svg><span>Home</span></button>
+    <div class="side-label">Create</div>
+    <button id="navClipBtn" class="side-item" data-nav="wizard" title="Clip Maker — import a video and make viral clips"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2.6"/><circle cx="6" cy="18" r="2.6"/><path d="M8.2 7.8L20 19M8.2 16.2L20 5"/></svg><span>Clip Maker</span></button>
+    <button id="navHookBtn" class="side-item" data-nav="hookmaker" title="Hook Maker — build a gripping opening"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3v8a6 6 0 0 0 12 0V3"/><path d="M6 7h4M14 7h4"/></svg><span>Hook Maker</span></button>
+    <button id="navGenBtn" class="side-item" data-nav="generator" title="AI Video Generator"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M10 9.5l5 2.5-5 2.5z" fill="currentColor" stroke="none"/></svg><span>AI Video Generator</span></button>
+    <button id="removerBtn" class="side-item" data-nav="remover" title="Caption Remover — strip captions already burned into a video"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20H8L3.7 15.7a2.4 2.4 0 0 1 0-3.4L12 3.6a2.4 2.4 0 0 1 3.4 0l5.3 5.3a2.4 2.4 0 0 1 0 3.4L13 20"/><path d="M7.5 10.5l6 6"/></svg><span>Caption Remover</span></button>
+    <button id="navStudioBtn" class="side-item" data-nav="captionstudio" title="Caption Studio — style a clip's captions"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="3"/><path d="M6.5 10h7M6.5 14h11"/></svg><span>Caption Studio</span></button>
+    <div class="side-label">Library</div>
+    <button id="libraryBtn" class="side-item" data-nav="library" title="Library — your saved videos"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg><span>Library</span></button>
+    <div class="side-label">Tools</div>
+    <button id="navTitlesBtn" class="side-item" data-nav="titles" title="Title &amp; Hook Generator"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 7V4.5h14V7M12 4.5V20M9 20h6"/></svg><span>Titles &amp; Hooks</span></button>
+    <button id="navScriptBtn" class="side-item" data-nav="script" title="AI Scriptwriter"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.6 3.6a2.1 2.1 0 0 1 3 3L8 18.2l-4.2 1.1L4.9 15z"/></svg><span>Scriptwriter</span></button>
+    <button id="navTranscriptBtn" class="side-item" data-nav="transcript" title="Transcript Tool"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2.5H6.5a2 2 0 0 0-2 2v15a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V8z"/><path d="M14 2.5V8h5.5M9 13h6M9 17h6"/></svg><span>Transcript</span></button>
+    <button id="navEnhBtn" class="side-item" data-nav="enhancer" title="Video Enhancer"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 4l1.6 4.4L17 10l-4.4 1.6L11 16l-1.6-4.4L5 10l4.4-1.6z"/><path d="M19 15v4M17 17h4"/></svg><span>Enhancer</span></button>
+  </nav>
+  <div class="side-foot">
+    <button id="sideAiCard" class="side-ai" type="button" title="Built-in AI status — click to open Settings">
+      <span class="side-ai-dot" id="sideAiDot"></span>
+      <span class="side-ai-text"><span class="side-ai-title">Built-in AI</span><span class="side-ai-status" id="sideAiText">Checking…</span></span>
+    </button>
+    <button id="settingsBtn" class="side-item" data-nav="settings" title="Settings"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>Settings</span></button>
+  </div>
+</aside>
+<div class="content-col">
+<header class="topbar">
   <button id="backBtn" class="ghost-btn icon-btn nav-back" title="Back to the previous screen" disabled>
     <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
     <span>Back</span>
   </button>
+  <h1 id="viewTitle" class="view-title">Home</h1>
   <div class="steps-indicator">
     <div class="step-dot" data-step="1" title="Step 1 — Import"><span class="dot-num">1</span><span class="dot-label">Import</span></div>
     <div class="step-line"></div>
@@ -51,27 +79,19 @@
     <div class="step-line"></div>
     <div class="step-dot" data-step="3" title="Step 3 — Clips"><span class="dot-num">3</span><span class="dot-label">Clips</span></div>
   </div>
-  <button id="studioBtn" class="ghost-btn icon-btn" title="Studio — all your tools in one place">
-    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/></svg>
-    <span>Studio</span>
-  </button>
-  <button id="libraryBtn" class="ghost-btn icon-btn" title="Library — your saved videos">
-    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
-    <span>Library</span>
-  </button>
-  <button id="removerBtn" class="ghost-btn icon-btn" title="Caption Remover — strip captions already burned into a video">
-    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20H8L3.7 15.7a2.4 2.4 0 0 1 0-3.4L12 3.6a2.4 2.4 0 0 1 3.4 0l5.3 5.3a2.4 2.4 0 0 1 0 3.4L13 20"/><path d="M7.5 10.5l6 6"/></svg>
-    <span>Caption Remover</span>
-  </button>
-  <button id="settingsBtn" class="ghost-btn icon-btn" title="Settings">
-    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-    <span>Settings</span>
+  <div class="top-search">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.8-3.8"/></svg>
+    <input id="hubSearch" type="text" placeholder="Search tools…" spellcheck="false">
+  </div>
+  <button id="themeQuickBtn" class="ghost-btn icon-btn" title="Toggle dark / light theme">
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13.5A8.5 8.5 0 1 1 10.5 4a6.8 6.8 0 0 0 9.5 9.5z"/></svg>
+    <span>Theme</span>
   </button>
 </header>
 
 <main>
   <!-- ============ STUDIO HUB (home) ============ -->
-  <section id="hubView" class="card step-card">
+  <section id="hubView" class="step-card hub-view">
     <div class="hub-hero">
       <div class="card-kicker">Itraji Studio</div>
       <h1>What are we creating today?</h1>
@@ -84,12 +104,9 @@
         <input id="hubPathInput" type="text" placeholder="…or a local file path, e.g. C:\Videos\myvideo.mp4" spellcheck="false">
         <button id="hubFileBtn" class="ghost-btn">Use local file</button>
       </div>
-      <div class="row row-tight">
-        <input id="hubSearch" type="text" placeholder="Search tools…" spellcheck="false" style="max-width:280px">
-      </div>
     </div>
 
-    <div class="field-label" style="margin-top:20px">Creative tools</div>
+    <div class="field-label home-label">Create</div>
     <div class="tool-grid" id="hubCreativeGrid">
       <button type="button" class="tool-card" data-tool="clipmaker" data-name="clip maker import video viral clips">
         <span class="tool-emoji">✂️</span>
@@ -123,7 +140,19 @@
       </button>
     </div>
 
-    <div class="field-label" style="margin-top:20px">Utility tools</div>
+    <div class="home-section">
+      <div class="row-between">
+        <div class="field-label home-label" style="margin:0">Recent projects</div>
+        <button id="homeSeeAllBtn" class="ghost-btn small" type="button">Open Library</button>
+      </div>
+      <div id="homeRecentsEmpty" class="empty-state hidden">
+        <div class="empty-title">No projects yet</div>
+        <div class="empty-sub">Import your first video above and it will show up here, ready to reopen anytime.</div>
+      </div>
+      <div id="homeRecents" class="library-grid"></div>
+    </div>
+
+    <div class="field-label home-label">More tools</div>
     <div class="tool-grid" id="hubUtilityGrid">
       <button type="button" class="tool-card" data-tool="library" data-name="library saved videos projects">
         <span class="tool-emoji">📚</span>
@@ -904,6 +933,8 @@
     </div>
   </section>
 </main>
+</div><!-- /content-col -->
+</div><!-- /app-shell -->
 
 <!-- caption editor + trim modal -->
 <div id="captionModal" class="modal hidden">
@@ -1032,7 +1063,7 @@
 
 <!-- settings modal -->
 <div id="settingsModal" class="modal hidden">
-  <div class="modal-box">
+  <div class="modal-box settings-box">
     <h2>Settings</h2>
     <div class="field">
       <label class="field-label">Appearance <span class="hint">— default matches the web app</span></label>
@@ -1072,6 +1103,19 @@
         <button id="falKeyClearBtn" class="ghost-btn small" type="button">Remove key</button>
       </div>
       <p class="hint" id="falKeyState">No key saved.</p>
+    </div>
+    <div class="field">
+      <label class="field-label">Built-in AI <span class="hint">— a professional AI model that runs on your PC. No key, no internet.</span></label>
+      <p class="sub" id="settingsAiText" style="margin:6px 0 0">First use needs a one-time download of the AI model (~9 GB). After that it works fully offline, forever.</p>
+      <div class="bar hidden" id="settingsAiBarWrap" style="margin-top:10px"><div id="settingsAiBar" class="fill"></div></div>
+      <div class="row row-tight" style="margin-top:10px">
+        <button id="settingsAiDownloadBtn" class="ghost-btn" type="button">Download Built-in AI (~9 GB)</button>
+        <span class="hint" id="settingsAiPct"></span>
+      </div>
+    </div>
+    <div class="field">
+      <label class="field-label">About</label>
+      <p class="sub" style="margin:0">Itraji Cliper v2.0 — turn long videos into viral clips. Clipping, captions and the Built-in AI all run locally on this PC; only the AI Video Generator uses the cloud, with your own fal.ai key.</p>
     </div>
     <div class="row">
       <button id="saveSettingsBtn" class="primary">Save settings</button>
