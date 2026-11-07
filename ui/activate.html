@@ -41,6 +41,9 @@
   .activate:disabled { opacity: .55; cursor: default; }
   .err { color: var(--danger); font-size: 13.5px; min-height: 20px; margin-top: 10px; }
   .hidden { display: none; }
+  @keyframes actIn { from { opacity: 0; transform: translateY(14px) scale(.99); } to { opacity: 1; transform: none; } }
+  .card { animation: actIn .34s cubic-bezier(.2,.7,.25,1); }
+  @media (prefers-reduced-motion: reduce) { .card { animation: none; } }
 </style>
 </head>
 <body>

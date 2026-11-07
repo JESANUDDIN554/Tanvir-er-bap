@@ -77,18 +77,45 @@ function fmtTime(s) {
   const m = Math.floor(s / 60), sec = s % 60;
   return `${m}:${String(sec).padStart(2, "0")}`;
 }
-function show(el) { el.classList.remove("hidden"); }
-function hide(el) { el.classList.add("hidden"); }
-
-function reveal(el) {
+function show(el) {
+  if (!el) return;
   const wasHidden = el.classList.contains("hidden");
   el.classList.remove("hidden");
-  if (wasHidden && el.classList.contains("step-card")) {
-    el.classList.remove("pop");
+  if (wasHidden) animateIn(el);
+}
+function hide(el) { el.classList.add("hidden"); }
+
+/* Entrance animation for everything that opens: every view (.step-card),
+   every modal, and the Studio hub's tool cards (staggered). Pure CSS
+   transform/opacity (see .anim-in in style.css); re-triggered by
+   re-adding the class, so it replays on every open and never blocks
+   clicks or workflows. Honored by prefers-reduced-motion in the CSS. */
+function animateIn(el) {
+  if (el.classList.contains("step-card") || el.classList.contains("modal")) {
+    el.classList.remove("anim-in");
     void el.offsetWidth;
-    el.classList.add("pop");
+    el.classList.add("anim-in");
+  }
+  if (el.id === "hubView") {
+    el.querySelectorAll(".tool-card").forEach((card, i) => {
+      card.style.animationDelay = Math.min(i * 45, 400) + "ms";
+      card.classList.remove("anim-in");
+      void card.offsetWidth;
+      card.classList.add("anim-in");
+    });
   }
 }
+
+/* Stagger the entrance of dynamically rendered card lists (Library grid,
+   Home recents): the cards carry the CSS animation; this sets delays. */
+function staggerCards(container, selector) {
+  if (!container) return;
+  container.querySelectorAll(selector).forEach((card, i) => {
+    card.style.animationDelay = Math.min(i * 55, 440) + "ms";
+  });
+}
+
+function reveal(el) { show(el); }
 
 function setStep(n) {
   document.querySelectorAll(".step-dot").forEach((d) => {
@@ -1568,6 +1595,7 @@ async function refreshLibrary() {
     });
     grid.appendChild(card);
   });
+  staggerCards(grid, ".lib-card");
 }
 
 /* ---------------- navigation history (Back button + logo home) -------
@@ -2333,6 +2361,7 @@ async function refreshHomeRecents() {
     });
     grid.appendChild(card);
   });
+  staggerCards(grid, ".lib-card");
 }
 
 $("studioBtn").addEventListener("click", goHome);
