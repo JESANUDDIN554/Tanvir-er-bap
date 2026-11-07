@@ -298,7 +298,7 @@ function renderLiveRail(st) {
   if (renders.length) hide($("liveRailEmpty")); else show($("liveRailEmpty"));
   const thumb = thumbLoadedFor === jobId
     ? $("videoThumb").getAttribute("src") : null;
-  renders.forEach((r) => {
+  renders.forEach((r, ri) => {
     const div = document.createElement("div");
     div.className = "rail-clip";
     div._render = r;
@@ -311,12 +311,28 @@ function renderLiveRail(st) {
     div.innerHTML = `${thumb ? `<img src="${thumb}" alt="">` : ""}
       <div class="rc-text">
         <div class="rc-title">${escapeHtml(r.title || "Clip")}</div>
-        <div class="rc-meta">${dur ? dur + " · " : ""}virality ${r.virality ?? "—"}</div>
+        <div class="rc-meta">${dur ? dur + " · " : ""}virality ${r.virality ?? "—"}${r.broll ? ` · 🎞 B-roll: ${escapeHtml(r.broll.keyword || "stock")}` : ""}</div>
       </div>
       <button class="ghost-btn small rc-dl" type="button">Download</button>
-      <button class="ghost-btn small rc-cap" type="button">Captions</button>`;
+      <button class="ghost-btn small rc-cap" type="button">Captions</button>
+      <button class="ghost-btn small rc-cover" type="button">Cover</button>`;
     div.querySelector(".rc-dl").addEventListener("click", () => {
       if (r.url) downloadUrl(r.url);
+    });
+    div.querySelector(".rc-cover").addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      const old = btn.textContent;
+      btn.textContent = "Making…";
+      const res = await api.make_cover(jobId, ri, r.title || "");
+      btn.disabled = false;
+      btn.textContent = old;
+      if (res.ok && res.cover) {
+        toast("Cover image saved — downloading");
+        downloadUrl(res.cover.url);
+      } else {
+        toast(res.error || "Cover failed", true);
+      }
     });
     div.querySelector(".rc-cap").addEventListener("click", () => {
       openCaptionStudio(r);
@@ -561,6 +577,9 @@ function initControls() {
   $("hookOverlayCheck").checked = settings.hook_overlay !== false;
   $("ctaOverlayCheck").checked = settings.cta_overlay !== false;
   $("punchZoomCheck").checked = settings.punch_zoom !== false;
+  $("zoomBeatsCheck").checked = !!settings.emphasis_zoom;
+  $("zoomLevelSel").value = settings.emphasis_level || "gentle";
+  $("brollCheck").checked = !!settings.broll;
   $("enhanceCheck").checked = !!settings.enhance_clarity;
   $("safeZoneCheck").checked = !!settings.safe_zone;
   $("speakerColor1").value = settings.speaker_color_1 || "#ffd166";
@@ -979,6 +998,15 @@ $("findInput").addEventListener("keydown", (e) => {
 
 /* ---------------- moments list ---------------- */
 function badgeClass(v) { return v >= 80 ? "" : v >= 60 ? "mid" : "low"; }
+/* Score-explanation chips: measured transcript signals behind a
+   moment's scores (pace / energy / hooks / novelty + penalties). */
+function sigChips(m) {
+  const sigs = (m && m.signals) || [];
+  if (!sigs.length) return "";
+  return `<div class="sig-chips">` + sigs.map((s) =>
+    `<span class="sig-chip${s.neg ? " neg" : ""}" title="${escapeHtml(s.detail || "")}">${escapeHtml(s.label)} <b>${s.score > 0 ? "+" : ""}${s.score}</b></span>`
+  ).join("") + `</div>`;
+}
 function bar(label, v) {
   const cls = v >= 80 ? "" : v >= 60 ? "mid" : "low";
   return `<div class="vrow"><span>${label}</span>
@@ -1029,6 +1057,7 @@ function renderMoments(moments) {
           ${bar("Value", m.value_score ?? m.virality)}
         </div>
         <div class="moment-reason">${escapeHtml(m.reason)}</div>
+        ${sigChips(m)}
         <button class="ghost-btn small editCapBtn" data-i="${i}">Edit captions / trim</button>
         <button class="ghost-btn small pkgBtn" data-i="${i}">📝 Posting package</button>
         <div class="pkg-panel hidden" data-i="${i}"></div>
@@ -1163,6 +1192,9 @@ function collectRenderOptions() {
     cta_text: $("ctaTextInput").value.trim(),
     safe_zone: $("safeZoneCheck").checked,
     punch_zoom: $("punchZoomCheck").checked,
+    emphasis_zoom: $("zoomBeatsCheck").checked,
+    emphasis_level: $("zoomLevelSel").value,
+    broll: $("brollCheck").checked,
     enhance_clarity: $("enhanceCheck").checked,
     logo_path: $("brandLogoInput").value.trim(),
   };
@@ -1936,6 +1968,7 @@ function syncStudioControls() {
   $("studioBorderVal").textContent = p.border;
   $("studioUpper").checked = !!p.uppercase;
   $("studioOneWord").checked = !!p.one_word;
+  $("studioEmoji").checked = !!p.auto_emoji;
   $("studioTextColor").value = p.text_color;
   $("studioHlColor").value = p.highlight_color;
 }
@@ -1999,6 +2032,9 @@ $("studioUpper").addEventListener("change", () => {
 $("studioOneWord").addEventListener("change", () => {
   studioCtx.params.one_word = $("studioOneWord").checked;
   renderStudioPreview();
+});
+$("studioEmoji").addEventListener("change", () => {
+  studioCtx.params.auto_emoji = $("studioEmoji").checked;
 });
 $("studioTextColor").addEventListener("input", () => {
   studioCtx.params.text_color = $("studioTextColor").value;
@@ -2708,12 +2744,14 @@ $("hookAnalyzeBtn").addEventListener("click", async () => {
     $("hookMomentMeta").textContent =
       `${fmtTime(m.segment_start)} – ${fmtTime(m.segment_end)} · ${srcLabel} · score ${m.score}. ` +
       "The render window below is trimmed to its most intense seconds.";
+    $("hookMomentSignals").innerHTML = sigChips(m);
     $("hookStartInput").value = Number(m.start).toFixed(1);
     $("hookEndInput").value = Number(m.end).toFixed(1);
   } else {
     $("hookMomentText").textContent =
       "No strong moment found in the transcript.";
     $("hookMomentMeta").textContent = "";
+    $("hookMomentSignals").innerHTML = "";
     $("hookStartInput").value = "0";
     $("hookEndInput").value = "5";
   }

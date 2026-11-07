@@ -250,24 +250,60 @@ def _mark_progress(response="keep"):
             _progress["response"] = response
 
 
-def _force_close(response):
-    """Interrupt a response whose read is blocked in the worker."""
-    try:
-        raw = getattr(response, "raw", None)
-        conn = (getattr(raw, "_connection", None)
-                or getattr(raw, "connection", None))
+def _response_socket(response):
+    """Best-effort hunt for the live socket under a streaming
+    requests/urllib3 response, or None.
+
+    urllib3 2.x DETACHES the socket from the connection object once
+    the response starts streaming (conn.sock reads back None), which
+    silently disarmed the first version of this hunt: the watchdog
+    "fired", found no socket, and fell back to response.close() -
+    which can itself block behind the reading thread, wedging the
+    watchdog and leaving the worker parked in recv until the 120 s
+    read timeout (the exact forever-hang this exists to prevent).
+    While in flight the socket lives under the response's buffered
+    reader chain: raw._fp (BufferedReader) -> .raw (SocketIO) ->
+    ._sock. Check every known location."""
+    raw = getattr(response, "raw", None)
+    if raw is None:
+        return None
+    for conn in (getattr(raw, "_connection", None),
+                 getattr(raw, "connection", None)):
         sock = getattr(conn, "sock", None)
         if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                sock.close()
-            except OSError:
-                pass
-    except Exception:  # noqa: BLE001 - fall back to a plain close
-        pass
+            return sock
+    fp = getattr(raw, "_fp", None)
+    for node in (fp, getattr(fp, "raw", None), getattr(fp, "fp", None)):
+        if node is None:
+            continue
+        for attr in ("_sock", "sock"):
+            sock = getattr(node, attr, None)
+            if sock is not None:
+                return sock
+        inner = getattr(node, "raw", None)
+        sock = getattr(inner, "_sock", None)
+        if sock is not None:
+            return sock
+    return None
+
+
+def _force_close(response):
+    """Interrupt a response whose read is blocked in the worker.
+
+    The socket shutdown comes FIRST: shutdown() is what wakes a recv
+    blocked in another thread. response.close() is only a cleanup
+    afterwards - on its own it can block behind the reading thread,
+    so it must never be the mechanism."""
+    sock = _response_socket(response)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
     try:
         response.close()
     except Exception:  # noqa: BLE001

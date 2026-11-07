@@ -420,7 +420,7 @@
     </div>
 
     <div class="field">
-      <label class="switch-row" for="emojisCheck"><span class="switch-text">Add emojis <span class="hint">— emoji on high-energy words</span></span><span class="switch"><input type="checkbox" id="emojisCheck"><span class="track"><span class="thumb"></span></span></span></label>
+      <label class="switch-row" for="emojisCheck"><span class="switch-text">Add emojis <span class="hint">— one emoji per caption line, from the words spoken</span></span><span class="switch"><input type="checkbox" id="emojisCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="highlightCheck"><span class="switch-text">Highlight keywords <span class="hint">— lime pop on key words</span></span><span class="switch"><input type="checkbox" id="highlightCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="silencesCheck"><span class="switch-text">Remove silences <span class="hint">— cuts dead air</span></span><span class="switch"><input type="checkbox" id="silencesCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="fillerCheck"><span class="switch-text">Remove filler words <span class="hint">— um, uh, like, you know…</span></span><span class="switch"><input type="checkbox" id="fillerCheck"><span class="track"><span class="thumb"></span></span></span></label>
@@ -430,6 +430,16 @@
       <label class="switch-row" for="hookOverlayCheck"><span class="switch-text">Hook text overlay <span class="hint">— punchiest line over the first ~2.5s</span></span><span class="switch"><input type="checkbox" id="hookOverlayCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="ctaOverlayCheck"><span class="switch-text">CTA overlay <span class="hint">— call-to-action in the last 2 seconds</span></span><span class="switch"><input type="checkbox" id="ctaOverlayCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="punchZoomCheck"><span class="switch-text">Punch-in zoom <span class="hint">— subtle zoom on the hook + slow drift</span></span><span class="switch"><input type="checkbox" id="punchZoomCheck"><span class="track"><span class="thumb"></span></span></span></label>
+      <label class="switch-row" for="zoomBeatsCheck"><span class="switch-text">Emphasis zoom <span class="hint">— punch in on the strongest spoken beat</span></span><span class="switch"><input type="checkbox" id="zoomBeatsCheck"><span class="track"><span class="thumb"></span></span></span></label>
+      <div class="row row-tight">
+        <label class="field-label" for="zoomLevelSel">Emphasis strength</label>
+        <select id="zoomLevelSel" class="mini-select">
+          <option value="gentle">Gentle</option>
+          <option value="medium">Medium</option>
+          <option value="strong">Strong</option>
+        </select>
+      </div>
+      <label class="switch-row" for="brollCheck"><span class="switch-text">Auto B-roll <span class="hint">— stock cutaway over long talking stretches (needs internet)</span></span><span class="switch"><input type="checkbox" id="brollCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="enhanceCheck"><span class="switch-text">Enhance clarity <span class="hint">— sharpen + denoise for low-res sources (not an AI upscale)</span></span><span class="switch"><input type="checkbox" id="enhanceCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="safeZoneCheck"><span class="switch-text">Reels-safe export <span class="hint">— captions nudged into safe zones, filename tagged</span></span><span class="switch"><input type="checkbox" id="safeZoneCheck"><span class="track"><span class="thumb"></span></span></span></label>
     </div>
@@ -859,6 +869,7 @@
       <div class="find-box">
         <p class="sub" id="hookMomentText" style="margin-top:0"></p>
         <p class="hint" id="hookMomentMeta"></p>
+        <div class="sig-chips" id="hookMomentSignals"></div>
         <div class="row row-tight" style="margin-top:10px">
           <label class="hint" for="hookStartInput">Start (s)</label>
           <button class="ghost-btn small" type="button" data-nudge="start,-2">−2s</button>
@@ -984,6 +995,7 @@
           <div class="ctl row row-tight">
             <label class="chk"><input type="checkbox" id="studioUpper"> UPPERCASE</label>
             <label class="chk"><input type="checkbox" id="studioOneWord"> One word at a time</label>
+            <label class="chk"><input type="checkbox" id="studioEmoji"> Auto-emoji (one per line, from the words spoken)</label>
           </div>
           <div class="ctl row row-tight">
             <label class="field-label">Text <input type="color" id="studioTextColor" value="#ffffff"></label>

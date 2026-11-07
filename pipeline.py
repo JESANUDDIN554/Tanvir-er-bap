@@ -7,6 +7,7 @@ with karaoke captions and hook overlay.
 All code is original, written for this project.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -573,6 +574,16 @@ def detect_moments_local(words, clip_min_s, clip_max_s,
             picked.append(m)
         if len(picked) >= max_clips:
             break
+    # Explanation chips measured from each moment's own transcript
+    # window - they accompany the model's scores and reason (which
+    # stay the model's), they never replace or invent them.
+    prev_content = set()
+    for m in sorted(picked, key=lambda x: x["start"]):
+        ww = [w for w in words
+              if w["end"] > m["start"] and w["start"] < m["end"]]
+        m["signals"] = window_signals(ww, prev_content,
+                                      m["end"] - m["start"])
+        prev_content = _content_words(ww)
     if progress_cb:
         progress_cb(100, f"Found {len(picked)} moments")
     return picked
@@ -623,9 +634,10 @@ def _content_words(win_words):
             and _clean_word(w["word"]) not in _OFFLINE_STOPWORDS}
 
 
-def _score_offline_window(win_words, prev_content, win_dur):
-    """Score one candidate window. Returns (virality, hook, flow, value,
-    reason_parts)."""
+def _window_components(win_words, prev_content, win_dur):
+    """Raw signal components for one candidate window - shared by the
+    offline scorer and the score-explanation chips so the explanation
+    always matches the number it explains."""
     n = len(win_words)
     density = n / max(win_dur, 0.1)  # words per second
     # ~1.5 wps is calm speech, ~2.8+ is rapid/excited
@@ -660,6 +672,73 @@ def _score_offline_window(win_words, prev_content, win_dur):
     filler_dur = sum(e - s for s, e in find_filler_ranges(win_words))
     filler_pen = min(25, filler_dur / max(win_dur, 0.1) * 120)
 
+    return {
+        "density": density, "density_score": density_score,
+        "punct": punct, "punct_score": punct_score,
+        "energy_hits": energy_hits, "energy_score": energy_score,
+        "caps": caps, "caps_score": caps_score,
+        "novelty_score": novelty_score,
+        "silence": silence, "silence_pen": silence_pen,
+        "filler_dur": filler_dur, "filler_pen": filler_pen,
+    }
+
+
+def _signal_chips(c):
+    """Explanation chips for a scored window (score-reason feature):
+    the positive drivers always, penalties only when they bite."""
+    chips = [
+        {"key": "pace", "label": "Pace",
+         "score": int(round(c["density_score"])),
+         "detail": f"{c['density']:.1f} words/sec"},
+        {"key": "energy", "label": "Energy words",
+         "score": int(round(c["energy_score"])),
+         "detail": (f"{len(c['energy_hits'])} hits: "
+                    + ", ".join(sorted(set(c["energy_hits"]))[:4])
+                    if c["energy_hits"] else "none in this window")},
+        {"key": "hook", "label": "Questions & shouts",
+         "score": int(round(c["punct_score"])),
+         "detail": f"{c['punct']} ?/! marks"},
+        {"key": "novelty", "label": "Fresh topic",
+         "score": int(round(c["novelty_score"])),
+         "detail": "new words vs earlier windows"},
+    ]
+    if c["silence"] > 1.5:
+        chips.append({"key": "silence", "label": "Dead air",
+                      "score": -int(round(c["silence_pen"])), "neg": True,
+                      "detail": f"{c['silence']:.1f}s of silence"})
+    if c["filler_dur"] > 1.0:
+        chips.append({"key": "filler", "label": "Fillers",
+                      "score": -int(round(c["filler_pen"])), "neg": True,
+                      "detail": f"{c['filler_dur']:.1f}s of uh/um"})
+    return chips
+
+
+def window_signals(win_words, prev_content=None, win_dur=None):
+    """Chips explaining a window's score, measured from the transcript
+    alone. Attached to moments from EVERY detector (offline, built-in
+    AI, keyword search) so the explanation is always a measurement of
+    the actual words, never an invented justification."""
+    if not win_words:
+        return []
+    if win_dur is None:
+        win_dur = win_words[-1]["end"] - win_words[0]["start"]
+    return _signal_chips(_window_components(win_words, prev_content,
+                                            win_dur))
+
+
+def _score_offline_window(win_words, prev_content, win_dur):
+    """Score one candidate window. Returns (virality, hook, flow, value,
+    reason_parts, signals)."""
+    c = _window_components(win_words, prev_content, win_dur)
+    density_score = c["density_score"]
+    energy_score = c["energy_score"]
+    punct_score = c["punct_score"]
+    novelty_score = c["novelty_score"]
+    caps_score = c["caps_score"]
+    silence_pen = c["silence_pen"]
+    filler_pen = c["filler_pen"]
+    energy_hits = c["energy_hits"]
+
     virality = (0.30 * density_score + 0.22 * energy_score
                 + 0.18 * punct_score + 0.15 * novelty_score
                 + 0.15 * caps_score
@@ -672,17 +751,17 @@ def _score_offline_window(win_words, prev_content, win_dur):
                      - 0.4 * silence_pen))
     value = round(0.5 * energy_score + 0.5 * novelty_score)
 
-    parts = [f"{density:.1f} words/sec",
+    parts = [f"{c['density']:.1f} words/sec",
              f"{len(energy_hits)} energy words"
              + (": " + ", ".join(sorted(set(energy_hits))[:4])
                 if energy_hits else ""),
-             f"{punct} exclamations/questions",
+             f"{c['punct']} exclamations/questions",
              f"{novelty_score:.0f}% topic novelty"]
-    if silence > 1.5:
-        parts.append(f"{silence:.1f}s silence (penalty)")
-    if filler_dur > 1.0:
-        parts.append(f"{filler_dur:.1f}s fillers (penalty)")
-    return virality, hook, flow, value, "; ".join(parts)
+    if c["silence"] > 1.5:
+        parts.append(f"{c['silence']:.1f}s silence (penalty)")
+    if c["filler_dur"] > 1.0:
+        parts.append(f"{c['filler_dur']:.1f}s fillers (penalty)")
+    return virality, hook, flow, value, "; ".join(parts), _signal_chips(c)
 
 
 def _extract_title_hook(win_words):
@@ -756,11 +835,11 @@ def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8):
             if e - s < 5:
                 prev_content = _content_words(win_words)
                 continue
-            virality, hook_s, flow_s, value_s, parts = _score_offline_window(
-                win_words, prev_content, e - s)
+            virality, hook_s, flow_s, value_s, parts, sigs = \
+                _score_offline_window(win_words, prev_content, e - s)
             prev_content = _content_words(win_words)
             scored.append((virality, s, e, win_words, hook_s, flow_s,
-                           value_s, parts))
+                           value_s, parts, sigs))
 
     # non-max suppression: keep best-first, drop heavy overlaps
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -780,7 +859,7 @@ def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8):
 
     moments = []
     for (virality, s, e, win_words, hook_s, flow_s, value_s,
-            parts) in picked:
+            parts, sigs) in picked:
         title, hook = _extract_title_hook(win_words)
         moments.append({
             "start": round(s, 2),
@@ -792,6 +871,7 @@ def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8):
             "flow_score": flow_s,
             "value_score": value_s,
             "reason": "Heuristic (offline): " + parts,
+            "signals": sigs,
             "offline": True,
         })
     moments.sort(key=lambda m: m["virality"], reverse=True)
@@ -905,6 +985,35 @@ def _extractive_posting_package(words, moment, genre=""):
     }
 
 
+def _posting_desc_is_echo(desc, words):
+    """True when a model-written posting description is really the
+    instruction parroted back ("Two to three sentences with a line
+    break, ending in a question.") instead of copy: such text shares
+    NO content words with the transcript, and often repeats itself
+    verbatim across a blank line."""
+    desc = desc or ""
+    desc_words = {_clean_word(t) for t in
+                  re.findall(r"[A-Za-z']+", desc.lower())}
+    desc_words.discard("")
+    tr_words = {_clean_word(w["word"]) for w in words or []}
+    tr_words.discard("")
+    halves = [h.strip() for h in re.split(r"\n\s*\n", desc) if h.strip()]
+    if len(halves) >= 2 and halves[0] == halves[1]:
+        return True
+    return len(desc_words) >= 6 and not (desc_words & tr_words)
+
+
+def posting_package_valid(pkg, words):
+    """Re-validate a CACHED posting package before serving it: a
+    package written by a weaker model build stays cached on the moment
+    (and in job.json) forever, so the echo check must apply to cache
+    reads too, not just fresh generations. Extractive packages are
+    template-built from the transcript and always valid."""
+    if not pkg or pkg.get("mode") != "ai":
+        return True
+    return not _posting_desc_is_echo(pkg.get("description", ""), words)
+
+
 def generate_posting_package(words, moment, genre=""):
     """Per-clip posting package: 3 titles, FB description, hashtags.
 
@@ -938,6 +1047,12 @@ def generate_posting_package(words, moment, genre=""):
                 h = re.sub(r"[^#a-zA-Z0-9_]", "", h)
                 if len(h) > 1:
                     tags.append(h.lower())
+            # Echo guard (see _posting_desc_is_echo): reject parroted
+            # instructions and take the honest extractive fallback.
+            if _posting_desc_is_echo(desc, words):
+                raise RuntimeError(
+                    "the model echoed its instructions instead of "
+                    "writing copy")
             if titles and desc:
                 return {
                     "titles": (titles + ["Clip"] * 3)[:3],
@@ -1407,7 +1522,8 @@ def hook_render_window(words, start, end, lo=3.0, hi=8.0,
         if len(ww) > dense_n:
             dense_n, dense_s = len(ww), t
         if len(ww) >= 4:
-            v, _h, _f, _val, _p = _score_offline_window(ww, None, target)
+            v, _h, _f, _val, _p, _sg = _score_offline_window(
+                ww, None, target)
             if v > best_v:
                 best_v, best_s = v, t
         t += 0.5
@@ -1437,11 +1553,14 @@ def find_hook_moment(words, duration=0.0, moments=None):
 
     def _pack(m, source, index):
         rs, re_ = hook_render_window(words, m["start"], m["end"])
-        text = " ".join(w["word"] for w in words
-                        if w["end"] > rs and w["start"] < re_).strip()
+        win = [w for w in words
+               if w["end"] > rs and w["start"] < re_]
+        text = " ".join(w["word"] for w in win).strip()
+        sigs = m.get("signals") or window_signals(win, None, re_ - rs)
         return {"start": rs, "end": re_, "text": text,
                 "score": int(m.get("virality", 0) or 0),
                 "source": source, "moment_index": index,
+                "signals": sigs,
                 "segment_start": round(float(m["start"]), 2),
                 "segment_end": round(float(m["end"]), 2)}
 
@@ -1622,7 +1741,7 @@ def _preset(**kw):
             "size": "l", "one_word": False, "animation": "none",
             "font": "default", "text_color": "#FFFFFF",
             "highlight_color": "#C8FF2E", "border": 3,
-            "outline_color": "#000000", "bold": 1}
+            "outline_color": "#000000", "bold": 1, "auto_emoji": False}
     base.update(kw)
     return base
 
@@ -1751,6 +1870,7 @@ def normalize_caption_params(params=None, style_name=None):
         eff["font"] = "default"
     eff["uppercase"] = bool(eff["uppercase"])
     eff["one_word"] = bool(eff["one_word"])
+    eff["auto_emoji"] = bool(eff.get("auto_emoji"))
     eff["bold"] = 1 if eff.get("bold", 1) else 0
     for ck, dflt in (("text_color", "#FFFFFF"),
                      ("highlight_color", "#C8FF2E"),
@@ -1791,6 +1911,9 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
     eff = normalize_caption_params(caption_params, style_name)
     if eff is not None:
         no_captions = False
+    # Auto-emoji: the render-level toggle OR the Caption Studio
+    # per-params toggle - both mean "one keyword emoji per line".
+    use_emojis = bool(emojis) or bool(eff and eff.get("auto_emoji"))
     W, H = int(res[0]), int(res[1])
     sx, sy = W / 1080.0, H / 1920.0
     cap_font = max(24, int(60 * sx))
@@ -1860,12 +1983,7 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
 
         def _p_word(w):
             t = w["word"].upper() if eff["uppercase"] else w["word"]
-            t = _esc(t)
-            if emojis:
-                em = EMOJI_MAP.get(_clean_word(w["word"]))
-                if em:
-                    t += em
-            return t
+            return _esc(t)
 
         def _p_anim_tags():
             if eff["animation"] == "pop":
@@ -1912,7 +2030,8 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
                 body.append(
                     f"Dialogue: {1 if p_box else 0},"
                     f"{ts(w['start'])},{ts(w['end'])},Caption,,0,0,0,,"
-                    f"{{\\1c{p_prim}&}}{_p_anim_tags()}{_p_word(w)}")
+                    f"{{\\1c{p_prim}&}}{_p_anim_tags()}{_p_word(w)}"
+                    + (_line_emoji([w]) if use_emojis else ""))
                 if p_box:
                     box_events.append(
                         _p_box_event([w], 0, w["start"], w["end"]))
@@ -1932,10 +2051,15 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
                         else:
                             parts.append(
                                 "{\\1c" + p_dim + "&}" + _p_word(wj))
+                    line_txt = " ".join(parts)
+                    if use_emojis:
+                        _em = _line_emoji(line)
+                        if _em:
+                            line_txt += _em
                     body.append(
                         f"Dialogue: {1 if p_box else 0},"
                         f"{ts(w['start'])},{ts(ev_end)},Caption,,0,0,0,,"
-                        + " ".join(parts))
+                        + line_txt)
                     if p_box:
                         box_events.append(
                             _p_box_event(line, k, w["start"], ev_end))
@@ -1954,10 +2078,6 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
             for w in line:
                 cs = max(1, int((w["end"] - w["start"]) * 100))
                 txt = _esc(w["word"])
-                if emojis:
-                    em = EMOJI_MAP.get(_clean_word(w["word"]))
-                    if em:
-                        txt += em
                 if spk_cols is not None:
                     # speaker colors win over highlight - that IS the feature
                     col = spk_cols[w.get("speaker", 0) % 2]
@@ -1966,6 +2086,10 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
                 else:
                     col = prim_col
                 parts.append(f"{{\\k{cs}\\1c{col}&}}{txt}")
+            if use_emojis and parts:
+                _em = _line_emoji(line)
+                if _em:
+                    parts[-1] += _em
             layer = 1 if use_box else 0
             body.append(
                 f"Dialogue: {layer},{ts(line[0]['start'])},{ts(line[-1]['end'])},"
@@ -2125,6 +2249,32 @@ def kept_duration(start, end, removed):
     return sum(e - s for s, e in compute_keep_segments(start, end, removed))
 
 
+def _guard_removed_against_words(removed, words, margin=0.03):
+    """Shrink trim ranges so a cut never eats into a kept word.
+
+    A range may fully contain the filler words it targets, but where
+    it only PARTIALLY overlaps a word (filler padding, or an audio-
+    detected silence whose edge lands on a word tail) the range is
+    pulled back to that word's boundary, keeping a small margin of
+    air. A range trapped entirely inside one word is dropped - a
+    cut inside a spoken word is never allowed."""
+    out = []
+    for s, e in removed:
+        for w in words:
+            ws, we = w["start"], w["end"]
+            if ws >= s and we <= e:
+                continue  # word fully inside the cut: it is the target
+            if ws < s < we:
+                s = min(we + margin, e)
+            if ws < e < we:
+                e = max(ws - margin, s)
+            if e - s <= 0.05:
+                break
+        if e - s > 0.05:
+            out.append((s, e))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # v2: caption editor re-timing
 # ---------------------------------------------------------------------------
@@ -2264,6 +2414,39 @@ EMOJI_MAP = {
     "breaking": "🚨", "exclusive": "🔥", "fight": "🥊", "run": "🏃",
     "car": "🚗", "dog": "🐶", "cat": "🐱", "goal": "⚽",
 }
+
+# Line-level auto-emoji: at most ONE emoji per caption line, appended
+# at the end of the line, chosen by the first keyword actually spoken
+# in that line. Curated for police/bodycam content first (the app's
+# home genre), energy/reaction words second.
+LINE_EMOJI_MAP = {
+    "police": "👮", "officer": "👮", "officers": "👮", "cop": "👮",
+    "cops": "👮", "trooper": "👮", "sheriff": "👮", "deputy": "👮",
+    "chase": "🚔", "pursuit": "🚔", "car": "🚔", "vehicle": "🚔",
+    "gun": "🚨", "weapon": "🚨", "pistol": "🚨", "rifle": "🚨",
+    "shots": "🚨", "shooting": "🚨", "arrest": "🚨", "arrested": "🚨",
+    "siren": "🚨", "sirens": "🚨", "breaking": "🚨",
+    "fire": "🔥", "flames": "🔥", "explosion": "💥", "exploded": "💥",
+    "danger": "⚠️", "dog": "🐶", "k9": "🐶",
+    "run": "🏃", "running": "🏃", "flee": "🏃", "fled": "🏃",
+    "money": "💰", "cash": "💰",
+    "scary": "😱", "terrifying": "😱", "unbelievable": "😱",
+    "funny": "😂", "hilarious": "🤣", "lol": "😂", "haha": "😂",
+    "wow": "😮", "insane": "🤯", "crazy": "🤪", "amazing": "😲",
+    "incredible": "🤩", "caught": "📸", "exposed": "📸",
+    "secret": "🤫", "love": "❤️", "win": "🏆", "fight": "🥊",
+}
+
+
+def _line_emoji(line_words):
+    """The single emoji for a caption line (or ''): the first keyword
+    in the line that has one wins, so the emoji always reflects a word
+    that was actually spoken in that line."""
+    for w in line_words:
+        em = LINE_EMOJI_MAP.get(_clean_word(w["word"]))
+        if em:
+            return em
+    return ""
 
 # Small built-in blocklist for the auto-censor beep (separate block, keep
 # it short - strong profanity only).
@@ -2529,6 +2712,7 @@ def find_moments_by_keywords(words, queries, clip_min_s, clip_max_s,
             "hook_score": v, "flow_score": max(30, v - 10),
             "value_score": max(30, v - 5),
             "reason": f"Keyword match for: {q}",
+            "signals": window_signals(win_words, None, e - s),
             "matched": q, "offline": True,
         })
     return moments[:max_clips], unmatched
@@ -2938,6 +3122,443 @@ def _overlay_logo(clip_path, logo_path):
     return clip_path
 
 
+EMPHASIS_ZOOM_LEVELS = {"gentle": 0.08, "medium": 0.14,
+                        "strong": 0.22}
+
+
+def _strongest_beats(cap_words, total_dur, max_beats=2):
+    """Strongest spoken beats on the OUTPUT timeline (cap_words are
+    already rebased): 1s windows scored by energy words, ?/! marks,
+    SHOUTED words and density. Returns [(center_t, score)] in time
+    order - at most max_beats, >= 2.5s apart, >= 1s from the edges so
+    the zoom envelope has room to ramp."""
+    if not cap_words or total_dur < 4:
+        return []
+    wins = []
+    t = 1.0
+    while t + 0.5 <= total_dur - 0.5:
+        ww = [w for w in cap_words
+              if w["end"] > t - 0.5 and w["start"] < t + 0.5]
+        score = 0.3 * len(ww)
+        for w in ww:
+            if _clean_word(w["word"]) in OFFLINE_ENERGY_WORDS:
+                score += 2.0
+            if "!" in w["word"] or "?" in w["word"]:
+                score += 2.0
+            if len(w["word"]) > 2 and w["word"].isupper():
+                score += 1.0
+        if score > 0:
+            wins.append((t, score))
+        t += 0.25
+    if not wins:
+        return []
+    wins.sort(key=lambda x: x[1], reverse=True)
+    top = wins[0][1]
+    picked = []
+    for t, s in wins:
+        if picked and s < 0.7 * top:
+            continue
+        if all(abs(t - pt) >= 2.5 for pt, _ in picked):
+            picked.append((t, s))
+        if len(picked) >= max_beats:
+            break
+    return sorted(picked)
+
+
+def _beat_center(clip_path, t):
+    """(cx, cy) fractions for a zoom centre at time t: horizontally
+    on the tracked face when one is visible in that frame (YuNet via
+    facetrack), vertically at 40% (where a face sits in a reframed
+    vertical clip); falls back to (0.5, 0.40) with no face."""
+    try:
+        import cv2
+        cap = cv2.VideoCapture(clip_path)
+        try:
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t) * 1000)
+            ok, frame = cap.read()
+        finally:
+            cap.release()
+        if ok and frame is not None:
+            from facetrack import FaceTracker
+            cx_px = FaceTracker().detect_center(frame)
+            if cx_px is not None and frame.shape[1]:
+                return (min(0.85, max(0.15, cx_px / frame.shape[1])),
+                        0.40)
+    except Exception:  # noqa: BLE001 - centre is best-effort
+        pass
+    return (0.5, 0.40)
+
+
+def _apply_emphasis_zoom(clip_path, beats, peak, progress_cb=None):
+    """Post-pass (same best-effort pattern as the logo pass): smooth
+    punch-in zooms on the rendered clip at the given beats. zoompan
+    evaluates the zoom factor per frame (crop cannot - its h
+    expression has no frame time at configure), easing in/out
+    around each beat - audio copied untouched."""
+    W, H, fps = probe_video(clip_path)
+    if not W or not H:
+        raise RuntimeError("could not probe the rendered clip")
+    env = "+".join(
+        f"(clip((time-{t - 0.9:.3f})/0.35,0,1)"
+        f"*clip(({t + 0.9:.3f}-time)/0.35,0,1))"
+        for t, _s in beats)
+    bt = max(beats, key=lambda b: b[1])[0]
+    cx, cy = _beat_center(clip_path, bt)
+    vf = (f"zoompan=z='1+{peak:.3f}*({env})'"
+          f":x='max(0,min(iw-iw/zoom,{cx:.3f}*iw-(iw/zoom)/2))'"
+          f":y='max(0,min(ih-ih/zoom,{cy:.3f}*ih-(ih/zoom)/2))'"
+          f":d=1:s={W}x{H}:fps={fps or 30},setsar=1")
+    tmp = clip_path + ".zoom.mp4"
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", clip_path,
+           "-vf", vf, "-c:v", "libx264", "-preset", "slow",
+           "-crf", "17", "-pix_fmt", "yuv420p", "-c:a", "copy",
+           "-movflags", "+faststart", tmp]
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0 or not os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise RuntimeError("emphasis zoom failed: "
+                           + r.stderr[-400:])
+    os.replace(tmp, clip_path)
+    return clip_path
+
+
+# ---------------------------------------------------------------------------
+# Auto B-roll: a free-licensed stock cutaway (Wikimedia Commons, no API
+# key) over a long single-shot talking stretch. Audio and captions run
+# untouched underneath. Needs internet - every failure degrades to
+# "render without B-roll", never a failed render.
+# ---------------------------------------------------------------------------
+BROLL_MIN_STRETCH_S = 6.0    # talking stretch must be at least this long
+BROLL_MAX_LEN_S = 6.0        # cutaway length cap
+BROLL_HOOK_INSET_S = 3.0     # never cover the hook opening
+
+_BROLL_PHRASES = (
+    ("police", "police car"), ("officer", "police car"),
+    ("cop", "police car"), ("sheriff", "police car"),
+    ("chase", "police chase"), ("pursuit", "police chase"),
+    ("dog", "police dog"), ("k9", "police dog"),
+    ("fire", "fire flames"), ("gun", "police"),
+    ("car", "car driving street"), ("vehicle", "car driving street"),
+    ("truck", "truck highway"), ("highway", "highway traffic"),
+    ("street", "city street"), ("city", "city street"),
+    ("hospital", "hospital building"), ("school", "school building"),
+)
+
+
+def _broll_keyword(win_words):
+    """Commons search phrase for a window: a curated phrase when a
+    known bodycam keyword is spoken, else the window's most frequent
+    content word."""
+    said = {_clean_word(w["word"]) for w in win_words}
+    for kw, phrase in _BROLL_PHRASES:
+        if kw in said:
+            return phrase
+    freq = {}
+    for w in win_words:
+        cw = _clean_word(w["word"])
+        if len(cw) > 3 and cw not in _OFFLINE_STOPWORDS:
+            freq[cw] = freq.get(cw, 0) + 1
+    return max(freq, key=freq.get) if freq else ""
+
+
+def _find_broll_window(cap_words, total_dur):
+    """(start, end, keyword) for a cutaway over the longest stretch
+    of near-continuous speech (words with no gap > 1.2s) in the
+    OUTPUT timeline, kept clear of the hook opening - or None."""
+    if not cap_words or total_dur < BROLL_MIN_STRETCH_S + 2:
+        return None
+    spans = []
+    a = cap_words[0]["start"]
+    prev = cap_words[0]
+    for w in cap_words[1:]:
+        if w["start"] - prev["end"] > 1.2:
+            spans.append((a, prev["end"]))
+            a = w["start"]
+        prev = w
+    spans.append((a, prev["end"]))
+    best = None
+    for s, e in spans:
+        if e - s >= BROLL_MIN_STRETCH_S and (best is None
+                                            or e - s > best[0]):
+            best = (e - s, s, e)
+    if not best:
+        return None
+    _len, s, e = best
+    w0 = max(s + 0.8, BROLL_HOOK_INSET_S)
+    if e - w0 < 2.5:
+        return None
+    w1 = min(e, w0 + BROLL_MAX_LEN_S)
+    win = [w for w in cap_words if w["end"] > w0 and w["start"] < w1]
+    kw = _broll_keyword(win)
+    if not kw:
+        return None
+    return (round(w0, 2), round(w1, 2), kw)
+
+
+def _broll_cache_dir():
+    import local_ai
+    d = os.path.join(local_ai.MODELS_DIR, "broll_cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _strip_html(text):
+    return re.sub(r"<[^>]+>", "", str(text or "")).strip()
+
+
+def _commons_broll_clip(keyword, want_dur, progress_cb=None):
+    """Find + download (cached) a free-licensed stock video from
+    Wikimedia Commons for keyword. Returns (path, credit) - credit
+    carries title/artist/license/page_url/source_url/duration for
+    attribution. Raises RuntimeError with a plain message."""
+    import urllib.parse
+    import urllib.request
+    api = ("https://commons.wikimedia.org/w/api.php?action=query"
+           "&format=json&generator=search&gsrnamespace=6&gsrlimit=8"
+           "&prop=imageinfo&iiprop=url%7Csize%7Cmime%7Cextmetadata"
+           "&gsrsearch="
+           + urllib.parse.quote(keyword + " filetype:video"))
+    req = urllib.request.Request(
+        api, headers={"User-Agent": "ItrajiCliper/1.0 (auto b-roll)"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"stock search failed ({e})") from e
+    pages = (data.get("query") or {}).get("pages") or {}
+    cands = []
+    for p in pages.values():
+        ii = (p.get("imageinfo") or [{}])[0]
+        url = (ii.get("url") or "").split("?")[0]
+        mime = ii.get("mime") or ""
+        if not url or not (mime.startswith("video/")
+                           or mime == "application/ogg"):
+            continue
+        size = int(ii.get("size") or 0)
+        if size > 60_000_000:
+            continue
+        dur = float(ii.get("duration") or 0)
+        meta = ii.get("extmetadata") or {}
+        cands.append({
+            "url": url, "size": size, "duration": dur,
+            "title": str(p.get("title") or "").removeprefix("File:"),
+            "page_url": ii.get("descriptionurl") or "",
+            "artist": _strip_html(
+                (meta.get("Artist") or {}).get("value", ""))[:80]
+                or "Wikimedia Commons contributor",
+            "license": ((meta.get("LicenseShortName") or {})
+                        .get("value", "") or "see file page")[:40],
+        })
+    if not cands:
+        raise RuntimeError(f"no stock video found for '{keyword}'")
+    # prefer a clip at least as long as the window, then smaller files
+    cands.sort(key=lambda c: (0 if c["duration"] >= want_dur else 1,
+                              c["size"]))
+    pick = cands[0]
+    fname = (hashlib.sha1(pick["url"].encode()).hexdigest()[:16]
+             + os.path.splitext(pick["url"])[1].lower())
+    path = os.path.join(_broll_cache_dir(), fname)
+    if not (os.path.isfile(path) and os.path.getsize(path) > 100_000):
+        tmp = path + ".part"
+        try:
+            req = urllib.request.Request(
+                pick["url"],
+                headers={"User-Agent": "ItrajiCliper/1.0 (auto b-roll)"})
+            with urllib.request.urlopen(req, timeout=60) as resp, \
+                    open(tmp, "wb") as f:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise RuntimeError(f"stock download failed ({e})") from e
+    credit = {"title": pick["title"], "artist": pick["artist"],
+              "license": pick["license"], "page_url": pick["page_url"],
+              "source_url": pick["url"], "duration": pick["duration"]}
+    return path, credit
+
+
+def _apply_broll(clip_path, broll_path, w0, w1, W, H):
+    """Post-pass: full-frame cutaway to the stock clip during
+    [w0, w1] of the rendered clip; the clip's own audio (and its
+    burned captions) continue underneath - the overlay only swaps
+    the picture for that window."""
+    fc = (f"[1:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+          f"crop={W}:{H},setpts=PTS-STARTPTS+{w0:.3f}/TB[b];"
+          f"[0:v][b]overlay=0:0:enable='between(t,{w0:.3f},{w1:.3f})'"
+          "[v]")
+    tmp = clip_path + ".broll.mp4"
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", clip_path,
+           "-i", broll_path, "-filter_complex", fc,
+           "-map", "[v]", "-map", "0:a",
+           "-c:v", "libx264", "-preset", "slow", "-crf", "17",
+           "-pix_fmt", "yuv420p", "-c:a", "copy",
+           "-movflags", "+faststart", tmp]
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0 or not os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise RuntimeError("b-roll overlay failed: " + r.stderr[-400:])
+    os.replace(tmp, clip_path)
+    return clip_path
+
+
+# ---------------------------------------------------------------------------
+# Cover Maker: pick a strong frame from a rendered clip and stamp the
+# hook/title on it in the app's caption style -> 1080x1920 JPG cover.
+# ---------------------------------------------------------------------------
+def _cover_candidates(cap_words, total_dur):
+    cands = {round(total_dur * f, 2) for f in (0.2, 0.4, 0.6, 0.8)}
+    for bt, _sc in _strongest_beats(cap_words, total_dur, max_beats=2):
+        cands.add(round(bt, 2))
+        cands.add(round(bt + 0.4, 2))
+    return sorted(t for t in cands
+                  if 0.25 <= t <= max(0.3, total_dur - 0.25))
+
+
+def make_cover(clip_path, cap_words, out_path, text, W=1080, H=1920):
+    """Auto-pick a cover frame from a rendered clip: candidates at
+    the strongest spoken beats plus spread points, scored by face
+    presence, sharpness (Laplacian variance) and sane brightness.
+    The winner is centre-cropped to 9:16 around the face when one
+    is present, and the title is stamped in the app caption style
+    (Archivo Black, white with a black outline) via drawtext.
+    Returns {path, t, face, sharpness, stamped}."""
+    import cv2
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", clip_path], capture_output=True, text=True)
+    try:
+        dur = float(r.stdout.strip())
+    except (TypeError, ValueError):
+        dur = 0.0
+    if dur <= 0:
+        raise RuntimeError("could not read the clip")
+    cap = cv2.VideoCapture(clip_path)
+    if not cap.isOpened():
+        raise RuntimeError("could not open the clip")
+    tracker = None
+    try:
+        import facetrack
+        tracker = facetrack.FaceTracker()
+    except Exception:  # noqa: BLE001 - face bonus is optional
+        tracker = None
+    best = None
+    for t in _cover_candidates(cap_words or [], dur):
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+        okf, frame = cap.read()
+        if not okf or frame is None:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        mean = float(gray.mean())
+        bright_pen = 0.0 if 35 <= mean <= 225 else 300.0
+        face_cx = None
+        face_bonus = 0.0
+        if tracker is not None:
+            try:
+                faces = tracker.detect_faces(frame)
+            except Exception:  # noqa: BLE001
+                faces = []
+            if faces:
+                cx, area = max(faces, key=lambda f: f[1])
+                face_cx = cx
+                face_bonus = 500.0 + min(
+                    500.0, area / max(1, frame.shape[0]
+                                      * frame.shape[1]) * 4000.0)
+        score = min(sharp, 900.0) + face_bonus - bright_pen
+        if best is None or score > best["score"]:
+            best = {"t": t, "frame": frame, "face_cx": face_cx,
+                    "sharp": sharp, "score": score}
+    cap.release()
+    if best is None:
+        raise RuntimeError("could not read any frame from the clip")
+    frame = best["frame"]
+    fh, fw = frame.shape[:2]
+    target = W / H
+    if fw / fh > target:            # too wide: crop the width
+        cw, ch = int(fh * target), fh
+        cx = best["face_cx"] if best["face_cx"] is not None else fw / 2
+        x0 = int(min(max(cx - cw / 2, 0), fw - cw))
+        y0 = 0
+    else:                            # too tall: crop the height
+        cw, ch = fw, int(fw / target)
+        x0 = 0
+        y0 = int(min(max(fh * 0.35 - ch / 2, 0), fh - ch))
+    crop = frame[y0:y0 + ch, x0:x0 + cw]
+    cover = cv2.resize(crop, (W, H), interpolation=cv2.INTER_LANCZOS4)
+    stamped = False
+    text = " ".join((text or "").split()).upper()
+    if text:
+        tmp_png = out_path + ".tmp.png"
+        cv2.imwrite(tmp_png, cover)
+        # wrap into balanced lines of at most ~14 chars (Archivo
+        # Black caps are wide - the size estimate below assumes a
+        # 0.78em average advance, so lines must stay short)
+        words_t = text.split()
+        n_lines = max(1, min(3, -(-len(text) // 15)))
+        lines, cur = [], ""
+        per = -(-len(words_t) // n_lines)
+        for i, wd in enumerate(words_t):
+            if i and i % per == 0:
+                lines.append(cur)
+                cur = ""
+            cur = (cur + " " + wd).strip()
+        if cur:
+            lines.append(cur)
+        longest = max(len(l) for l in lines)
+        size = int(max(44, min(118, (W * 0.92)
+                               / (0.78 * max(1, longest)))))
+        tf = out_path + ".txt"
+        with open(tf, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        fonts_dir = FONTS_DIR or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "fonts")
+        font = os.path.join(fonts_dir, "ArchivoBlack-Regular.ttf")
+
+        def _esc(p):
+            return (p.replace("\\", "/").replace(":", "\\:")
+                     .replace("'", "\\'"))
+        vf = (f"drawtext=fontfile='{_esc(font)}'"
+              f":textfile='{_esc(tf)}':fontsize={size}"
+              f":fontcolor=white:borderw={max(3, size // 11)}"
+              f":bordercolor=black:x=(w-text_w)/2:y=h*0.07"
+              f":line_spacing={size // 5}")
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", tmp_png,
+               "-vf", vf, "-frames:v", "1", "-q:v", "3", out_path]
+        rr = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, text=True)
+        stamped = rr.returncode == 0 and os.path.exists(out_path)
+        for junk in (tmp_png, tf):
+            try:
+                os.remove(junk)
+            except OSError:
+                pass
+        if not stamped:              # plain cover beats no cover
+            cv2.imwrite(out_path, cover,
+                        [cv2.IMWRITE_JPEG_QUALITY, 92])
+    else:
+        cv2.imwrite(out_path, cover, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not os.path.exists(out_path):
+        raise RuntimeError("cover export failed")
+    return {"path": out_path, "t": round(best["t"], 2),
+            "face": best["face_cx"] is not None,
+            "sharpness": round(best["sharp"], 1), "stamped": stamped}
+
+
 def render_clip(video_path, moment, words, style_name, out_path,
                 progress_cb=None, face_track=False, remove_fillers=False,
                 remove_silences=False, auto_censor=False, emojis=False,
@@ -2946,7 +3567,8 @@ def render_clip(video_path, moment, words, style_name, out_path,
                 speaker_colors=None, hook_overlay=True, cta_text=None,
                 safe_zone=False, punch_zoom=False, enhance_clarity=False,
                 logo_path=None, quality_tier="maximum",
-                caption_params=None):
+                caption_params=None, emphasis_zoom=False,
+                emphasis_level="gentle", broll=False):
     """Cut + reframe + burned captions + hook. Returns out_path.
 
     face_track=True -> per-frame face-following crop (OpenCV pipe).
@@ -2962,6 +3584,13 @@ def render_clip(video_path, moment, words, style_name, out_path,
     cta_text -> when set, shown as a faded overlay in the last 2s.
     safe_zone -> nudge captions/hook inside Reels UI safe areas.
     punch_zoom -> subtle zoom-punch on the hook + slow drift.
+    emphasis_zoom -> punch-in zoom centred on the subject at the
+        clip's strongest spoken beat(s); emphasis_level picks the
+        peak (gentle/medium/strong). Best-effort post-pass.
+    broll -> free-licensed stock cutaway (Wikimedia Commons) over a
+        long talking stretch; needs internet; any failure renders
+        without it. When used, a <out>.broll.json sidecar records the
+        source for attribution.
     enhance_clarity -> light denoise + sharpen (honest "enhance",
         never "AI upscale").
     logo_path -> corner logo PNG watermarked top-left (brand kit).
@@ -2987,7 +3616,8 @@ def render_clip(video_path, moment, words, style_name, out_path,
         removed += find_filler_ranges(win_words)
     if remove_silences:
         try:
-            removed += detect_silences(video_path, start, end)
+            removed += detect_silences(video_path, start, end,
+                                       min_dur=0.7)
         except Exception:  # noqa: BLE001 - silence cut is best-effort
             pass
     removed = [(max(s, start), min(e, end)) for s, e in removed]
@@ -3000,6 +3630,22 @@ def render_clip(video_path, moment, words, style_name, out_path,
         else:
             merged.append((s, e))
     removed = merged
+
+    if removed:
+        # Trim safety guards: cuts may swallow filler words whole but
+        # never eat into a kept word, and the total cut is capped at
+        # 35% of the clip - beyond that the "trim" is really a
+        # different edit, so refuse honestly instead of mangling it.
+        removed = _guard_removed_against_words(removed, win_words)
+        cut_total = sum(e - s for s, e in removed)
+        span = end - start
+        if cut_total > 0.35 * span:
+            raise RuntimeError(
+                "Filler/silence trim would cut "
+                f"{cut_total:.1f}s of this {span:.0f}s clip "
+                f"({cut_total / span * 100:.0f}%) - over the 35% "
+                "safety limit, so nothing was rendered. Turn off a "
+                "trim option or pick a longer moment.")
 
     keep_segs = compute_keep_segments(start, end, removed)
     if not keep_segs:
@@ -3040,6 +3686,64 @@ def render_clip(video_path, moment, words, style_name, out_path,
         except OSError:
             pass
 
+    if emphasis_zoom:
+        # best-effort like the logo pass: a failed zoom must never
+        # lose the finished clip
+        try:
+            beats = _strongest_beats(cap_words, total_dur)
+            peak = EMPHASIS_ZOOM_LEVELS.get(
+                str(emphasis_level or "gentle").lower(),
+                EMPHASIS_ZOOM_LEVELS["gentle"])
+            if beats:
+                _apply_emphasis_zoom(out_path, beats, peak,
+                                     progress_cb=progress_cb)
+                if progress_cb:
+                    progress_cb(
+                        97, "Emphasis zoom on the strongest beat"
+                        + ("s" if len(beats) > 1 else ""))
+            elif progress_cb:
+                progress_cb(97, "Emphasis zoom skipped: no strong "
+                            "beat in this clip")
+        except Exception as e:  # noqa: BLE001
+            if progress_cb:
+                progress_cb(97, "Emphasis zoom skipped: "
+                            + str(e)[:80])
+
+    broll_meta = None
+    if broll:
+        # best-effort post-pass: audio + captions keep running under
+        # the cutaway, and any failure just keeps the plain render
+        try:
+            plan = _find_broll_window(cap_words, total_dur)
+            if not plan:
+                if progress_cb:
+                    progress_cb(97, "B-roll skipped: no long talking "
+                                "stretch in this clip")
+            else:
+                w0, w1, kw = plan
+                bpath, credit = _commons_broll_clip(
+                    kw, w1 - w0, progress_cb=progress_cb)
+                w1 = min(w1, w0 + float(credit.get("duration")
+                                        or (w1 - w0)))
+                if w1 - w0 >= 2.0:
+                    _apply_broll(out_path, bpath, w0, w1, W, H)
+                    broll_meta = {
+                        "keyword": kw,
+                        "window": [round(w0, 2), round(w1, 2)],
+                        "title": credit["title"],
+                        "artist": credit["artist"],
+                        "license": credit["license"],
+                        "page_url": credit["page_url"],
+                        "source_url": credit["source_url"]}
+                    if progress_cb:
+                        progress_cb(98, f"B-roll added ({kw})")
+                elif progress_cb:
+                    progress_cb(98, "B-roll skipped: stock clip too "
+                                "short")
+        except Exception as e:  # noqa: BLE001
+            if progress_cb:
+                progress_cb(98, "B-roll skipped: " + str(e)[:90])
+
     if logo_path:
         # brand-kit corner logo: best-effort - a failed overlay must not
         # lose the finished clip
@@ -3061,6 +3765,15 @@ def render_clip(video_path, moment, words, style_name, out_path,
                     os.remove(tmp)
                 except OSError:
                     pass
+    if broll_meta:
+        # attribution sidecar: app.py folds it into the render record
+        # (and from there into posting packages), then removes it
+        try:
+            with open(out_path + ".broll.json", "w",
+                      encoding="utf-8") as f:
+                json.dump(broll_meta, f)
+        except OSError:
+            pass
     if progress_cb:
         progress_cb(100, "Render complete")
     return out_path

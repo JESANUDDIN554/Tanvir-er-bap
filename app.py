@@ -32,7 +32,8 @@ from pipeline import (  # noqa: E402
     find_moments_by_keywords, parse_srt_file,
     render_clip, retime_words, write_srt, write_vtt, write_xml_timeline,
     merge_clips, probe_duration, probe_video, set_custom_styles,
-    generate_posting_package, remove_captions, detect_caption_band,
+    generate_posting_package, posting_package_valid,
+    remove_captions, detect_caption_band,
     preview_caption_removal,
     generate_titles, generate_script, enhance_video,
     generate_hooks, find_hook_moment,
@@ -201,6 +202,9 @@ DEFAULT_SETTINGS = {
     "cta_text": "Follow for more 🔔",
     "safe_zone": False,            # Reels-safe caption nudge + filename tag
     "punch_zoom": True,            # subtle zoom-punch + slow drift
+    "emphasis_zoom": False,        # punch-in on the strongest beat(s)
+    "emphasis_level": "gentle",    # gentle/medium/strong
+    "broll": False,                # stock cutaway on long stretches
     "enhance_clarity": False,      # sharpen + denoise ("enhance", not "AI upscale")
     "quality_tier": "maximum",     # encode tier: maximum/balanced/fast
     "logo_path": "",               # brand-kit corner logo PNG
@@ -753,7 +757,7 @@ class Api:
         # (or a keyword find) the job keeps its transcript, and asking
         # for a fresh scan - another length, the other mode - must not
         # be mistaken for "no video imported".
-        if not job or job["status"] not in ("transcribed", "moments"):
+        if not job or job["status"] not in ("transcribed", "moments", "done"):
             return {"ok": False, "error": "Import a video first."}
         clip_min, clip_max = self._clip_len_range(clip_len)
         job["status"] = "working"
@@ -810,7 +814,7 @@ class Api:
         job = JOBS.get(job_id)
         # Same re-detect rule as detect_offline: "moments" still has a
         # transcript and may be scanned again.
-        if not job or job["status"] not in ("transcribed", "moments"):
+        if not job or job["status"] not in ("transcribed", "moments", "done"):
             return {"ok": False, "error": "Import a video first."}
         if not local_ai.model_ready():
             return {"ok": False, "error": "local_ai_missing",
@@ -1227,11 +1231,42 @@ class Api:
         if not job or not (0 <= index < len(job.get("moments", []))):
             return {"ok": False, "error": "Moment not found."}
         m = job["moments"][index]
-        if m.get("posting"):
-            return {"ok": True, "package": m["posting"], "cached": True}
+
+        def _with_broll_credits(pkg):
+            # attribution for any render of this moment that used an
+            # auto B-roll cutaway - appended at return time (never
+            # baked into the cached package), so renders finished
+            # after the package was generated still get credited
+            lines = []
+            for r in job.get("renders", []):
+                b = r.get("broll")
+                if r.get("moment_index") != index or not b:
+                    continue
+                line = (f"B-roll: \"{b.get('title', '')}\" by "
+                        f"{b.get('artist', '')} "
+                        f"({b.get('license', '')}), via Wikimedia "
+                        f"Commons {b.get('page_url', '')}").strip()
+                if line not in lines:
+                    lines.append(line)
+            if lines and "B-roll:" not in pkg.get("description", ""):
+                pkg = dict(pkg)
+                pkg["description"] = (
+                    pkg.get("description", "")
+                    + "\n\n" + "\n".join(lines)).strip()
+            return pkg
+
         words = m.get("edited_words") or [
             w for w in job["words"]
             if w["end"] > m["start"] and w["start"] < m["end"]]
+        if m.get("posting"):
+            # A cached "ai" package written by a weaker model build can
+            # be instruction echo, not copy - re-validate before
+            # serving; an invalid cache falls through and regenerates.
+            if posting_package_valid(m["posting"], words):
+                return {"ok": True,
+                        "package": _with_broll_credits(m["posting"]),
+                        "cached": True}
+            m.pop("posting", None)
         if not words:
             return {"ok": False, "error": "No captions in this moment."}
         settings = load_settings()
@@ -1239,7 +1274,48 @@ class Api:
             words, m, genre=settings.get("genre", ""))
         m["posting"] = pkg
         _save_job(job_id)
-        return {"ok": True, "package": pkg, "cached": False}
+        return {"ok": True, "package": _with_broll_credits(pkg),
+                "cached": False}
+
+    # -- Cover Maker ---------------------------------------------------
+    def make_cover(self, job_id, render_index, text=""):
+        gate = _license_gate()
+        if gate:
+            return gate
+        """Auto cover for a render: strongest frame (face + sharpness
+        + spoken beat) stamped with the title -> 1080x1920 JPG saved
+        next to the render and recorded on it."""
+        job = JOBS.get(job_id)
+        renders = (job or {}).get("renders") or []
+        if not job or not (0 <= render_index < len(renders)):
+            return {"ok": False, "error": "Render not found."}
+        r = renders[render_index]
+        clip = r.get("path")
+        if not clip or not os.path.isfile(clip):
+            return {"ok": False, "error": "Render file is missing."}
+        moments = job.get("moments") or []
+        mi = r.get("moment_index", 0)
+        m = moments[mi] if 0 <= mi < len(moments) else {}
+        words = m.get("edited_words") or [
+            w for w in job.get("words", [])
+            if w["end"] > m.get("start", 0)
+            and w["start"] < m.get("end", 0)]
+        base = float(m.get("start", 0))
+        cap = [dict(w, start=max(0.0, w["start"] - base),
+                    end=w["end"] - base) for w in words]
+        out = os.path.splitext(clip)[0] + "_cover.jpg"
+        try:
+            info = _pipeline.make_cover(
+                clip, cap, out,
+                (text or "").strip() or r.get("title")
+                or m.get("title") or "")
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)[:160]}
+        r["cover"] = {"file": os.path.basename(out),
+                      "url": self._download_url(job_id, out),
+                      "t": info["t"], "face": info["face"]}
+        _save_job(job_id)
+        return {"ok": True, "cover": r["cover"]}
 
     # -- Studio: Title & Hook Generator ---------------------------------
     def ai_titles(self, topic="", job_id=""):
@@ -1285,6 +1361,8 @@ class Api:
         opts = self._render_opts(None)
         opts["remove_fillers"] = False
         opts["remove_silences"] = False
+        opts["emphasis_zoom"] = False
+        opts["broll"] = False
         opts["ratio"] = "9:16"
         return opts
 
@@ -1980,6 +2058,7 @@ class Api:
                     "remove_fillers", "remove_silences", "auto_censor",
                     "emojis", "highlight", "speaker_colors", "hook_overlay",
                     "cta_overlay", "cta_text", "safe_zone", "punch_zoom",
+                    "emphasis_zoom", "emphasis_level", "broll",
                     "enhance_clarity", "logo_path", "quality_tier"):
             opts.setdefault(key, settings.get(key))
         opts.setdefault("caption_style", "bold-pop")
@@ -2036,6 +2115,8 @@ class Api:
                                     "emojis", "highlight", "speaker_colors",
                                     "hook_overlay", "cta_text", "safe_zone",
                                     "punch_zoom", "enhance_clarity",
+                                    "emphasis_zoom", "emphasis_level",
+                                    "broll",
                                     "logo_path", "quality_tier")}
         job["status"] = "working"
         job.pop("render_error", None)  # don't ship a stale failure
@@ -2080,6 +2161,10 @@ class Api:
                     cta_text=opts.get("cta_text"),
                     safe_zone=bool(opts.get("safe_zone")),
                     punch_zoom=bool(opts.get("punch_zoom")),
+                    emphasis_zoom=bool(opts.get("emphasis_zoom")),
+                    emphasis_level=opts.get("emphasis_level",
+                                            "gentle"),
+                    broll=bool(opts.get("broll")),
                     enhance_clarity=bool(
                         opts.get("enhance_clarity")),
                     logo_path=opts.get("logo_path"),
@@ -2128,6 +2213,19 @@ class Api:
                 if eff_params:
                     _rd["caption_params"] = eff_params
                     m["caption_params"] = eff_params
+                # auto B-roll attribution sidecar (written by
+                # render_clip when a cutaway was actually used)
+                _bf = out + ".broll.json"
+                if os.path.isfile(_bf):
+                    try:
+                        with open(_bf, encoding="utf-8") as fh:
+                            _rd["broll"] = json.load(fh)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        os.remove(_bf)
+                    except OSError:
+                        pass
                 renders.append(_rd)
                 # publish each clip the moment it exists so the Live
                 # Analysis rail fills one by one during polling
@@ -2782,6 +2880,12 @@ def make_wsgi_app(api):
 
         # --- API: POST /api/<method> {"args": [...]} ---------------------
         if method == "POST" and path.startswith("/api/"):
+            # Persisted Library jobs must be visible to EVERY method:
+            # per-method _load_library() calls were easy to miss (a
+            # fresh server answered posting_package with "Moment not
+            # found" for a job sitting on disk until some other method
+            # happened to load the Library first). It is idempotent.
+            _load_library()
             name = path[len("/api/"):]
             fn = getattr(api, name, None)
             if not callable(fn) or name.startswith("_"):
