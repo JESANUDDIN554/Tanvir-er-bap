@@ -3109,6 +3109,28 @@ def _clamp_window_geometry(x0, y0, work_w, work_h):
     return (w, h, x, y)
 
 
+def _dpi_scale():
+    """The primary display's DPI scale (1.0 = 100%) in the SAME
+    coordinate space _window_geometry() measures in.
+
+    SPI_GETWORKAREA answers follow this process's DPI awareness, and
+    GetDpiForSystem reports under that same awareness, so physical
+    geometry divided by this scale gives true logical pixels - which
+    is the unit pywebview's create_window expects (it multiplies its
+    inputs back by GetDpiForWindow/96). 1.0 off Windows or on any
+    failure, where the conversion is a no-op anyway."""
+    if os.name != "nt":
+        return 1.0
+    try:
+        import ctypes
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        if dpi:
+            return dpi / 96.0
+    except Exception:  # noqa: BLE001 - geometry is a nicety, never fatal
+        pass
+    return 1.0
+
+
 def _window_geometry():
     """(w, h, x, y) for the app window, clamped to the primary
     monitor's work area (Windows only) - or None. Shared by the own
@@ -3139,6 +3161,93 @@ def _window_geometry():
         return _clamp_window_geometry(x0, y0, work_w, work_h)
     except Exception:  # noqa: BLE001 - geometry is a nicety, never fatal
         return None
+
+
+def _pull_window_on_screen():
+    """Verify the own window actually landed inside its monitor's
+    work area, and pull it back if any visible edge sticks out.
+
+    The geometry handed to pywebview crosses two coordinate spaces
+    (physical here, logical there, multiplied back by the window's
+    DPI), so despite the clamp the placed rectangle is only certain
+    once the window exists - on the user's PC it hung off the left
+    edge, clipping the sidebar and even the title text. This runs
+    after the window is shown, in the now DPI-aware GUI process:
+    GetWindowRect / DwmGetWindowAttribute / GetMonitorInfo all speak
+    physical pixels here, so the check and the SetWindowPos
+    correction share one consistent space. Best-effort throughout:
+    any failure leaves the window exactly as it is."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        hwnd = 0
+        for title in ("Itraji Cliper", "Itraji Cliper — Activation"):
+            hwnd = user32.FindWindowW(None, title)
+            if hwnd:
+                break
+        if not hwnd:
+            return
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long),
+                        ("top", ctypes.c_long),
+                        ("right", ctypes.c_long),
+                        ("bottom", ctypes.c_long)]
+
+        full = _RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(full)):
+            return
+        # Visible bounds (excludes the invisible resize-frame margin
+        # Windows adds to GetWindowRect): a healthy window's VISIBLE
+        # rect sits flush inside the work area even though its full
+        # rect overhangs by a few px - only correct real overhangs.
+        vis = _RECT()
+        hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            hwnd, 9, ctypes.byref(vis), ctypes.sizeof(vis))
+        if hr != 0:
+            vis = full
+        mon = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        if not mon:
+            return
+
+        class _MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD),
+                        ("rcMonitor", _RECT),
+                        ("rcWork", _RECT),
+                        ("dwFlags", wintypes.DWORD)]
+
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+            return
+        wk = mi.rcWork
+        if (vis.left >= wk.left - 1 and vis.top >= wk.top - 1
+                and vis.right <= wk.right + 1
+                and vis.bottom <= wk.bottom + 1):
+            return  # fully on-screen (1px rounding tolerance)
+        fit = _clamp_window_geometry(wk.left, wk.top,
+                                     wk.right - wk.left,
+                                     wk.bottom - wk.top)
+        if fit is None:
+            return
+        nw, nh, nx, ny = fit
+        # SetWindowPos places the FULL rect (incl. the invisible
+        # frame); translate the visible-bounds fit by the frame
+        # delta so the visible window lands exactly on it.
+        fx = vis.left - full.left
+        fy = vis.top - full.top
+        fw = (full.right - full.left) - (vis.right - vis.left)
+        fh = (full.bottom - full.top) - (vis.bottom - vis.top)
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        user32.SetWindowPos(hwnd, 0, nx - fx, ny - fy, nw + fw, nh + fh,
+                            SWP_NOZORDER | SWP_NOACTIVATE)
+    except Exception:  # noqa: BLE001 - a nicety, never fatal
+        pass
 
 
 def _window_geometry_args():
@@ -3232,6 +3341,22 @@ def _run_own_window(url):
         geo = _window_geometry()
         if geo is not None:
             w, h, x, y = geo
+            # pywebview's create_window speaks LOGICAL pixels: its
+            # Windows backend multiplies width/height/x/y by the
+            # window's DPI scale (GetDpiForWindow/96) to get physical
+            # pixels. _window_geometry() returns PHYSICAL pixels, so
+            # convert first - feeding physical values straight in
+            # made the window oversized and displaced on 125%/150%
+            # displays (it landed hanging off the left edge, sidebar
+            # and title text clipped). At 100% scaling this is a
+            # no-op. min_size stays as-is: it is already in logical
+            # (CSS) pixels, which is the layout's own unit.
+            scale = _dpi_scale()
+            if scale and scale != 1.0:
+                w = int(round(w / scale))
+                h = int(round(h / scale))
+                x = int(round(x / scale))
+                y = int(round(y / scale))
             kwargs.update({"width": w, "height": h, "x": x, "y": y})
         win = webview.create_window(**kwargs)
 
@@ -3261,6 +3386,10 @@ def _run_own_window(url):
 
         def _mark_shown():
             shown["yes"] = True
+            # Whatever the geometry conversions above produced on
+            # this particular display, guarantee the placed window
+            # is fully on-screen before the user starts working.
+            _pull_window_on_screen()
 
         try:
             win.events.shown += _mark_shown

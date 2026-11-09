@@ -41,6 +41,12 @@ html { -webkit-font-smoothing: antialiased; background: var(--bg); }
 body {
   margin: 0; min-height: 100vh; background: radial-gradient(1200px 600px at 50% -10%, var(--body-hi) 0%, var(--bg) 55%) fixed, var(--bg);
   color: var(--text); font-family: var(--font); font-size: 14.5px; line-height: 1.55;
+  /* The app shell must never scroll/shift sideways: any stray wide
+     element clips inside the window instead of pushing the fixed
+     sidebar's content off the left edge. `clip` (not `hidden`)
+     creates no scroll container, so fixed/sticky children are
+     unaffected. */
+  overflow-x: clip;
 }
 
 /* ---------- splash ---------- */
