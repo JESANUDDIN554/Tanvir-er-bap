@@ -26,6 +26,7 @@ import tarfile
 import threading
 import time
 import zipfile
+from collections import deque
 from urllib.parse import urlparse
 
 import requests
@@ -182,10 +183,72 @@ def _heal_state_locked():
             stage="Download stopped - click Download to resume")
 
 
+# ---------------------------------------------------------------------------
+# Auto-resume on boot.
+#
+# A model .part on disk only exists because a download was started
+# before and interrupted (app closed, PC restarted, process cut).
+# But the download state is per-process: after a relaunch nothing
+# restarted the download on its own - the state sat idle at 0% and
+# the sidebar card showed its placeholder, which reads as "it won't
+# resume" until the user thinks to click Download again. So the
+# first state poll of a fresh process resumes automatically:
+# exactly once, and only when there is real partial progress to
+# resume. A fresh install (no .part) still waits for the user's
+# click, and a download that already ran - and possibly failed with
+# a user-visible error - this session is never second-guessed. The
+# attempt-start re-verify in _download_once makes resuming safe for
+# a complete .part: it is verified (and its rename finished) or
+# discarded per the corrupt-restart rule, never trusted blindly.
+# ---------------------------------------------------------------------------
+
+_auto_resume_lock = threading.Lock()
+_auto_resume_fired = False
+
+
+def _maybe_auto_resume(state):
+    """Resume an interrupted model download, once per process.
+
+    `state` is the snapshot download_state() just took. Returns True
+    when start_download() was fired, so the caller can re-read the
+    (now active) state instead of returning the stale snapshot."""
+    global _auto_resume_fired
+    if state.get("active") or state.get("done") or state.get("error"):
+        return False
+    with _auto_resume_lock:
+        if _auto_resume_fired:
+            return False
+        # Claim the single shot before checking anything else, so
+        # concurrent polls can never double-fire it. If the checks
+        # below decline, no later poll could legitimately fire
+        # either: only a download creates a .part, and a download
+        # starting is exactly what the _download_thread guard sees.
+        _auto_resume_fired = True
+    try:
+        if _download_thread is not None:
+            # A download already ran this session; whatever stopped
+            # it was surfaced to the user (error state / heal). The
+            # next move is the user's click, not an automatic retry.
+            return False
+        part = model_path() + ".part"
+        if not os.path.isfile(part) or os.path.getsize(part) <= 0:
+            return False  # fresh install: wait for the user's click
+        if model_ready():
+            return False
+        start_download()
+        return True
+    except Exception:  # noqa: BLE001 - a courtesy, never fatal
+        return False
+
+
 def download_state():
     with _state_lock:
         _heal_state_locked()
-        return dict(_download_state)
+        state = dict(_download_state)
+    if _maybe_auto_resume(state):
+        with _state_lock:
+            state = dict(_download_state)
+    return state
 
 
 def _set_state(**kw):
@@ -213,6 +276,31 @@ _DOWNLOAD_ATTEMPTS = 5  # per file, resuming from the .part between tries
 class _PermanentDownloadError(RuntimeError):
     """A download failure retrying cannot fix (HTTP 4xx, disk full,
     corrupt .part). Surfaces immediately instead of burning attempts."""
+
+
+class _CorruptDownloadError(_PermanentDownloadError):
+    """The finished .part is provably wrong (overshot the known total
+    or failed its SHA-256 check) and has already been discarded.
+
+    A subclass of _PermanentDownloadError so existing handlers treat
+    it as terminal, but _download_file catches it FIRST: one bad copy
+    can be a single damaged transfer, so the driver restarts clean
+    exactly once before giving up. Without that distinction a user
+    whose 9 GB .part is complete-but-corrupt hits an instant failure
+    on every click (attempt-start re-verify), and a user whose fresh
+    download fails its check has to notice and re-click by hand -
+    while a hypothetical verify/retry cycle at the capped 99% would
+    look exactly like the "stuck at 99%" hang this replaces."""
+
+
+class _TooSlowError(RuntimeError):
+    """The connection is alive but pathologically slow: bytes keep
+    arriving often enough to defeat both the per-read timeout and
+    the stall watchdog, yet the sustained rate makes finishing
+    unrealistic. Raised out of the streaming loop so the driver can
+    switch to the fallback server (resume keeps the .part, so no
+    downloaded bytes are lost); with no fallback left it degrades
+    to an ordinary transient failure."""
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +418,65 @@ def _stall_watchdog():
         time.sleep(2)
 
 
+# ---------------------------------------------------------------------------
+# Slowness escape.
+#
+# The watchdog above only sees total silence. A route can instead be
+# alive but useless - a throttled or far-away CDN edge dripping bytes
+# every few seconds: often enough that no single read stalls for
+# _STALL_SECONDS and the read timeout never trips, yet so slow that
+# the last 1% of a 9 GB model (~90 MB) takes half an hour or more at
+# the capped "99%" display, with no error and no mirror switch (the
+# mirror only engages on host-level failure / repeated 5xx). That is
+# the second way a download wedges at 99% forever.
+#
+# So the streaming loop also tracks sustained throughput over a
+# trailing window. The floor is 25 KB/s: at that rate the 90 MB tail
+# alone would take ~1 hour and the whole model ~100 hours - no route
+# worth staying on is that slow for a full window, and switching
+# costs nothing because resume keeps the .part. The window is 180 s
+# and is only judged once the stream itself has run for a full
+# window, so a slow start (connect, TLS, first byte, ramp-up) can
+# never false-trigger it.
+# ---------------------------------------------------------------------------
+
+_SLOW_WINDOW = float(os.environ.get("ITRAJI_DL_SLOW_WINDOW", "180"))
+_SLOW_MIN_RATE = float(os.environ.get("ITRAJI_DL_SLOW_MIN_RATE", "25000"))
+_SLOW_MIN_REMAINING = 2 << 20  # almost done: let it finish, don't switch
+
+
+def _raise_if_too_slow(samples, stream_t0, total, done):
+    """Raise _TooSlowError when the trailing-window throughput is
+    pathologically low. samples: deque of (monotonic_ts, done_bytes)
+    for this response, oldest first, starting with the stream's
+    first sample. The rate is measured from an ANCHOR sample - the
+    newest sample at or before the window's start - because with
+    coarse chunks the samples inside the window alone can span far
+    less than the window and understate how long the recent bytes
+    actually took."""
+    now = time.monotonic()
+    if now - stream_t0 < _SLOW_WINDOW:
+        return  # never judge an attempt younger than one full window
+    if total and total - done <= _SLOW_MIN_REMAINING:
+        return  # the tail is tiny: switching would cost more than waiting
+    # Trim to the anchor: drop samples while the NEXT one is still
+    # at or before the window's start, leaving samples[0] as the
+    # last sample taken outside the window.
+    horizon = now - _SLOW_WINDOW
+    while len(samples) > 1 and samples[1][0] <= horizon:
+        samples.popleft()
+    if len(samples) < 2:
+        return
+    span = now - samples[0][0]
+    if span < _SLOW_WINDOW * 0.9:
+        return
+    rate = (done - samples[0][1]) / span
+    if rate < _SLOW_MIN_RATE:
+        raise _TooSlowError(
+            f"download is pathologically slow "
+            f"(~{int(rate)} bytes/s over {int(span)}s)")
+
+
 def _sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -378,25 +525,40 @@ def _header_total(headers, expected_size, status, have):
     return None
 
 
-def _verify_part(tmp, total, expected_sha256):
+def _checking_stage(stage):
+    """The stage label shown while a complete file is being verified:
+    'Downloading X' becomes 'Checking X'. Hashing ~9 GB takes real
+    time, and leaving 'Downloading ... 99%' on screen for it made a
+    working verification indistinguishable from a hang."""
+    if stage and stage.startswith("Downloading"):
+        return "Checking" + stage[len("Downloading"):]
+    return "Checking the downloaded file..."
+
+
+def _verify_part(tmp, total, expected_sha256, stage=None):
     """Final gate before the atomic rename. Raises
-    _PermanentDownloadError (and removes the .part) when the finished
+    _CorruptDownloadError (and removes the .part) when the finished
     file is provably wrong; a short file is a transient failure."""
     size = os.path.getsize(tmp)
     if total:
         if size > total:
             _remove_quietly(tmp)
-            raise _PermanentDownloadError(
+            raise _CorruptDownloadError(
                 f"download overshot: got {size} of {total} bytes - "
-                "discarded, please retry")
+                "discarded")
         if size < total:
             raise RuntimeError(
                 f"download incomplete: got {size} of {total} bytes")
-    if expected_sha256 and _sha256_file(tmp) != expected_sha256:
-        _remove_quietly(tmp)
-        raise _PermanentDownloadError(
-            "download failed its checksum verification - "
-            "discarded, please retry")
+    if expected_sha256:
+        # The bytes are all here; what follows is verification, and
+        # the state must say so (pct stays at the 99 cap: the file
+        # is not usable until the check passes).
+        _set_state(stage=_checking_stage(stage), pct=99)
+        if _sha256_file(tmp) != expected_sha256:
+            _remove_quietly(tmp)
+            raise _CorruptDownloadError(
+                "download failed its checksum verification - "
+                "discarded")
 
 
 def _download_once(url, tmp, stage, expected_size, expected_sha256):
@@ -413,7 +575,7 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
         have = 0
     if expected_size and have == expected_size and have > 0:
         # A previous run finished the bytes but died before the rename.
-        _verify_part(tmp, expected_size, expected_sha256)
+        _verify_part(tmp, expected_size, expected_sha256, stage=stage)
         return
     _set_state(stage=stage, error=None)
     restarts = 0
@@ -428,7 +590,7 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
                 total = _content_range_total(
                     r.headers.get("Content-Range")) or expected_size
                 if total and have == total:
-                    _verify_part(tmp, total, expected_sha256)
+                    _verify_part(tmp, total, expected_sha256, stage=stage)
                     return
                 _remove_quietly(tmp)
                 have = 0
@@ -462,19 +624,31 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
                                   r.status_code, have)
             if total and have > total:
                 _remove_quietly(tmp)
-                raise _PermanentDownloadError(
+                raise _CorruptDownloadError(
                     "partial file is larger than the download itself - "
-                    "discarded, please retry")
+                    "discarded")
             if total and have == total:
-                _verify_part(tmp, total, expected_sha256)
+                _verify_part(tmp, total, expected_sha256, stage=stage)
                 return
             if total:
                 _set_state(pct=min(99, int(have / total * 100)))
             _mark_progress(r)  # the watchdog watches this response
             done = have
+            # Sustained-throughput tracking for this response (see
+            # the slowness-escape note above): samples span the
+            # trailing window and are judged per chunk.
+            stream_t0 = time.monotonic()
+            samples = deque([(stream_t0, done)])
             try:
                 with open(tmp, "ab" if have > 0 else "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1 << 20):
+                    # 64 KB chunks, deliberately not 1 MB: the
+                    # buffered reader only yields once a full chunk
+                    # is available, so at 1 MB a ~5 KB/s route
+                    # yields (and stamps progress) less often than
+                    # the 120 s watchdog window, and throughput
+                    # samples arrive too coarsely to judge. At 64 KB
+                    # even that route yields every ~13 s.
+                    for chunk in r.iter_content(chunk_size=1 << 16):
                         if not chunk:
                             continue
                         f.write(chunk)
@@ -483,13 +657,16 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
                         if total:
                             _set_state(
                                 pct=min(99, int(done / total * 100)))
+                        samples.append((time.monotonic(), done))
+                        _raise_if_too_slow(samples, stream_t0,
+                                           total, done)
             except OSError as e:
                 if e.errno in (errno.ENOSPC, errno.EDQUOT):
                     raise _PermanentDownloadError(
                         f"not enough free disk space ({e})")
                 raise
             break
-    _verify_part(tmp, total, expected_sha256)
+    _verify_part(tmp, total, expected_sha256, stage=stage)
 
 
 def _is_host_failure(exc):
@@ -533,23 +710,51 @@ def _download_file(url, dest, stage, expected_size=None,
 
     fallback_urls are mirror locations of the SAME file. When the
     current host fails at the host level (DNS / connect - see
-    _is_host_failure) or keeps answering 5xx, the next attempt
-    switches to the mirror and resumes mid-file from the same .part:
-    Range offsets are host-independent because the bytes are
-    identical, and the final size + SHA-256 gate verifies the
-    assembled file, never the host it came from."""
+    _is_host_failure), keeps answering 5xx, or is pathologically
+    slow (see _TooSlowError), the next attempt switches to the
+    mirror and resumes mid-file from the same .part: Range offsets
+    are host-independent because the bytes are identical, and the
+    final size + SHA-256 gate verifies the assembled file, never
+    the host it came from.
+
+    A finished file that fails verification (_CorruptDownloadError:
+    the bytes are provably wrong and already discarded) restarts
+    clean exactly once WITHOUT consuming the retry budget - one
+    damaged transfer should not be terminal, but a second failure
+    on a fresh copy means the arriving bytes keep getting damaged,
+    so it stops with an honest error instead of looping at 99%."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = dest + ".part"
     urls = [url] + [u for u in fallback_urls if u != url]
     which = 0
     server_errors = 0
-    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+    corrupt_restarts = 0
+    attempt = 0
+    while attempt < _DOWNLOAD_ATTEMPTS:
+        attempt += 1
         active_stage = (stage if which == 0
                         else stage + " - backup server")
         try:
             _download_once(urls[which], tmp, active_stage,
                            expected_size, expected_sha256)
             break
+        except _CorruptDownloadError as e:
+            # Must precede the _PermanentDownloadError clause (it is
+            # a subclass). The .part is already discarded; restart
+            # from zero on the same host (the host delivered bytes
+            # fine - they were damaged, not unreachable).
+            corrupt_restarts += 1
+            if corrupt_restarts > 1:
+                raise _PermanentDownloadError(
+                    "the downloaded file failed its integrity check "
+                    "twice, even after one clean re-download - the "
+                    "copy arriving over this connection keeps getting "
+                    "damaged. Please try Download again; if it keeps "
+                    "happening, try another network.") from e
+            attempt -= 1  # a clean restart is not a retry
+            _set_state(stage=stage + " - restarting clean download",
+                       error=None, pct=0)
+            time.sleep(2)
         except _PermanentDownloadError:
             raise
         except Exception as e:  # noqa: BLE001 - classified below
@@ -561,12 +766,20 @@ def _download_file(url, dest, stage, expected_size=None,
                         f"could not download from either server "
                         f"({names}): {e}") from e
                 raise
-            if str(e).startswith("server error (HTTP 5"):
-                server_errors += 1
-            if which + 1 < len(urls) and (
-                    _is_host_failure(e) or server_errors >= 2):
-                which += 1
-                server_errors = 0
+            if isinstance(e, _TooSlowError):
+                # Alive but useless route: switch at once when a
+                # fallback remains (resume keeps the .part). With
+                # no fallback it degrades to the retries below.
+                if which + 1 < len(urls):
+                    which += 1
+                    server_errors = 0
+            else:
+                if str(e).startswith("server error (HTTP 5"):
+                    server_errors += 1
+                if which + 1 < len(urls) and (
+                        _is_host_failure(e) or server_errors >= 2):
+                    which += 1
+                    server_errors = 0
             time.sleep(min(2 ** attempt, 16))
     os.replace(tmp, dest)
     _set_state(pct=100)

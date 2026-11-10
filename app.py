@@ -254,6 +254,433 @@ def save_settings(data):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Old-copy cleanup (Settings -> "Old version folders").
+#
+# Users accumulate loose folders of older builds (Downloads, Desktop,
+# ...) plus older per-user installs, then launch an old one by mistake
+# and report ghost bugs ("the fix doesn't work"). Settings can scan
+# for those folders and delete them. The safety rules are strict and
+# enforced server-side, at scan time AND again at delete time:
+#   * a folder only qualifies if it provably IS an app copy - the
+#     marker exe inside it (ClipMakerPC.exe), or an Inno uninstaller
+#     (unins000.exe) in a folder whose name matches the app;
+#   * the RUNNING copy's folder is never listed and never deleted,
+#     and neither is any folder containing it;
+#   * delete targets must be direct children of the scan roots -
+#     the exact set the scan lists - so a client-supplied path can
+#     never reach anywhere else.
+# ---------------------------------------------------------------------------
+
+_OLD_COPY_MARKER = "clipmakerpc.exe"
+_OLD_COPY_UNINSTALLER = "unins000.exe"
+_OLD_COPY_NAME_PATTERNS = ("clipmakerpc*", "itraji cliper*",
+                           "clipmaker pc*")
+_OLD_COPY_SIZE_WALK_CAP = 200000  # files; one copy is ~15k
+
+
+def _running_app_dir():
+    """Folder of the RUNNING copy - never listed, never deleted.
+
+    Frozen: the folder holding the exe (the install or loose folder).
+    BASE_DIR is NOT this when frozen (it is the _MEIPASS extraction
+    dir), so sys.executable is the authority. From source: this
+    file's directory."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _old_copy_scan_roots():
+    """Folders whose DIRECT children are scanned for old copies."""
+    home = os.path.expanduser("~")
+    local = os.environ.get("LOCALAPPDATA") or os.path.join(
+        home, "AppData", "Local")
+    roots = [home,
+             os.path.join(home, "Desktop"),
+             os.path.join(home, "Downloads"),
+             os.path.join(home, "Documents"),
+             os.path.join(local, "Programs")]
+    seen, out = set(), []
+    for r in roots:
+        key = os.path.normcase(os.path.abspath(r))
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def _is_old_copy_dir(path):
+    """(is_copy, has_uninstaller) for one directory.
+
+    Primary gate: the marker exe inside. Secondary: an Inno
+    uninstaller AND a folder name matching the app - an arbitrary
+    program's uninstaller must never qualify a folder on its own."""
+    try:
+        names = {n.lower() for n in os.listdir(path)}
+    except OSError:
+        return (False, False)
+    has_uninstaller = _OLD_COPY_UNINSTALLER in names
+    if _OLD_COPY_MARKER in names:
+        return (True, has_uninstaller)
+    if has_uninstaller:
+        import fnmatch
+        base = os.path.basename(os.path.normpath(path)).lower()
+        if any(fnmatch.fnmatchcase(base, pat)
+               for pat in _OLD_COPY_NAME_PATTERNS):
+            return (True, True)
+    return (False, False)
+
+
+def _dir_size_capped(path):
+    """Total file bytes under path; symlinked dirs are not followed
+    and the walk stops at a generous file cap, so a pathological
+    tree cannot hang the scan. Unreadable entries count as 0."""
+    total, seen = 0, 0
+    for dirpath, _dirs, files in os.walk(path):
+        for name in files:
+            seen += 1
+            if seen > _OLD_COPY_SIZE_WALK_CAP:
+                return total
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    return total
+
+
+def _scan_old_copies():
+    """Old app-copy folders under the scan roots, largest first.
+    The running copy (and any folder containing it) is excluded."""
+    running = os.path.normcase(os.path.abspath(_running_app_dir()))
+    roots = _old_copy_scan_roots()
+    root_keys = {os.path.normcase(os.path.abspath(r)) for r in roots}
+    found, seen = [], set()
+    for root in roots:
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for name in entries:
+            path = os.path.join(root, name)
+            if os.path.islink(path) or not os.path.isdir(path):
+                continue
+            key = os.path.normcase(os.path.abspath(path))
+            if key in seen:
+                continue
+            seen.add(key)
+            if key == running or (running + os.sep).startswith(
+                    key + os.sep):
+                continue  # the running copy, or a folder holding it
+            if key in root_keys:
+                continue  # never list a scan root itself (~/Desktop…)
+            is_copy, has_uninstaller = _is_old_copy_dir(path)
+            if not is_copy:
+                continue
+            try:
+                modified = os.path.getmtime(path)
+            except OSError:
+                modified = 0
+            found.append({"path": path,
+                          "size_bytes": _dir_size_capped(path),
+                          "has_uninstaller": has_uninstaller,
+                          "modified": modified})
+    found.sort(key=lambda c: c["size_bytes"], reverse=True)
+    return found
+
+
+def _validate_old_copy_target(path):
+    """Re-validate a client-supplied delete target against EVERY
+    scan rule. Returns the normalized absolute path, or None to
+    refuse. The client's word is never enough: the folder must
+    still be a provable app copy, a direct child of a scan root,
+    and unrelated to the running copy and the home dir itself."""
+    if not isinstance(path, str) or not path.strip():
+        return None
+    p = os.path.abspath(os.path.normpath(path.strip().strip('"')))
+    if os.path.islink(p) or not os.path.isdir(p):
+        return None
+    key = os.path.normcase(p)
+    home = os.path.normcase(os.path.abspath(os.path.expanduser("~")))
+    if key == home:
+        return None
+    running = os.path.normcase(os.path.abspath(_running_app_dir()))
+    if key == running or (running + os.sep).startswith(key + os.sep):
+        return None  # the running copy, or a folder containing it
+    roots = _old_copy_scan_roots()
+    root_keys = {os.path.normcase(os.path.abspath(r)) for r in roots}
+    if key in root_keys:
+        return None  # a scan root itself (Desktop, Downloads, …)
+    parent = os.path.normcase(os.path.dirname(p))
+    if parent not in root_keys:
+        return None  # not a direct child of any scan root
+    is_copy, _un = _is_old_copy_dir(p)
+    if not is_copy:
+        return None
+    return p
+
+
+def _kill_old_copy_processes(folder):
+    """Best-effort stop of ClipMakerPC.exe processes whose exe file
+    lives INSIDE `folder` - a running old copy locks its files and
+    would defeat the delete. Windows only; never this process.
+    Failures are swallowed: the delete reports its own result."""
+    if os.name != "nt":
+        return
+    prefix = os.path.normcase(os.path.abspath(folder)) + os.sep
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        try:
+            for proc in psutil.process_iter(["pid", "exe"]):
+                try:
+                    if proc.info.get("pid") == os.getpid():
+                        continue
+                    exe = proc.info.get("exe") or ""
+                    if os.path.normcase(exe).startswith(prefix):
+                        proc.kill()
+                except Exception:  # noqa: BLE001 - per-process guard
+                    continue
+            return
+        except Exception:  # noqa: BLE001 - fall through to CIM
+            pass
+    try:
+        import subprocess
+        esc = os.path.abspath(folder).replace("'", "''")
+        script = (
+            "Get-CimInstance Win32_Process "
+            "-Filter \"Name='ClipMakerPC.exe'\" | "
+            "Where-Object { $_.ProcessId -ne " + str(os.getpid()) +
+            " -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith('"
+            + esc + "\\', [System.StringComparison]::OrdinalIgnoreCase)"
+            " } | ForEach-Object { Stop-Process -Id $_.ProcessId "
+            "-Force -ErrorAction SilentlyContinue }")
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-Command", script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:  # noqa: BLE001 - best effort only
+        pass
+
+
+def _delete_old_copy(path):
+    """Delete one validated old-copy folder. Returns (ok, error).
+
+    Order: stop processes running from inside it, run its Inno
+    uninstaller first when present (it knows about shortcuts and
+    registry entries), then remove whatever is left with a plain
+    recursive delete whose error handler clears read-only flags."""
+    import shutil
+    import subprocess
+    _kill_old_copy_processes(path)
+    if os.name == "nt":
+        time.sleep(0.3)  # let killed processes release their files
+        uninstaller = os.path.join(path, _OLD_COPY_UNINSTALLER)
+        if os.path.isfile(uninstaller):
+            try:
+                subprocess.run(
+                    [uninstaller, "/VERYSILENT", "/SUPPRESSMSGBOXES",
+                     "/NORESTART"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=180,
+                    creationflags=getattr(subprocess,
+                                          "CREATE_NO_WINDOW", 0))
+            except Exception:  # noqa: BLE001 - leftovers handled below
+                pass
+            # Inno uninstallers often hand off to a temp copy and
+            # return before the folder is actually gone.
+            for _ in range(20):
+                if not os.path.exists(path):
+                    break
+                time.sleep(0.25)
+    if not os.path.exists(path):
+        return (True, "")
+
+    def _clear_readonly(func, p, _exc_info):
+        try:
+            os.chmod(p, 0o777)
+            func(p)
+        except Exception:  # noqa: BLE001 - the rmtree result decides
+            pass
+
+    last_error = ""
+    for attempt in range(2):
+        try:
+            shutil.rmtree(path, onerror=_clear_readonly)
+        except Exception as e:  # noqa: BLE001 - surfaced to the UI
+            last_error = str(e)[:200]
+        if not os.path.exists(path):
+            return (True, "")
+        if attempt == 0:
+            time.sleep(1.0)  # a handle may still be closing
+    if not last_error:
+        last_error = ("some files could not be removed - the copy "
+                      "may still be running; close it and try again")
+    return (False, last_error)
+
+
+# ---------------------------------------------------------------------------
+# Self-uninstall (Settings -> "Danger zone").
+#
+# A running exe cannot delete itself on Windows, so the endpoint
+# writes a small PowerShell cleanup script into the user's TEMP dir
+# (never inside the app folder - the script must survive deleting
+# it), launches it fully detached, and exits. The script waits for
+# this process's PID to disappear, then removes the app:
+#   * installed layout (unins000.exe in the app folder): run the
+#     Inno uninstaller silently; with remove_data, also sweep the
+#     folder it leaves behind (runtime downloads/projects live in
+#     there and Inno keeps unknown files);
+#   * loose layout: deleting the app folder IS the uninstall.
+# remove_data additionally deletes the per-user data OUTSIDE the app
+# folder: the settings file, the Chrome-mode profile dir, the work/
+# projects dir and the Built-in AI data dir (when they live outside).
+#
+# Safety: only the packaged app may do this - a source checkout is
+# refused outright - and the app folder itself must pass the same
+# sanity rules as the old-copy validator (never the home dir, never
+# a drive root).
+# ---------------------------------------------------------------------------
+
+def _uninstall_data_paths():
+    """Per-user data a remove_data uninstall deletes, as absolute
+    paths. Deduped; the home dir itself and roots are filtered out
+    as paranoia - a path bug must never widen the delete."""
+    home = os.path.expanduser("~")
+    candidates = [SETTINGS_PATH,
+                  os.path.join(home, ".clipmaker_pc_profile"),
+                  os.path.join(BASE_DIR, "work")]
+    try:
+        candidates.append(local_ai.DATA_DIR)
+    except Exception:  # noqa: BLE001 - local_ai imports above anyway
+        pass
+    out, seen = [], set()
+    for p in candidates:
+        if not p:
+            continue
+        ap = os.path.abspath(p)
+        key = os.path.normcase(ap)
+        if key in seen:
+            continue
+        seen.add(key)
+        if key == os.path.normcase(os.path.abspath(home)):
+            continue
+        if os.path.dirname(ap) == ap:
+            continue
+        out.append(ap)
+    return out
+
+
+def _uninstall_plan(remove_data):
+    """(plan, "") or (None, reason). Only the packaged app gets a
+    plan: frozen, or an exe literally named ClipMakerPC.exe."""
+    exe_name = os.path.basename(sys.executable or "").lower()
+    if not (getattr(sys, "frozen", False)
+            or exe_name == "clipmakerpc.exe"):
+        return None, ("only available in the installed app - this "
+                      "copy is running from source")
+    app_dir = os.path.abspath(_running_app_dir())
+    home = os.path.abspath(os.path.expanduser("~"))
+    if os.path.normcase(app_dir) == os.path.normcase(home):
+        return None, "refused: the app folder is the home folder"
+    if os.path.dirname(app_dir) == app_dir:
+        return None, "refused: the app folder is a drive root"
+    if not os.path.isdir(app_dir):
+        return None, "refused: app folder not found"
+    mode = "uninstaller" if os.path.isfile(
+        os.path.join(app_dir, _OLD_COPY_UNINSTALLER)) else "folder"
+    return ({"mode": mode, "app_dir": app_dir, "pid": os.getpid(),
+             "remove_data": bool(remove_data),
+             "data_paths": _uninstall_data_paths()}, "")
+
+
+def _uninstall_script_text(plan):
+    """The detached cleanup script (PowerShell) as pure text - a
+    separate builder so tests can assert exactly what would run.
+    The script only ever executes on a user's PC, after this
+    process has exited."""
+    def q(p):  # PowerShell single-quoted literal
+        return "'" + str(p).replace("'", "''") + "'"
+
+    app_dir = plan["app_dir"]
+    lines = [
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        "# Itraji Cliper self-uninstall: wait for the app to exit.",
+        "for ($i = 0; $i -lt 120; $i++) {",
+        "  if (-not (Get-Process -Id %d -ErrorAction SilentlyContinue))"
+        " { break }" % plan["pid"],
+        "  Start-Sleep -Milliseconds 500",
+        "}",
+        "Start-Sleep -Seconds 1",
+    ]
+    if plan["mode"] == "uninstaller":
+        lines.append(
+            "Start-Process -FilePath %s -ArgumentList "
+            "'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait"
+            % q(os.path.join(app_dir, _OLD_COPY_UNINSTALLER)))
+    if plan["mode"] == "folder" or plan["remove_data"]:
+        lines += [
+            "for ($i = 0; $i -lt 20; $i++) {",
+            "  if (-not (Test-Path %s)) { break }" % q(app_dir),
+            "  Remove-Item %s -Recurse -Force" % q(app_dir),
+            "  Start-Sleep -Milliseconds 500",
+            "}",
+        ]
+    if plan["remove_data"]:
+        for p in plan["data_paths"]:
+            if os.path.normcase(os.path.abspath(p)) == os.path.normcase(
+                    os.path.abspath(app_dir)):
+                continue
+            lines.append("Remove-Item %s -Recurse -Force" % q(p))
+    lines.append("Remove-Item $PSCommandPath -Force")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _write_uninstall_script(plan):
+    """Write the cleanup script into the TEMP dir (which survives
+    the app folder's deletion). Returns the script path."""
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="itraji-uninstall-",
+                                suffix=".ps1")
+    # newline="" - the generator already emits CRLF; translating
+    # again would produce CR-CR-LF line endings.
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+        f.write(_uninstall_script_text(plan))
+    return path
+
+
+def _launch_uninstall_script(script_path):
+    """Start the cleanup script fully detached (Windows only).
+    Returns True when launched. Off Windows: False - the plan guard
+    has already refused source runs, so this stays unreachable in
+    development."""
+    if os.name != "nt":
+        return False
+    import subprocess
+    flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-WindowStyle", "Hidden", "-File", script_path],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, creationflags=flags, close_fds=True)
+    return True
+
+
+def _schedule_self_exit(delay=0.8):
+    """Exit this process shortly AFTER the HTTP response returns -
+    the cleanup script waits for our PID, so the process must
+    actually die for the uninstall to proceed."""
+    def _die():
+        time.sleep(delay)
+        os._exit(0)
+    threading.Thread(target=_die, daemon=True).start()
+
+
 def _hex_to_ass(hex_color):
     """#RRGGBB -> ASS &HAABBGGRR (opaque). Safe fallback to white."""
     import re
@@ -471,6 +898,63 @@ class Api:
         current.update(settings or {})
         save_settings(current)
         return {"ok": True}
+
+    # -- old-copy cleanup ----------------------------------------------
+    def old_copies(self):
+        """Scan for folders of OTHER copies of the app (Settings ->
+        "Old version folders"). The running copy is never listed."""
+        try:
+            copies = _scan_old_copies()
+        except Exception as e:  # noqa: BLE001 - surfaced to UI
+            return {"ok": False, "error": str(e)[:200]}
+        return {"ok": True, "copies": copies,
+                "running_dir": _running_app_dir()}
+
+    def delete_old_copies(self, paths=None):
+        """Delete old-copy folders. Every path is re-validated
+        server-side (_validate_old_copy_target) - the client's list
+        is never trusted - and results are reported per path, so a
+        partial success says exactly which folder failed and why."""
+        if isinstance(paths, dict):  # tolerate a {"paths": [...]} body
+            paths = paths.get("paths")
+        results = []
+        for raw in (paths or []):
+            target = _validate_old_copy_target(raw)
+            if target is None:
+                results.append({
+                    "path": raw if isinstance(raw, str) else str(raw),
+                    "ok": False,
+                    "error": "refused: not a recognised old-copy "
+                             "folder (kept for safety)"})
+                continue
+            ok, err = _delete_old_copy(target)
+            item = {"path": target, "ok": ok}
+            if err:
+                item["error"] = err
+            results.append(item)
+        return {"ok": True, "results": results}
+
+    def uninstall_self(self, remove_data=False):
+        """Uninstall Itraji Cliper from this PC (Settings -> Danger
+        zone). Writes the detached cleanup script, starts it, then
+        exits so the script can remove the app (see _uninstall_plan).
+        The response returns BEFORE the exit, and reports which mode
+        will run. Refused from a source checkout."""
+        if isinstance(remove_data, dict):  # tolerate {"remove_data": x}
+            remove_data = remove_data.get("remove_data")
+        plan, why = _uninstall_plan(bool(remove_data))
+        if plan is None:
+            return {"ok": False, "error": why}
+        try:
+            script = _write_uninstall_script(plan)
+            launched = _launch_uninstall_script(script)
+        except Exception as e:  # noqa: BLE001 - surfaced to UI
+            return {"ok": False, "error": str(e)[:200]}
+        if not launched:
+            return {"ok": False,
+                    "error": "uninstall is only available on Windows"}
+        _schedule_self_exit()
+        return {"ok": True, "mode": plan["mode"]}
 
     # -- import + transcribe -------------------------------------------
     def _new_job(self):
@@ -2866,6 +3350,16 @@ def make_wsgi_app(api):
                                   json.dumps(api.local_ai_download(),
                                              default=str))
 
+        # --- old-copy cleanup: GET /api/old_copies ----------------------
+        # A GET (not the POST method dispatch) because a scan is a
+        # pure read; deletion stays a POST Api method. The scan walks
+        # candidate sizes, so it runs only when Settings asks for it.
+        if method == "GET" and path == "/api/old_copies":
+            return _wsgi_response(start_response, "200 OK",
+                                  "application/json",
+                                  json.dumps(api.old_copies(),
+                                             default=str))
+
         # --- work in progress: GET /api/work-status -------------------
         # Polled by the close guard injected into the main page: while
         # anything is active, the page arms beforeunload so closing
@@ -3109,6 +3603,39 @@ def _clamp_window_geometry(x0, y0, work_w, work_h):
     return (w, h, x, y)
 
 
+_DPI_AWARE_ATTEMPTED = False
+
+
+def _ensure_system_dpi_aware():
+    """Make this process system-DPI-aware BEFORE any window geometry
+    is measured, once, best-effort.
+
+    pywebview only calls SetProcessDPIAware() inside its own
+    create_window (winforms backend), which runs during
+    webview.start() - AFTER _window_geometry() / _dpi_scale() below
+    have already measured. If the process were still DPI-unaware at
+    measurement time (nothing else in the app sets awareness, and
+    the exe manifest is not ours to control), SPI_GETWORKAREA and
+    GetDpiForSystem would answer VIRTUALIZED values: the work area
+    in logical pixels and a DPI of 96 - so _dpi_scale() would read
+    1.0, skip the logical conversion entirely, and pywebview would
+    then multiply already-logical geometry by the real scale,
+    oversizing the window again. Setting awareness up front - the
+    exact call pywebview itself makes later, so its own call simply
+    becomes a no-op - makes every measurement below genuinely
+    physical and the conversions deterministic. No-op off Windows
+    or on any failure (geometry stays a nicety, never fatal)."""
+    global _DPI_AWARE_ATTEMPTED
+    if _DPI_AWARE_ATTEMPTED or os.name != "nt":
+        return
+    _DPI_AWARE_ATTEMPTED = True
+    try:
+        import ctypes
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:  # noqa: BLE001 - a nicety, never fatal
+        pass
+
+
 def _dpi_scale():
     """The primary display's DPI scale (1.0 = 100%) in the SAME
     coordinate space _window_geometry() measures in.
@@ -3121,6 +3648,7 @@ def _dpi_scale():
     failure, where the conversion is a no-op anyway."""
     if os.name != "nt":
         return 1.0
+    _ensure_system_dpi_aware()
     try:
         import ctypes
         dpi = ctypes.windll.user32.GetDpiForSystem()
@@ -3137,6 +3665,7 @@ def _window_geometry():
     (WebView2) window and the Chrome --app window (as flags)."""
     if os.name != "nt":
         return None
+    _ensure_system_dpi_aware()
     try:
         import ctypes
 
@@ -3258,13 +3787,30 @@ def _window_geometry_args():
     previous session left behind - which can be wider than the screen,
     pushing the top-right buttons off-screen. Fully guarded: any
     failure returns [] and Chrome keeps its default behavior.
-    """
-    geo = _window_geometry()
-    if geo is None:
+
+    _window_geometry() returns PHYSICAL pixels, but Chromium window
+    bounds are in logical (DIP) pixels - the same mismatch the
+    own-window branch had with pywebview. Feeding physical values
+    straight in made the Chrome window oversized and displaced on
+    125%/150% displays (the clipped sidebar the user kept seeing in
+    the fallback mode), so convert with _dpi_scale() first - a no-op
+    at 100% scaling. Any failure anywhere returns []: Chrome's own
+    placement beats a wrong rectangle."""
+    try:
+        geo = _window_geometry()
+        if geo is None:
+            return []
+        w, h, x, y = geo
+        scale = _dpi_scale()
+        if scale and scale != 1.0:
+            w = int(round(w / scale))
+            h = int(round(h / scale))
+            x = int(round(x / scale))
+            y = int(round(y / scale))
+        return [f"--window-size={w},{h}",
+                f"--window-position={x},{y}"]
+    except Exception:  # noqa: BLE001 - geometry is a nicety, never fatal
         return []
-    w, h, x, y = geo
-    return [f"--window-size={w},{h}",
-            f"--window-position={x},{y}"]
 
 
 def _launch_window(url):
@@ -3390,6 +3936,27 @@ def _run_own_window(url):
             # this particular display, guarantee the placed window
             # is fully on-screen before the user starts working.
             _pull_window_on_screen()
+            # Second pass ~1.2s later: pywebview applies the size
+            # and position in the form constructor (before Shown),
+            # but the form also carries WinForms AutoScaleMode.Dpi
+            # with a 96-DPI baseline, and the runtime / Windows can
+            # still adjust the placed rectangle as the window
+            # settles - after the shown-time check has already run.
+            # The corrector is idempotent and a no-op when the
+            # window is fully on-screen, so a late drift gets the
+            # same correction instead of surviving it.
+            def _second_pass():
+                try:
+                    time.sleep(1.2)
+                    _pull_window_on_screen()
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
+
+            try:
+                threading.Thread(target=_second_pass,
+                                 daemon=True).start()
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
 
         try:
             win.events.shown += _mark_shown

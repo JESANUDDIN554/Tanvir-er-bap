@@ -674,13 +674,16 @@ async function refreshLocalAiStatus() {
   const btn = $("localAiDownloadBtn"), barWrap = $("localAiBarWrap"),
     bar = $("localAiBar"), pct = $("localAiPct"), txt = $("localAiText");
   if (!btn) return;
+  // EVERY mirror (Step-2 card, hub card, Settings card, sidebar
+  // mini-card) is updated for every state first; polling stops for
+  // the ready state only at the very end. An early return in the
+  // ready branch once skipped all the mirrors below, freezing them
+  // at their placeholders - the sidebar sat on "Checking…" forever
+  // when the first poll of a session resolved to ready.
   if (st.ready) {
     txt.textContent = "Built-in AI ready ✓ — the model is on your PC and works fully offline.";
     hide(btn); hide(barWrap); pct.textContent = "";
-    stopLocalAiPolling();
-    return;
-  }
-  if (st.downloading) {
+  } else if (st.downloading) {
     hide(btn); show(barWrap);
     bar.style.width = (st.pct || 0) + "%";
     pct.textContent = (st.stage || "Downloading…") + " — " + Math.round(st.pct || 0) + "%";
@@ -769,6 +772,9 @@ async function refreshLocalAiStatus() {
       sideDot.className = "side-ai-dot";
     }
   }
+  // All mirrors now show the current state; only then may the
+  // ready state stop the polling that feeds them.
+  if (st.ready) stopLocalAiPolling();
 }
 
 $("localAiDownloadBtn").addEventListener("click", async () => {
@@ -3110,6 +3116,196 @@ $("falKeyClearBtn").addEventListener("click", async () => {
   toast("fal.ai key removed");
 });
 
+/* ---------------- old version folders (Settings cleanup) ----------
+   Scan lists folders of OTHER copies of the app (loose old downloads
+   and old installs). The server re-validates every delete target, so
+   this UI only ever offers what the scan returned - and the copy
+   being run is never among them. */
+let oldCopiesFound = [];
+
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n, u = -1;
+  do { v /= 1024; u++; } while (v >= 1024 && u < units.length - 1);
+  return (v >= 100 ? Math.round(v) : v.toFixed(1)) + " " + units[u];
+}
+function fmtDate(epochSecs) {
+  if (!epochSecs) return "";
+  try {
+    return new Date(epochSecs * 1000).toLocaleDateString(undefined,
+      { day: "numeric", month: "short", year: "numeric" });
+  } catch (e) { return ""; }
+}
+function selectedOldCopies() {
+  return [...document.querySelectorAll(
+    "#oldCopiesList .old-copy-row input:checked")]
+    .map((cb) => cb.dataset.path);
+}
+function syncOldCopiesDeleteBtn() {
+  const btn = $("oldCopiesDeleteBtn");
+  if (!btn) return;
+  const n = selectedOldCopies().length;
+  btn.disabled = n === 0;
+  if (!btn.dataset.armed)
+    btn.textContent = n ? `Delete selected (${n})` : "Delete selected";
+}
+function renderOldCopies() {
+  const list = $("oldCopiesList");
+  const actions = $("oldCopiesActions");
+  list.innerHTML = "";
+  if (!oldCopiesFound.length) {
+    const d = document.createElement("div");
+    d.className = "old-copies-empty";
+    d.textContent = "No old copies found 🎉";
+    list.appendChild(d);
+    hide(actions);
+  } else {
+    oldCopiesFound.forEach((c) => {
+      const row = document.createElement("label");
+      row.className = "old-copy-row";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = true;
+      cb.dataset.path = c.path;
+      cb.addEventListener("change", syncOldCopiesDeleteBtn);
+      row.appendChild(cb);
+      const main = document.createElement("span");
+      main.className = "old-copy-main";
+      const p = document.createElement("span");
+      p.className = "old-copy-path";
+      p.textContent = c.path;
+      main.appendChild(p);
+      const meta = document.createElement("span");
+      meta.className = "old-copy-meta";
+      const when = fmtDate(c.modified);
+      meta.textContent = fmtBytes(c.size_bytes)
+        + (when ? " · " + when : "");
+      main.appendChild(meta);
+      row.appendChild(main);
+      if (c.has_uninstaller) {
+        const tag = document.createElement("span");
+        tag.className = "badge";
+        tag.textContent = "has uninstaller";
+        row.appendChild(tag);
+      }
+      list.appendChild(row);
+    });
+    show(actions);
+  }
+  show(list);
+  syncOldCopiesDeleteBtn();
+}
+$("oldCopiesScanBtn").addEventListener("click", async () => {
+  const btn = $("oldCopiesScanBtn");
+  const state = $("oldCopiesState");
+  btn.disabled = true;
+  state.textContent = "Scanning…";
+  $("oldCopiesResult").textContent = "";
+  try {
+    const r = await fetch("/api/old_copies");
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || "scan failed");
+    oldCopiesFound = data.copies || [];
+    state.textContent = oldCopiesFound.length
+      ? oldCopiesFound.length + " old "
+        + (oldCopiesFound.length === 1 ? "copy" : "copies") + " found"
+      : "";
+    renderOldCopies();
+  } catch (e) {
+    state.textContent = "";
+    toast("Old-copy scan failed: " + e.message, true);
+  }
+  btn.disabled = false;
+});
+$("oldCopiesDeleteBtn").addEventListener("click", async () => {
+  const btn = $("oldCopiesDeleteBtn");
+  const paths = selectedOldCopies();
+  if (!paths.length) return;
+  // same arm-to-confirm pattern as the Library delete button
+  if (!btn.dataset.armed) {
+    btn.dataset.armed = "1";
+    btn.textContent = "Sure? Delete " + paths.length
+      + (paths.length === 1 ? " folder" : " folders");
+    setTimeout(() => {
+      delete btn.dataset.armed;
+      syncOldCopiesDeleteBtn();
+    }, 3000);
+    return;
+  }
+  delete btn.dataset.armed;
+  btn.disabled = true;
+  btn.textContent = "Deleting…";
+  const resEl = $("oldCopiesResult");
+  resEl.textContent = "";
+  try {
+    const res = await api.delete_old_copies(paths);
+    const results = (res && res.results) || [];
+    const gone = results.filter((r2) => r2.ok);
+    const failed = results.filter((r2) => !r2.ok);
+    if (failed.length) {
+      resEl.textContent = "Deleted " + gone.length + " of "
+        + results.length + " — failed: " + failed.map((r2) =>
+          String(r2.path).split(/[\\/]/).pop()
+          + (r2.error ? " (" + r2.error + ")" : "")).join("; ");
+      toast("Some old copies could not be deleted", true);
+    } else {
+      resEl.textContent = "Deleted " + gone.length
+        + (gone.length === 1 ? " folder" : " folders") + " ✅";
+      toast("Old copies deleted");
+    }
+    const norm = (p) => String(p).replace(/\\/g, "/")
+      .replace(/\/+$/, "").toLowerCase();
+    oldCopiesFound = oldCopiesFound.filter(
+      (c) => !gone.some((g) => norm(g.path) === norm(c.path)));
+    renderOldCopies();
+  } catch (e) {
+    resEl.textContent = "Delete failed: " + e.message;
+    toast("Delete failed", true);
+  }
+  btn.disabled = false;
+  syncOldCopiesDeleteBtn();
+});
+
+/* ---------------- uninstall (Settings danger zone) ----------------
+   The server writes a detached cleanup script and exits; the modal
+   only collects the remove-data choice and shows the goodbye line.
+   From a source checkout the server refuses, and the error is
+   surfaced as a toast like any other failure. */
+$("uninstallBtn").addEventListener("click", () => {
+  $("uninstallRemoveData").checked = false;
+  hide($("uninstallDoneText"));
+  show($("uninstallActions"));
+  const btn = $("uninstallConfirmBtn");
+  btn.disabled = false;
+  btn.textContent = "Yes, uninstall";
+  show($("uninstallModal"));
+});
+$("uninstallCancelBtn").addEventListener("click",
+  () => hide($("uninstallModal")));
+$("uninstallConfirmBtn").addEventListener("click", async () => {
+  const btn = $("uninstallConfirmBtn");
+  btn.disabled = true;
+  btn.textContent = "Uninstalling…";
+  try {
+    const res = await api.uninstall_self(
+      $("uninstallRemoveData").checked);
+    if (!res || !res.ok)
+      throw new Error((res && res.error) || "uninstall refused");
+    hide($("uninstallActions"));
+    show($("uninstallDoneText"));
+    // The app exits on its own; in Chrome mode the tab can linger
+    // on a dead server, so try to close it too.
+    setTimeout(() => { try { window.close(); } catch (e) { /* noop */ } },
+               1800);
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = "Yes, uninstall";
+    toast("Uninstall failed: " + e.message, true);
+  }
+});
+
 /* ---------------- theme (Dark default = web-app look) ---------------- */
 function hexToRgb(hex) {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex || "");
@@ -3182,12 +3378,12 @@ function closeModal(id) {
   }
   hide($(id));
 }
-["captionModal", "previewModal", "settingsModal"].forEach((id) => {
+["captionModal", "previewModal", "settingsModal", "uninstallModal"].forEach((id) => {
   $(id).addEventListener("click", (e) => { if (e.target.id === id) closeModal(id); });
 });
 window.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  ["captionModal", "previewModal", "settingsModal"].forEach((id) => {
+  ["captionModal", "previewModal", "settingsModal", "uninstallModal"].forEach((id) => {
     if (!$(id).classList.contains("hidden")) closeModal(id);
   });
 });

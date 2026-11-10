@@ -1114,12 +1114,49 @@
       </div>
     </div>
     <div class="field">
+      <label class="field-label">Old version folders <span class="hint">— leftover copies of the app from older downloads</span></label>
+      <p class="sub" style="margin:6px 0 0">Old copies of the app can cause confusion — delete the ones you don't use. The copy you're running is never listed.</p>
+      <div class="row row-tight" style="margin-top:10px">
+        <button id="oldCopiesScanBtn" class="ghost-btn" type="button">Scan for old copies</button>
+        <span class="hint" id="oldCopiesState"></span>
+      </div>
+      <div id="oldCopiesList" class="old-copies-list hidden"></div>
+      <div class="row row-tight hidden" id="oldCopiesActions" style="margin-top:10px">
+        <button id="oldCopiesDeleteBtn" class="primary" type="button">Delete selected</button>
+        <span class="hint" id="oldCopiesResult"></span>
+      </div>
+    </div>
+    <div class="field danger-field">
+      <label class="field-label">Danger zone</label>
+      <p class="sub" style="margin:6px 0 0">Remove Itraji Cliper from this PC completely. The app closes and its folder is deleted — this can't be undone from here.</p>
+      <div class="row row-tight" style="margin-top:10px">
+        <button id="uninstallBtn" class="danger-btn" type="button">Uninstall Itraji Cliper</button>
+      </div>
+    </div>
+    <div class="field">
       <label class="field-label">About</label>
       <p class="sub" style="margin:0">Itraji Cliper v2.0 — turn long videos into viral clips. Clipping, captions and the Built-in AI all run locally on this PC; only the AI Video Generator uses the cloud, with your own fal.ai key.</p>
     </div>
     <div class="row">
       <button id="saveSettingsBtn" class="primary">Save settings</button>
       <button id="closeSettingsBtn" class="ghost-btn">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- uninstall confirm modal -->
+<div id="uninstallModal" class="modal hidden">
+  <div class="modal-box">
+    <h2>Uninstall Itraji Cliper?</h2>
+    <p class="sub">This removes Itraji Cliper from this PC: the app closes, then its folder is deleted (installed copies are removed with their uninstaller, shortcuts included). Reinstalling later needs the Setup file and your license key again.</p>
+    <label class="check-row" for="uninstallRemoveData">
+      <input type="checkbox" id="uninstallRemoveData">
+      <span>Also delete the downloaded AI model (~9 GB), projects and settings</span>
+    </label>
+    <p class="sub hidden" id="uninstallDoneText" style="margin:12px 0 0">Itraji Cliper will now close and remove itself…</p>
+    <div class="row" id="uninstallActions">
+      <button id="uninstallConfirmBtn" class="danger-btn" type="button">Yes, uninstall</button>
+      <button id="uninstallCancelBtn" class="ghost-btn" type="button">Cancel</button>
     </div>
   </div>
 </div>
