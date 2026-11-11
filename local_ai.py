@@ -1512,12 +1512,27 @@ def ensure_server(progress_cb=None):
 # Chat + JSON extraction
 # ---------------------------------------------------------------------------
 
+def _admin_log(status, t0, error=None):
+    """Record one Built-in AI call in the Admin Panel's API log.
+    Lazy import + fully guarded: telemetry must never break the
+    call it describes. Server-start time is excluded - t0 starts
+    when the request itself is sent."""
+    try:
+        import admin
+        admin.log_api_call("Built-in AI (local)", MODEL_FILE, status,
+                           (time.time() - t0) * 1000.0,
+                           error=error, kind="chat")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def chat(messages, progress_cb=None):
     """One chat-completion round-trip against the local server.
 
     Returns the assistant's reply text. Raises RuntimeError on any
     failure - callers must surface it, never invent a fallback."""
     base = ensure_server(progress_cb)
+    t0 = time.time()
     try:
         r = requests.post(
             base + "/v1/chat/completions",
@@ -1526,12 +1541,18 @@ def chat(messages, progress_cb=None):
             timeout=(10, 1800))
         r.raise_for_status()
         data = r.json()
-        return data["choices"][0]["message"]["content"]
+        reply = data["choices"][0]["message"]["content"]
+        _admin_log("ok", t0)
+        return reply
     except requests.HTTPError as e:
-        raise RuntimeError(f"Built-in AI server error: {e}") from e
+        err = RuntimeError(f"Built-in AI server error: {e}")
+        _admin_log("error", t0, error=str(err))
+        raise err from e
     except (requests.RequestException, KeyError, IndexError,
             TypeError, ValueError) as e:
-        raise RuntimeError(f"Built-in AI request failed: {e}") from e
+        err = RuntimeError(f"Built-in AI request failed: {e}")
+        _admin_log("error", t0, error=str(err))
+        raise err from e
 
 
 def extract_json(text):

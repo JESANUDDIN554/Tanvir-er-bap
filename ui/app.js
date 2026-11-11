@@ -25,6 +25,10 @@ let quality = "1080p";
 let encodeTier = "maximum";
 let clipCount = 8;
 let genre = "";
+let category = "general";
+let translateLangs = [["bn", "Bengali"], ["es", "Spanish"], ["hi", "Hindi"],
+  ["ar", "Arabic"], ["pt", "Portuguese"], ["fr", "French"], ["de", "German"],
+  ["ur", "Urdu"]];
 /* navigation history state (Back button / logo home) */
 let navStack = [];
 let navNow = { view: "hub" };
@@ -39,6 +43,7 @@ const TOOL_VIEWS = {
   generator: "generatorView", titles: "titlesView", script: "scriptView",
   transcript: "transcriptView", enhancer: "enhancerView",
   hookmaker: "hookmakerView", aimanager: "aiManagerView",
+  admin: "adminView",
 };
 
 /* Opus-style shell: the sidebar active pill + topbar title follow the
@@ -49,7 +54,7 @@ const VIEW_TITLES = {
   titles: "Title & Hook Generator", script: "AI Scriptwriter",
   transcript: "Transcript Tool", enhancer: "Video Enhancer",
   hookmaker: "Hook Maker", captionstudio: "Caption Studio",
-  aimanager: "AI Engine",
+  aimanager: "AI Engine", admin: "Admin Panel",
 };
 function syncSidebar(view) {
   document.querySelectorAll(".side-item").forEach((b) =>
@@ -205,6 +210,9 @@ async function poll() {
     }
     reveal($("step2"));
     setStep(2);
+    if (st.category && $("categorySel")
+        && document.activeElement !== $("categorySel"))
+      $("categorySel").value = st.category;
     $("importBtn").disabled = false;
     $("localFileBtn").disabled = false;
     if (controlsInitFor !== jobId) { controlsInitFor = jobId; initControls(); }
@@ -335,7 +343,11 @@ function renderLiveRail(st) {
   const renders = st.renders || [];
   if (st.status === "done" && renders.length) show($("liveGoClips"));
   else hide($("liveGoClips"));
-  const sig = JSON.stringify(renders.map((r) => r.path));
+  const tr = st.translate || {};
+  const sig = JSON.stringify(renders.map((r) =>
+    [r.path, r.translations || null])) + "|tr:"
+    + [tr.busy ? 1 : 0, tr.lang || "", tr.render_idx ?? "",
+       tr.error || "", tr.done ? 1 : 0].join(":");
   if (sig === lastRailSig) return;
   lastRailSig = sig;
   const list = $("liveRailList");
@@ -353,14 +365,45 @@ function renderLiveRail(st) {
       const m = (lastMoments || [])[r.moment_index];
       if (m) dur = fmtTime(Math.max(0, Math.round(m.end - m.start)));
     }
+    const trBusy = tr.busy && tr.render_idx === ri;
+    const trLinks = Object.entries(r.translations || {}).map(([lg, t]) =>
+      `<button class="ghost-btn small rc-tr-dl" data-lg="${lg}" data-kind="srt" type="button">${lg.toUpperCase()} SRT</button>
+       <button class="ghost-btn small rc-tr-dl" data-lg="${lg}" data-kind="vtt" type="button">${lg.toUpperCase()} VTT</button>`).join("");
     div.innerHTML = `${thumb ? `<img src="${thumb}" alt="">` : ""}
       <div class="rc-text">
         <div class="rc-title">${escapeHtml(r.title || "Clip")}</div>
-        <div class="rc-meta">${dur ? dur + " · " : ""}virality ${r.virality ?? "—"}${r.broll ? ` · 🎞 B-roll: ${escapeHtml(r.broll.keyword || "stock")}` : ""}</div>
+        <div class="rc-meta">${dur ? dur + " · " : ""}virality ${r.virality ?? "—"}${r.aspect ? " · " + escapeHtml(r.aspect) : ""}${r.reframe ? " · " + escapeHtml(r.reframe) : ""}${r.audio_polish ? " · 🔊 −14 LUFS" : ""}${r.broll ? ` · 🎞 B-roll: ${escapeHtml(r.broll.keyword || "stock")}` : ""}</div>
+        <div class="rc-translate">
+          <select class="rc-lang" aria-label="Caption language">${translateLangs.map(([c, l]) => `<option value="${c}">${l}</option>`).join("")}</select>
+          <button class="ghost-btn small rc-tr" type="button" ${trBusy ? "disabled" : ""}>${trBusy ? "Translating…" : "🌐 Translate"}</button>
+          ${trLinks}
+        </div>
+        ${tr.render_idx === ri && tr.error ? `<div class="rc-tr-err">${escapeHtml(tr.error)}</div>` : ""}
+        ${r.teaser_note ? `<div class="rc-tr-note">${escapeHtml(r.teaser_note)}</div>` : ""}
       </div>
       <button class="ghost-btn small rc-dl" type="button">Download</button>
       <button class="ghost-btn small rc-cap" type="button">Captions</button>
       <button class="ghost-btn small rc-cover" type="button">Cover</button>`;
+    div.querySelector(".rc-tr").addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      const lang = div.querySelector(".rc-lang").value;
+      btn.disabled = true;
+      btn.textContent = "Translating…";
+      const res = await api.translate_captions(jobId, ri, lang);
+      if (!res.ok) {
+        btn.disabled = false;
+        btn.textContent = "🌐 Translate";
+        toast(res.message || res.error || "Translation failed", true);
+        return;
+      }
+      toast("Translating captions with the Built-in AI…");
+      watchTranslate();
+    });
+    div.querySelectorAll(".rc-tr-dl").forEach((b) =>
+      b.addEventListener("click", () => {
+        const t = (r.translations || {})[b.dataset.lg];
+        if (t && t[b.dataset.kind]) downloadUrl(t[b.dataset.kind]);
+      }));
     div.querySelector(".rc-dl").addEventListener("click", () => {
       if (r.url) downloadUrl(r.url);
     });
@@ -384,6 +427,24 @@ function renderLiveRail(st) {
     });
     list.appendChild(div);
   });
+}
+
+/* Watch a caption translation to completion, then refresh the
+   rail so the translated SRT/VTT buttons appear. */
+async function watchTranslate() {
+  for (let i = 0; i < 900; i++) {
+    await new Promise((r) => setTimeout(r, 1200));
+    let st;
+    try { st = await api.job_status(jobId); } catch (e) { return; }
+    const tr = st.translate || {};
+    if (!tr.busy) {
+      lastRailSig = "";
+      renderLiveRail(st);
+      if (tr.error) toast("Translation failed: " + tr.error, true);
+      else if (tr.done) toast("Translated captions ready — use the SRT/VTT buttons on the clip");
+      return;
+    }
+  }
 }
 
 function updateLivePanel(st) {
@@ -626,6 +687,10 @@ function initControls() {
   $("zoomLevelSel").value = settings.emphasis_level || "gentle";
   $("brollCheck").checked = !!settings.broll;
   $("enhanceCheck").checked = !!settings.enhance_clarity;
+  $("audioPolishCheck").checked = !!settings.audio_polish;
+  $("denoiseAudioCheck").checked = !!settings.denoise_audio;
+  category = settings.category || "general";
+  if ($("categorySel")) $("categorySel").value = category;
   $("safeZoneCheck").checked = !!settings.safe_zone;
   $("speakerColor1").value = settings.speaker_color_1 || "#ffd166";
   $("speakerColor2").value = settings.speaker_color_2 || "#6cc7ff";
@@ -1035,9 +1100,10 @@ $("detectBtn").addEventListener("click", async () => {
   hide($("detectError"));
   const mode = segGet("detectModeSeg");
   const len = currentClipLen();
+  const cat = $("categorySel") ? $("categorySel").value : "general";
   const res = mode === "offline"
-    ? await api.detect_offline(jobId, clipCount, len)
-    : await api.detect_local(jobId, clipCount, len);
+    ? await api.detect_offline(jobId, clipCount, len, cat)
+    : await api.detect_local(jobId, clipCount, len, cat);
   if (!res.ok) {
     if (res.error === "local_ai_missing") show($("localAiCard"));
     $("detectError").textContent = res.message || res.error;
@@ -1107,6 +1173,27 @@ function bar(label, v) {
     <div class="vbar"><div class="vfill ${cls}" data-w="${v}" style="width:0%"></div></div>
     <b>${v}</b></div>`;
 }
+/* Phase 1: multi-dimensional score bars + platform tag. Shown when
+   the moment carries subscores (new detections); older projects
+   keep the legacy Hook/Flow/Value bars. */
+function scoreBars(m) {
+  const s = m && m.scores;
+  if (!s) return bar("Hook", m.hook_score ?? m.virality)
+    + bar("Flow", m.flow_score ?? m.virality)
+    + bar("Value", m.value_score ?? m.virality);
+  const rs = m.score_reasons || {};
+  const sbar = (label, v, why) =>
+    `<div class="vrow" title="${escapeHtml(why || "")}"><span>${label}</span>
+    <div class="vbar"><div class="vfill ${v >= 80 ? "" : v >= 60 ? "mid" : "low"}" data-w="${v}" style="width:0%"></div></div>
+    <b>${v}</b></div>`;
+  return sbar("Hook", s.hook, rs.hook) + sbar("Keep", s.retention, rs.retention)
+    + sbar("Emot", s.emotion, rs.emotion) + sbar("Story", s.story, rs.story);
+}
+function platformTag(m) {
+  const p = m && m.platform;
+  if (!p || !p.name) return "";
+  return `<span class="platform-tag" title="${escapeHtml(p.why || "")}">📱 ${escapeHtml(p.name)}</span>`;
+}
 
 $("sortBtn").addEventListener("click", () => {
   sortDesc = !sortDesc;
@@ -1143,13 +1230,11 @@ function renderMoments(moments) {
       <input type="checkbox" data-i="${i}" checked aria-label="Select clip">
       <div class="moment-thumb"><img src="/files/${jobId}/thumb.jpg" alt="" loading="lazy" onerror="this.remove()"><span class="moment-dur">${Math.round(m.end - m.start)}s</span></div>
       <div class="moment-body">
-        <div class="moment-title">${escapeHtml(m.title)}${tags}</div>
+        <div class="moment-title">${escapeHtml(m.title)}${tags} ${platformTag(m)}</div>
         <div class="moment-meta">${fmtTime(m.start)} → ${fmtTime(m.end)} · ${Math.round(m.end - m.start)}s</div>
         <div class="moment-hook">${escapeHtml(m.hook)}</div>
         <div class="vbreak">
-          ${bar("Hook", m.hook_score ?? m.virality)}
-          ${bar("Flow", m.flow_score ?? m.virality)}
-          ${bar("Value", m.value_score ?? m.virality)}
+          ${scoreBars(m)}
         </div>
         <div class="moment-reason">${escapeHtml(m.reason)}</div>
         ${sigChips(m)}
@@ -1291,6 +1376,8 @@ function collectRenderOptions() {
     emphasis_level: $("zoomLevelSel").value,
     broll: $("brollCheck").checked,
     enhance_clarity: $("enhanceCheck").checked,
+    audio_polish: $("audioPolishCheck").checked,
+    denoise_audio: $("denoiseAudioCheck").checked,
     logo_path: $("brandLogoInput").value.trim(),
   };
 }
@@ -1309,6 +1396,11 @@ $("ctaTextInput").addEventListener("change", async () => {
 $("brandLogoInput").addEventListener("change", async () => {
   settings.logo_path = $("brandLogoInput").value.trim();
   try { await api.save_settings({ logo_path: settings.logo_path }); } catch (e) { /* offline */ }
+});
+$("categorySel").addEventListener("change", async () => {
+  category = $("categorySel").value;
+  settings.category = category;
+  try { await api.save_settings({ category }); } catch (e) { /* offline */ }
 });
 
 async function startRender(indices) {
@@ -2307,6 +2399,7 @@ function showTool(name) {
     });
   }
   else if (name === "aimanager") initAiManager();
+  else if (name === "admin") initAdmin();
   syncSidebar(name);
 }
 
@@ -2665,6 +2758,7 @@ $("navScriptBtn").addEventListener("click", () => showTool("script"));
 $("navTranscriptBtn").addEventListener("click", () => showTool("transcript"));
 $("navEnhBtn").addEventListener("click", () => showTool("enhancer"));
 $("navAiBtn").addEventListener("click", () => showTool("aimanager"));
+$("navAdminBtn").addEventListener("click", () => openAdmin());
 $("sideAiCard").addEventListener("click", () => showTool("aimanager"));
 $("homeSeeAllBtn").addEventListener("click", showLibrary);
 document.querySelectorAll(".tool-back").forEach((b) =>
@@ -2681,6 +2775,7 @@ document.querySelectorAll(".tool-card").forEach((card) => {
       showLibrary();
       toast("Pick a clip in the Library, then open Caption Studio on it");
     } else if (tool === "settings") $("settingsBtn").click();
+    else if (tool === "admin") openAdmin();
     else showTool(tool);
   });
 });
@@ -3411,6 +3506,7 @@ let hookTimer = null;
 let hookData = null;        // last hook_analyze result
 let hookJobId = null;       // project the analysis belongs to
 let hookSelText = "";       // chosen hook line
+let hookSelCand = null;     // chosen ranked hook candidate (Hook v2)
 
 function stopHookPoll() {
   if (hookTimer) { clearInterval(hookTimer); hookTimer = null; }
@@ -3458,6 +3554,7 @@ $("hookAnalyzeBtn").addEventListener("click", async () => {
   stopHookPoll();
   hookData = null;
   hookSelText = "";
+  hookSelCand = null;
   if (!job) { toast("Pick a Library project first", true); return; }
   $("hookAnalyzeBtn").disabled = true;
   let res;
@@ -3487,6 +3584,31 @@ $("hookAnalyzeBtn").addEventListener("click", async () => {
     });
     list.appendChild(row);
     if (i === 0) hookSelText = h.text;
+  });
+  // Hook v2: ranked candidate hook moments across the whole video.
+  // The top pick is marked; clicking any candidate makes it the
+  // hook moment (window + overlay text follow the pick).
+  const candList = $("hookCandList");
+  candList.innerHTML = "";
+  (res.candidates || []).forEach((c, i) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "title-row hook-row cand-row" + (i === 0 ? " sel" : "");
+    row.innerHTML = `${scoreChip(c.score)}<span class="t-text">${escapeHtml(c.text)}</span>
+      <span class="cand-meta">${fmtTime(c.start)} – ${fmtTime(c.end)} · ${escapeHtml(c.reason || "")}</span>`;
+    row.addEventListener("click", () => {
+      candList.querySelectorAll(".cand-row").forEach((r) =>
+        r.classList.remove("sel"));
+      row.classList.add("sel");
+      hookSelCand = c;
+      hookSelText = c.text;
+      $("hookMomentText").textContent = "“" + (c.text || "") + "”";
+      $("hookStartInput").value = Number(c.start).toFixed(1);
+      $("hookEndInput").value = Number(c.end).toFixed(1);
+      syncHookWindowMeta();
+    });
+    candList.appendChild(row);
+    if (i === 0) hookSelCand = c;
   });
   const m = res.moment;
   if (m) {
@@ -3524,6 +3646,7 @@ $("hookAnalyzeBtn").addEventListener("click", async () => {
     sel.appendChild(o);
   }
   $("hookComboBtn").disabled = !(res.clips || []).length;
+  $("hookTeaserBtn").disabled = !(res.clips || []).length;
   hide($("hookOutWrap"));
   $("hookOut").innerHTML = "";
   show($("hookResults"));
@@ -3545,6 +3668,18 @@ async function hookStartRender(kind) {
       if (!c) { toast("No clip picked", true); return; }
       res = await api.hook_combo(hookJobId, hookSelText, s, e,
         c.index, c.start, c.end, c.title || "");
+    } else if (kind === "teaser") {
+      const c = (hookData.clips || [])[
+        parseInt($("hookClipSelect").value, 10)];
+      if (!c) { toast("No clip picked", true); return; }
+      // the picked candidate's own window wins when one is chosen;
+      // otherwise the (possibly hand-nudged) window inputs rule
+      const cand = hookSelCand;
+      const ts = cand ? cand.start : s;
+      const te = cand ? cand.end : e;
+      const tt = cand ? cand.text : hookSelText;
+      res = await api.hook_teaser(hookJobId, tt, ts, te,
+        c.index, c.start, c.end, c.title || "");
     } else {
       res = await api.hook_render(hookJobId, hookSelText, s, e);
     }
@@ -3559,6 +3694,7 @@ async function hookStartRender(kind) {
   }
   $("hookRenderBtn").disabled = true;
   $("hookComboBtn").disabled = true;
+  $("hookTeaserBtn").disabled = true;
   show($("hookProgress"));
   $("hookBar").style.width = "0%";
   $("hookStage").textContent = "Rendering…";
@@ -3585,6 +3721,8 @@ async function pollHook() {
   $("hookRenderBtn").disabled = false;
   $("hookComboBtn").disabled =
     !(hookData && (hookData.clips || []).length);
+  $("hookTeaserBtn").disabled =
+    !(hookData && (hookData.clips || []).length);
   if (st.render_error) {
     $("hookRenderError").textContent = st.render_error;
     show($("hookRenderError"));
@@ -3596,7 +3734,8 @@ async function pollHook() {
 
 function renderHookOut(renders) {
   const mine = (renders || []).filter((r) =>
-    r.hook_clip || r.title === "Hook + clip");
+    r.hook_clip || r.teaser || r.title === "Hook + clip"
+    || r.title === "Teaser");
   if (!mine.length) return;
   const wrap = $("hookOut");
   wrap.innerHTML = "";
@@ -3620,6 +3759,7 @@ function renderHookOut(renders) {
 
 $("hookRenderBtn").addEventListener("click", () => hookStartRender("single"));
 $("hookComboBtn").addEventListener("click", () => hookStartRender("combo"));
+$("hookTeaserBtn").addEventListener("click", () => hookStartRender("teaser"));
 
 /* ---------------- settings ---------------- */
 function openSettings() {
@@ -4017,6 +4157,369 @@ $("themeQuickBtn").addEventListener("click", async () => {
   try { await api.save_settings({ theme: settings.theme }); } catch (e) { /* offline */ }
 });
 
+/* ---------------- Admin Panel (owner only) ----------------
+   The server is the gatekeeper: /api/admin/* answers 403 without
+   a live server-side session, and only a license key carrying the
+   signed owner claim can start one. Everything here is display. */
+let adminStatsCache = null;
+let adminRange = "daily";
+
+async function adminFetch(path, opts) {
+  const r = await fetch(path, Object.assign(
+    { headers: { "Content-Type": "application/json" } }, opts || {}));
+  let data = {};
+  try { data = await r.json(); } catch (e) { /* non-JSON reply */ }
+  return { status: r.status, data };
+}
+
+async function openAdmin() {
+  try {
+    const s = await adminFetch("/api/admin/session");
+    if (s.status === 200 && s.data.active) { enterAdmin(); return; }
+  } catch (e) { /* fall through to the unlock dialog */ }
+  hide($("adminUnlockError"));
+  $("adminKeyInput").value = "";
+  show($("adminUnlockModal"));
+  setTimeout(() => $("adminKeyInput").focus(), 60);
+}
+
+function enterAdmin() {
+  show($("navAdminBtn"));
+  showTool("admin");
+}
+
+function adminLockedUi(msg) {
+  hide($("navAdminBtn"));
+  if (toolOpen === "admin") goHome();
+  if (msg) toast(msg);
+}
+
+async function checkAdminSession() {
+  try {
+    const s = await adminFetch("/api/admin/session");
+    if (s.status === 200 && s.data.active) show($("navAdminBtn"));
+  } catch (e) { /* panel simply stays hidden */ }
+}
+
+async function submitAdminUnlock() {
+  const key = $("adminKeyInput").value.trim();
+  const err = $("adminUnlockError");
+  if (!key) {
+    err.textContent = "Paste your owner key first.";
+    show(err);
+    return;
+  }
+  const btn = $("adminUnlockBtn");
+  btn.disabled = true;
+  try {
+    const r = await adminFetch("/api/admin/unlock", {
+      method: "POST", body: JSON.stringify({ key }) });
+    if (r.status === 200 && r.data.ok) {
+      hide($("adminUnlockModal"));
+      toast("Admin Panel unlocked — welcome, "
+        + (r.data.holder || "owner") + ".");
+      enterAdmin();
+    } else {
+      err.textContent = (r.data && r.data.error)
+        || "That key doesn't unlock the Admin Panel.";
+      show(err);
+    }
+  } catch (e) {
+    err.textContent = "Couldn't reach the app to check that key.";
+    show(err);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("adminUnlockBtn").addEventListener("click", submitAdminUnlock);
+$("adminUnlockCancelBtn").addEventListener("click",
+  () => hide($("adminUnlockModal")));
+$("adminKeyInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") submitAdminUnlock();
+});
+$("settingsAdminBtn").addEventListener("click", () => {
+  closeModal("settingsModal");
+  openAdmin();
+});
+$("adminRefreshBtn").addEventListener("click", () => refreshAdmin());
+$("adminLockBtn").addEventListener("click", async () => {
+  try {
+    await adminFetch("/api/admin/logout", { method: "POST", body: "{}" });
+  } catch (e) { /* the UI locks either way */ }
+  adminLockedUi("Admin Panel locked.");
+});
+document.querySelectorAll("#adChartSeg button").forEach((b) =>
+  b.addEventListener("click", () => {
+    adminRange = b.dataset.range;
+    document.querySelectorAll("#adChartSeg button").forEach((x) =>
+      x.classList.toggle("seg-on", x === b));
+    renderAdminChart();
+  }));
+
+function initAdmin() { refreshAdmin(); }
+
+function fmtUptime(s) {
+  s = Math.max(0, Math.floor(s || 0));
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600),
+    m = Math.floor((s % 3600) / 60);
+  if (d) return d + "d " + h + "h";
+  if (h) return h + "h " + m + "m";
+  return m + "m";
+}
+
+function fmtWhen(ts) {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleString([], {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function fmtLatency(ms) {
+  if (ms == null) return "—";
+  if (ms >= 1000) return (ms / 1000).toFixed(1) + " s";
+  return Math.round(ms) + " ms";
+}
+
+function statusBadge(status) {
+  const s = String(status || "").toLowerCase();
+  if (["done", "ok", "completed"].includes(s)) return "b-ok";
+  if (["error", "failed"].includes(s)) return "b-bad";
+  if (["running", "working", "queued", "downloading"].includes(s))
+    return "b-info";
+  return "b-warn";
+}
+
+async function refreshAdmin() {
+  let statsRes, logRes;
+  try {
+    [statsRes, logRes] = await Promise.all([
+      adminFetch("/api/admin/stats"),
+      adminFetch("/api/admin/api-log")]);
+  } catch (e) {
+    toast("Couldn't load the Admin Panel data.");
+    return;
+  }
+  if (statsRes.status === 403 || logRes.status === 403) {
+    adminLockedUi("Admin session ended — unlock again to reopen "
+      + "the panel.");
+    return;
+  }
+  adminStatsCache = statsRes.data;
+  renderAdminStats(statsRes.data);
+  renderAdminLog(logRes.data);
+}
+
+function dlRows(pairs) {
+  return pairs.map(([k, v]) =>
+    "<dt>" + escapeHtml(k) + "</dt><dd>" + escapeHtml(String(v))
+    + "</dd>").join("");
+}
+
+function renderAdminStats(d) {
+  const st = d.stats || {}, lic = d.license || {},
+    sys = d.system || {}, store = d.storage || {};
+  $("adStatVideos").textContent = st.videos_processed ?? "–";
+  $("adStatClips").textContent = st.clips_generated ?? "–";
+  $("adStatDownloads").textContent = st.downloads ?? "–";
+  $("adStatDownloadsNote").textContent = st.counters_since
+    ? "(tracked since the Admin Panel was added)" : "";
+  const kinds = st.ai_jobs || {};
+  const aiTotal = Object.values(kinds).reduce((a, b) => a + b, 0);
+  $("adStatAiJobs").textContent = aiTotal;
+  $("adStatFailed").textContent = st.failed_count ?? "–";
+  $("adStatStorage").textContent = fmtBytes(store.work_bytes || 0);
+  $("adStatUptime").textContent = fmtUptime(d.uptime_s);
+  const sinceTxt = st.counters_since
+    ? new Date(st.counters_since * 1000).toLocaleDateString() : "—";
+  $("adminSessionNote").textContent =
+    "Run counters are tracked since " + sinceTxt + ": Built-in AI "
+    + "detections " + (kinds.detect_local || 0) + " · Offline "
+    + "detections " + (kinds.detect_offline || 0) + " · Generator "
+    + (kinds.generator || 0) + " · Enhancer " + (kinds.enhancer || 0)
+    + " · Caption Remover " + (kinds.remover || 0) + ".";
+
+  $("adLicenseList").innerHTML = dlRows([
+    ["License holder", lic.holder || "—"],
+    ["Role", lic.role === "owner" ? "Owner" : "Customer"],
+    ["Key type", lic.key_type || "—"],
+    ["Works on", lic.machine_claim === "ANY"
+      ? "Any PC (universal key)" : "One PC (machine-bound)"],
+    ["This PC's code", lic.machine_code || "—"],
+    ["Expires", !lic.expires ? "—"
+      : (lic.expires === "never" ? "Never" : lic.expires)],
+    ["Activation", lic.unlocked ? "Unlocked" : "Locked"],
+    ["App version", "v" + (lic.app_version || "—")],
+    ["Built-in AI model", lic.model_ready ? "Downloaded ✓"
+      : (lic.model_downloading ? "Downloading…" : "Not downloaded")],
+    ["fal.ai key", lic.fal_key_set ? "Saved ✓" : "Not set"],
+  ]);
+  const ram = (sys.ram_total
+    ? fmtBytes(sys.ram_free || 0) + " free of "
+      + fmtBytes(sys.ram_total) : "—");
+  const disk = (sys.disk_total
+    ? fmtBytes(sys.disk_free || 0) + " free of "
+      + fmtBytes(sys.disk_total) : "—");
+  $("adSystemList").innerHTML = dlRows([
+    ["System", sys.os || "—"],
+    ["CPU cores", sys.cpu_count ?? "—"],
+    ["RAM", ram],
+    ["Disk", disk],
+    ["Projects storage", fmtBytes(store.work_bytes || 0)],
+    ["Projects folder", (store.work_roots || []).join("  ·  ") || "—"],
+    ["AI models storage", fmtBytes(store.models_bytes || 0)],
+    ["Models folder", store.models_dir || "—"],
+    ["App folder size", fmtBytes(store.app_bytes || 0)],
+  ]);
+  renderAdminChart();
+  const tb = $("adActivityBody");
+  const rows = st.activity || [];
+  tb.innerHTML = rows.length ? rows.map((r) =>
+    "<tr><td>" + escapeHtml(fmtWhen(r.ts)) + "</td><td>"
+    + escapeHtml(r.tool || "") + "</td><td>"
+    + escapeHtml(String(r.title || "").slice(0, 60))
+    + (r.error ? "<div class=\"hint\">"
+      + escapeHtml(String(r.error).slice(0, 120)) + "</div>" : "")
+    + "</td><td><span class=\"badge " + statusBadge(r.status)
+    + "\">" + escapeHtml(r.status || "—") + "</span></td></tr>"
+  ).join("") : "<tr><td colspan=\"4\" class=\"hint\">No activity "
+    + "recorded yet.</td></tr>";
+}
+
+function providerCard(name, statusHtml, lines) {
+  return "<div class=\"admin-provider\"><h3>" + escapeHtml(name)
+    + "</h3>" + statusHtml
+    + lines.map((l) => "<p class=\"sub\">" + l + "</p>").join("")
+    + "</div>";
+}
+
+function renderAdminLog(d) {
+  const providers = d.providers || [];
+  const byName = {};
+  providers.forEach((p) => { byName[p.provider] = p; });
+  const totalCalls = providers.reduce((a, p) => a + (p.calls || 0), 0);
+  $("adStatLogCalls").textContent = totalCalls;
+
+  const cards = [];
+  const fal = byName["fal.ai"];
+  const lic = (adminStatsCache && adminStatsCache.license) || {};
+  cards.push(providerCard("fal.ai — AI Video Generator",
+    "<p class=\"sub\">API key: <b>" + (lic.fal_key_set
+      ? "saved on this PC" : "not set") + "</b></p>",
+    fal ? [
+      "Calls logged: <b>" + fal.calls + "</b> · success rate <b>"
+        + (fal.success_rate ?? "—") + "%</b>",
+      "Avg response: <b>" + fmtLatency(fal.avg_latency_ms) + "</b>"
+        + " · last call " + fmtWhen(fal.last_ts) + " ("
+        + escapeHtml(fal.last_status || "—") + ")",
+      fal.last_error ? "Last error: "
+        + escapeHtml(String(fal.last_error).slice(0, 140)) : "",
+      "Credits: <b>" + (fal.credits_reported
+        ? "reported by provider" : "not reported by provider")
+        + "</b>",
+    ].filter(Boolean) : ["No fal.ai calls logged yet."]));
+  const local = byName["Built-in AI (local)"];
+  cards.push(providerCard("Built-in AI (local model)",
+    "<p class=\"sub\">Model: <b>" + (lic.model_ready
+      ? "downloaded and ready" : "not downloaded") + "</b> · runs "
+      + "fully offline on this PC</p>",
+    local ? [
+      "Calls logged: <b>" + local.calls + "</b> · success rate <b>"
+        + (local.success_rate ?? "—") + "%</b>",
+      "Avg response: <b>" + fmtLatency(local.avg_latency_ms) + "</b>"
+        + " · last call " + fmtWhen(local.last_ts),
+      local.last_error ? "Last error: "
+        + escapeHtml(String(local.last_error).slice(0, 140)) : "",
+      "Credits: <b>none — local compute</b>",
+    ].filter(Boolean) : ["No Built-in AI calls logged yet."]));
+  $("adProviders").innerHTML = cards.join("");
+
+  const entries = d.entries || [];
+  $("adApiLogBody").innerHTML = entries.length ? entries.map((e) =>
+    "<tr><td>" + escapeHtml(fmtWhen(e.ts)) + "</td><td>"
+    + escapeHtml(e.provider || "") + "</td><td>"
+    + escapeHtml(e.model || "") + (e.kind
+      ? " <span class=\"hint\">(" + escapeHtml(e.kind) + ")</span>"
+      : "")
+    + "</td><td><span class=\"badge " + statusBadge(e.status)
+    + "\">" + escapeHtml(e.status || "—") + "</span></td><td>"
+    + escapeHtml(fmtLatency(e.latency_ms)) + "</td><td>"
+    + (e.credits == null ? "not reported"
+      : escapeHtml(String(e.credits)))
+    + "</td></tr>").join("")
+    : "<tr><td colspan=\"6\" class=\"hint\">No API calls logged "
+      + "yet — use the Generator or the Built-in AI and they'll "
+      + "appear here.</td></tr>";
+
+  const fails = d.failures || [];
+  $("adApiFailures").innerHTML = fails.length ? fails.map((e) =>
+    "<div class=\"admin-fail\"><b>" + escapeHtml(e.provider || "")
+    + "</b> · " + escapeHtml(e.model || "")
+    + "<span class=\"hint\">" + escapeHtml(fmtWhen(e.ts)) + " — "
+    + escapeHtml(String(e.error || "unknown error").slice(0, 200))
+    + "</span></div>").join("")
+    : "<p class=\"hint\">No failed API requests logged. 🎉</p>";
+}
+
+function renderAdminChart() {
+  const host = $("adChart");
+  if (!host || !adminStatsCache) return;
+  const series = (adminStatsCache.stats || {}).series || {};
+  const pts = series[adminRange] || [];
+  const notes = { daily: "Last 30 days", weekly: "Last 12 weeks",
+    monthly: "Last 12 months" };
+  $("adChartNote").textContent = notes[adminRange] || "";
+  const W = 660, H = 216, padL = 30, padB = 24, padT = 16;
+  const plotW = W - padL - 8, plotH = H - padB - padT;
+  const max = Math.max(1, ...pts.map((p) =>
+    Math.max(p.videos || 0, p.clips || 0)));
+  let svg = "<svg viewBox=\"0 0 " + W + " " + H + "\" role=\"img\">";
+  for (let i = 0; i <= 3; i++) {
+    const y = padT + plotH - (plotH * i / 3);
+    const v = Math.round(max * i / 3);
+    svg += "<line class=\"admin-chart-grid\" x1=\"" + padL
+      + "\" y1=\"" + y + "\" x2=\"" + (padL + plotW) + "\" y2=\"" + y
+      + "\"/><text class=\"admin-chart-axis\" x=\"" + (padL - 5)
+      + "\" y=\"" + (y + 3) + "\" text-anchor=\"end\">" + v
+      + "</text>";
+  }
+  const groupW = pts.length ? plotW / pts.length : plotW;
+  const barW = Math.max(2, Math.min(15, groupW / 2 - 2));
+  pts.forEach((p, i) => {
+    const cx = padL + groupW * i + groupW / 2;
+    const vh = plotH * (p.videos || 0) / max;
+    const ch = plotH * (p.clips || 0) / max;
+    const base = padT + plotH;
+    svg += "<rect class=\"admin-bar-videos\" x=\"" + (cx - barW - 1)
+      + "\" y=\"" + (base - vh) + "\" width=\"" + barW
+      + "\" height=\"" + vh + "\" rx=\"2\"><title>"
+      + escapeHtml(p.label) + " — " + (p.videos || 0)
+      + " videos</title></rect>";
+    svg += "<rect class=\"admin-bar-clips\" x=\"" + (cx + 1)
+      + "\" y=\"" + (base - ch) + "\" width=\"" + barW
+      + "\" height=\"" + ch + "\" rx=\"2\"><title>"
+      + escapeHtml(p.label) + " — " + (p.clips || 0)
+      + " clips</title></rect>";
+    const top = Math.max(p.videos || 0, p.clips || 0);
+    if (top > 0) {
+      svg += "<text class=\"admin-chart-val\" x=\"" + cx
+        + "\" y=\"" + (base - Math.max(vh, ch) - 4)
+        + "\" text-anchor=\"middle\">" + top + "</text>";
+    }
+    const every = pts.length > 14 ? 5 : (pts.length > 7 ? 2 : 1);
+    if (i % every === 0 || i === pts.length - 1) {
+      let lbl = String(p.label || "");
+      if (adminRange === "daily" || adminRange === "weekly")
+        lbl = lbl.slice(5);
+      else lbl = lbl.slice(2);
+      svg += "<text class=\"admin-chart-axis\" x=\"" + cx
+        + "\" y=\"" + (H - 8) + "\" text-anchor=\"middle\">"
+        + escapeHtml(lbl) + "</text>";
+    }
+  });
+  svg += "</svg>";
+  host.innerHTML = svg;
+}
+
 /* ---------------- modals: Esc + backdrop click ---------------- */
 function closeModal(id) {
   if (id === "previewModal") {
@@ -4025,12 +4528,12 @@ function closeModal(id) {
   }
   hide($(id));
 }
-["captionModal", "previewModal", "settingsModal", "uninstallModal"].forEach((id) => {
+["captionModal", "previewModal", "settingsModal", "uninstallModal", "adminUnlockModal"].forEach((id) => {
   $(id).addEventListener("click", (e) => { if (e.target.id === id) closeModal(id); });
 });
 window.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  ["captionModal", "previewModal", "settingsModal", "uninstallModal"].forEach((id) => {
+  ["captionModal", "previewModal", "settingsModal", "uninstallModal", "adminUnlockModal"].forEach((id) => {
     if (!$(id).classList.contains("hidden")) closeModal(id);
   });
 });
@@ -4047,6 +4550,8 @@ window.addEventListener("DOMContentLoaded", async () => {
       sel.appendChild(o);
     });
     if (opts.genre_defaults) genreDefaults = opts.genre_defaults;
+    if (opts.translate_langs && opts.translate_langs.length)
+      translateLangs = opts.translate_langs.map((l) => [l.key, l.label]);
     settings = await api.get_settings();
     sel.value = settings.language || "auto";
     $("cookiesCheck").checked = !!settings.use_cookies;
@@ -4054,6 +4559,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   applyTheme();
   updateBackBtn();
   syncSidebar("hub");
+  checkAdminSession();
   refreshLocalAiStatus();
   refreshHomeRecents();
   startLocalAiPolling();

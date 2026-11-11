@@ -36,11 +36,14 @@ from pipeline import (  # noqa: E402
     remove_captions, detect_caption_band,
     preview_caption_removal,
     generate_titles, generate_script, enhance_video,
-    generate_hooks, find_hook_moment,
+    generate_hooks, find_hook_moment, rank_hook_candidates,
+    translate_captions as pipeline_translate_captions,
+    TRANSLATE_LANGS, CATEGORIES, category_info,
     LANGUAGES, GENRES, RATIOS,
 )
 
 import local_ai  # noqa: E402  (built-in local LLM: engine/model/server)
+import admin  # noqa: E402  (Owner Admin Panel: sessions/log/stats)
 import ai_components  # noqa: E402  (AI Installation Manager backend)
 import licensing  # noqa: E402  (signed license + core pack + integrity)
 import updater  # noqa: E402  (signed file-replacement update packs)
@@ -64,6 +67,9 @@ SETTINGS_PATH = os.path.join(os.path.expanduser("~"),
 # release changes compiled code. Update packs carry their own
 # version for the apply-result line.
 APP_VERSION = "2.0"
+
+# Process start, for the Admin Panel's uptime figure.
+_APP_START_TS = time.time()
 
 # Job pruning: long desktop sessions must not grow JOBS forever.
 JOB_TTL_S = 6 * 3600   # drop non-working jobs older than 6h
@@ -170,7 +176,7 @@ def _save_job(job_id):
         data = {k: job.get(k) for k in (
             "title", "source", "video_path", "duration", "words",
             "moments", "renders", "status", "stage", "language",
-            "created")}
+            "category", "created")}
         folder = _job_folder(job_id)
         os.makedirs(folder, exist_ok=True)
         tmp = os.path.join(folder, "job.json.tmp")
@@ -230,6 +236,7 @@ def _load_library():
             "duration": data.get("duration", 0),
             "words": words, "moments": moments, "renders": renders,
             "language": data.get("language", "auto"),
+            "category": data.get("category", ""),
             "source": data.get("source", "url"),
             "created": data.get("created", 0) or os.path.getmtime(meta)}
 
@@ -243,6 +250,12 @@ DEFAULT_SETTINGS = {
     "quality": "1080p",
     "language": "auto",
     "genre": "",
+    "category": "general",         # Phase 1: content-category mode
+                                   # (general/bodycam/podcast/interview/
+                                   # gaming/education/news) - tunes
+                                   # detection weights + subscores
+    "audio_polish": False,         # Phase 1: loudnorm to -14 LUFS
+    "denoise_audio": False,        # Phase 1: gentle afftdn with polish
     "emojis": False,
     "highlight": False,
     "remove_silences": False,
@@ -972,13 +985,31 @@ def _gen_public(st):
             "imported_job_id": st.get("imported_job_id")}
 
 
+def _admin_log_gen(st):
+    """Log a generation's terminal transition in the Admin Panel's
+    API log. gen_video_status returns early for done/error jobs, so
+    each flip is reached exactly once. Latency is the total
+    queue-to-finish time."""
+    admin.log_api_call(
+        "fal.ai",
+        st.get("endpoint") or st.get("model_name") or "",
+        "ok" if st.get("status") == "done" else "error",
+        (time.time() - (st.get("created") or time.time())) * 1000.0,
+        error=st.get("error"), kind="generation")
+
+
 class Api:
     # -- options -------------------------------------------------------
     def get_options(self):
         """Static option lists for the UI (languages, genres, ratios)."""
         return {"languages": LANGUAGES,
                 "genre_defaults": GENRES,
-                "ratios": list(RATIOS.keys())}
+                "ratios": list(RATIOS.keys()),
+                "categories": [{"key": k, "label": v["label"]}
+                               for k, v in CATEGORIES.items()],
+                "translate_langs": [{"key": k, "label": v}
+                                    for k, v in
+                                    TRANSLATE_LANGS.items()]}
 
     def caption_presets(self):
         """Caption Studio data: preset bundles + font/size lists."""
@@ -1460,8 +1491,44 @@ class Api:
             n = 8
         return max(1, min(40, n))  # hard cap 40
 
+    # -- content category + audio profile (Phase 1) ------------------
+    def _detect_category(self, job, category=None):
+        """Resolve the content category for a detect run: explicit
+        per-call value, else the project's stored one, else the
+        Settings default. The winner is stored on the job, so a
+        project remembers its category across re-detects."""
+        settings = load_settings()
+        key, _info = category_info(
+            category or job.get("category")
+            or settings.get("category", "general"))
+        job["category"] = key
+        return key
+
+    def _audio_profile(self, job):
+        """Cached audio energy profile of the job's video (feeds the
+        subscores' voice-arousal term). Best-effort: None when the
+        audio can't be profiled - subscores then drop the term."""
+        vp = job.get("video_path") or ""
+        try:
+            sig = (vp, os.path.getmtime(vp)) if vp else None
+        except OSError:
+            sig = None
+        if job.get("_audio_profile_sig") == sig \
+                and "_audio_profile" in job:
+            return job["_audio_profile"]
+        prof = None
+        if vp and os.path.isfile(vp):
+            try:
+                prof = _pipeline.audio_energy_profile(vp)
+            except Exception:  # noqa: BLE001
+                prof = None
+        job["_audio_profile"] = prof
+        job["_audio_profile_sig"] = sig
+        return prof
+
     # -- offline moment detection (heuristic, no model) ---------------------------
-    def detect_offline(self, job_id, max_clips=8, clip_len="60s"):
+    def detect_offline(self, job_id, max_clips=8, clip_len="60s",
+                       category=None):
         gate = _license_gate()
         if gate:
             return gate
@@ -1475,22 +1542,27 @@ class Api:
         clip_min, clip_max = self._clip_len_range(clip_len)
         job["status"] = "working"
         job.pop("detect_error", None)  # don't ship a stale failure
+        admin.bump_counter("detect_offline")
         t = threading.Thread(
             target=self._run_detect_offline,
             args=(job_id, clip_min, clip_max,
-                  self._clip_count(max_clips)),
+                  self._clip_count(max_clips),
+                  self._detect_category(job, category),
+                  self._audio_profile(job)),
             daemon=True)
         t.start()
         return {"ok": True}
 
-    def _run_detect_offline(self, job_id, clip_min, clip_max, max_clips):
+    def _run_detect_offline(self, job_id, clip_min, clip_max, max_clips,
+                            category="general", audio_profile=None):
         job = JOBS[job_id]
         try:
             _job_log(job_id, "Detection started (Offline)")
             job["stage"] = "Scanning transcript (offline)"
             job["progress"] = 40
             moments = detect_moments_offline(
-                job["words"], clip_min, clip_max, max_clips=max_clips)
+                job["words"], clip_min, clip_max, max_clips=max_clips,
+                category=category, audio_profile=audio_profile)
             if not moments:
                 raise RuntimeError("no_moments")
             # keep keyword-search ("matched") moments a concurrent
@@ -1520,7 +1592,8 @@ class Api:
             _job_log(job_id, "ERROR: " + job.get("detect_error", ""))
 
     # -- built-in AI moment detection (local LLM) ------------
-    def detect_local(self, job_id, max_clips=8, clip_len="60s"):
+    def detect_local(self, job_id, max_clips=8, clip_len="60s",
+                     category=None):
         gate = _license_gate()
         if gate:
             return gate
@@ -1537,21 +1610,26 @@ class Api:
         clip_min, clip_max = self._clip_len_range(clip_len)
         job["status"] = "working"
         job.pop("detect_error", None)  # don't ship a stale failure
+        admin.bump_counter("detect_local")
         t = threading.Thread(
             target=self._run_detect_local,
             args=(job_id, clip_min, clip_max,
-                  self._clip_count(max_clips)),
+                  self._clip_count(max_clips),
+                  self._detect_category(job, category),
+                  self._audio_profile(job)),
             daemon=True)
         t.start()
         return {"ok": True}
 
-    def _run_detect_local(self, job_id, clip_min, clip_max, max_clips):
+    def _run_detect_local(self, job_id, clip_min, clip_max, max_clips,
+                          category="general", audio_profile=None):
         job = JOBS[job_id]
         try:
             _job_log(job_id, "Detection started (Built-in AI)")
             moments = detect_moments_local(
                 job["words"], clip_min, clip_max,
-                max_clips=max_clips, progress_cb=_job_progress(job_id))
+                max_clips=max_clips, progress_cb=_job_progress(job_id),
+                category=category, audio_profile=audio_profile)
             if not moments:
                 raise RuntimeError("no_moments")
             # keep keyword-search ("matched") moments a concurrent
@@ -1736,7 +1814,11 @@ class Api:
         rid = uuid.uuid4().hex[:12]
         _REMOVER_JOBS[rid] = {"id": rid, "status": "running", "pct": 0,
                               "stage": "Starting", "error": None,
-                              "url": None, "mode": mode, "log": []}
+                              "url": None, "mode": mode, "log": [],
+                              "created": time.time(),
+                              "source_name": (source if is_url else
+                                              os.path.basename(source))}
+        admin.bump_counter("remover")
         job_region = ({"auto": True} if auto
                       else {"top_pct": top, "bottom_pct": bot})
         t = threading.Thread(target=self._run_remover,
@@ -2228,6 +2310,9 @@ class Api:
                       "virality": moment["score"]}]
         out = {"ok": True, "hooks": res["hooks"], "mode": res["mode"],
                "note": res["note"], "moment": moment, "clips": clips,
+               "candidates": rank_hook_candidates(
+                   words, job.get("moments") or None,
+                   job.get("duration", 0)),
                "duration": job.get("duration", 0),
                "title": job.get("title", "")}
         job["_hook_cache"] = {"n_words": len(words),
@@ -2471,6 +2556,160 @@ class Api:
             self._hook_end(job, False, "Hook + clip failed")
         _save_job(job_id)
 
+    def _teaser_clip_render(self, job_id, job, moment, clip_index):
+        """Render index of the teaser's main clip: an existing
+        straight render of the moment when there is one, else a
+        fresh render with no hook overlay of its own (the cold open
+        carries the hook). Mirrors the hook+clip reuse rule."""
+        if clip_index >= 0:
+            for i, r in enumerate(job.get("renders", [])):
+                if r.get("moment_index") == clip_index \
+                        and not r.get("hook_clip") \
+                        and not r.get("merged") \
+                        and not r.get("teaser") \
+                        and os.path.isfile(r.get("path", "")):
+                    return i
+        outdir = os.path.join(_job_folder(job_id), "clips")
+        os.makedirs(outdir, exist_ok=True)
+        out = self._hook_out_path(job, outdir, "teaserclip")
+        cm = dict(moment)
+        cm["hook"] = ""
+        self._call_render_clip(job_id, job, cm, out, self._hook_opts())
+        job["renders"].append({
+            "path": out, "title": moment.get("title", "Clip"),
+            "virality": int(moment.get("virality", 0) or 0),
+            "moment_index": clip_index,
+            "url": self._download_url(job_id, out)})
+        _job_log(job_id, "Render finished - " + os.path.basename(out))
+        return len(job["renders"]) - 1
+
+    def hook_teaser(self, job_id, hook_text, hook_start, hook_end,
+                    clip_index=-1, clip_start=None, clip_end=None,
+                    clip_title=""):
+        """Teaser render (Hook v2): the chosen hook moment plays
+        FIRST as a cold open, then the picked clip plays in full in
+        its original order (the proven hook+clip stitch machinery -
+        caption offsets across the seam are the merge's own).
+
+        Honest dedupe: when the hook window sits at the picked
+        clip's own opening, the clip is rendered once as-is (with
+        the hook text as its overlay) instead of duplicating its
+        first seconds, and the render record says so."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        _load_library()
+        job = JOBS.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Project not found."}
+        hook_text = (hook_text or "").strip()
+        if not hook_text:
+            return {"ok": False,
+                    "error": "Pick a hook moment first."}
+        win = self._hook_window(job, hook_start, hook_end)
+        if not win:
+            return {"ok": False,
+                    "error": "That hook window doesn't fit the video "
+                             "(needs 1-15s inside it)."}
+        try:
+            clip_index = int(clip_index)
+        except (TypeError, ValueError):
+            clip_index = -1
+        moment = None
+        if 0 <= clip_index < len(job.get("moments") or []):
+            moment = job["moments"][clip_index]
+        elif clip_start is not None:
+            try:
+                cs, ce = float(clip_start), float(clip_end)
+            except (TypeError, ValueError):
+                cs, ce = -1.0, -1.0
+            dur = float(job.get("duration") or 0)
+            if 0 <= cs < ce <= dur and ce - cs >= 1.0:
+                moment = {"start": round(cs, 2),
+                          "end": round(ce, 2),
+                          "title": clip_title or "Clip",
+                          "hook": "", "virality": 0}
+        if moment is None:
+            return {"ok": False,
+                    "error": "Pick the clip the teaser should open "
+                             "into."}
+        job, lock, err = self._hook_begin(job_id, "Rendering teaser")
+        if err:
+            return err
+        t = threading.Thread(
+            target=self._run_hook_teaser,
+            args=(job_id, hook_text[:90], win, moment, clip_index),
+            daemon=True)
+        t.start()
+        return {"ok": True}
+
+    def _run_hook_teaser(self, job_id, hook_text, win, moment,
+                         clip_index):
+        job = JOBS[job_id]
+        hs, he = win
+        ms, me = float(moment["start"]), float(moment["end"])
+        hook_len = max(he - hs, 0.1)
+        inter = max(0.0, min(he, me) - max(hs, ms))
+        at_opening = (hs >= ms - 0.5
+                      and hs <= ms + 0.25 * max(me - ms, 0.1))
+        try:
+            if at_opening and inter >= 0.5 * hook_len:
+                # The hook IS this clip's opening: one clean render
+                # of the clip with the hook text overlaid - no
+                # duplicated seconds.
+                outdir = os.path.join(_job_folder(job_id), "clips")
+                os.makedirs(outdir, exist_ok=True)
+                out = self._hook_out_path(job, outdir, "teaser")
+                cm = dict(moment)
+                cm["hook"] = hook_text
+                self._call_render_clip(job_id, job, cm, out,
+                                       self._hook_opts())
+                rebased = [
+                    {"start": round(max(0.0, w["start"] - ms), 3),
+                     "end": round(max(0.0, w["end"] - ms), 3),
+                     "word": w["word"]}
+                    for w in job["words"]
+                    if w["end"] > ms and w["start"] < me]
+                job.setdefault("renders", []).append({
+                    "path": out, "title": "Teaser",
+                    "virality": int(moment.get("virality", 0) or 0),
+                    "moment_index": clip_index,
+                    "words": rebased,
+                    "merged_duration": round(me - ms, 2),
+                    "teaser": True,
+                    "teaser_note": "The hook is this clip's own "
+                                   "opening, so the clip was "
+                                   "rendered as-is with the hook "
+                                   "text overlaid.",
+                    "url": self._download_url(job_id, out)})
+                _job_log(job_id, "Render finished - "
+                         + os.path.basename(out))
+                self._hook_end(job, True, "Teaser ready")
+                _save_job(job_id)
+                return
+            ih = self._render_hook_file(
+                job_id, job, hook_text, hs, he,
+                int(moment.get("virality", 0) or 0) or 90)
+            job["stage"] = "Rendering teaser"
+            ic = self._teaser_clip_render(job_id, job, moment,
+                                          clip_index)
+            merged = self.merge_selected(job_id, [ih, ic],
+                                         transition="cut")
+            if not merged.get("ok"):
+                raise RuntimeError(merged.get("error")
+                                   or "merge failed")
+            job["renders"][-1]["title"] = "Teaser"
+            job["renders"][-1]["teaser"] = True
+            job["renders"][-1]["teaser_note"] = (
+                f"Cold open {hs:.1f}-{he:.1f}s, then the full clip "
+                "in its original order.")
+            self._hook_end(job, True, "Teaser ready")
+        except Exception as e:  # noqa: BLE001
+            job["render_error"] = "Teaser failed: " + str(e)[:220]
+            _job_log(job_id, "ERROR: " + job["render_error"])
+            self._hook_end(job, False, "Teaser failed")
+        _save_job(job_id)
+
     # -- Studio: Transcript tool ------------------------------------------
     def get_transcript(self, job_id):
         """A project's full transcript: plain text + timed segments."""
@@ -2571,6 +2810,7 @@ class Api:
             return {"ok": False, "error": "Unknown model."}
         payload = _fal_payload(model, prompt, aspect_ratio, duration,
                                resolution)
+        t0 = time.time()
         try:
             r = requests.post(
                 "https://queue.fal.run/" + model["endpoint"],
@@ -2578,23 +2818,37 @@ class Api:
                          "Content-Type": "application/json"},
                 json=payload, timeout=60)
         except requests.RequestException as e:
-            return {"ok": False, "error": "Couldn't reach fal.ai: "
-                                          + str(e)[:160]}
+            err = "Couldn't reach fal.ai: " + str(e)[:160]
+            admin.log_api_call("fal.ai", model["endpoint"], "error",
+                               (time.time() - t0) * 1000.0,
+                               error=err, kind="submit")
+            return {"ok": False, "error": err}
         if r.status_code >= 400:
+            err = "fal.ai said: " + _fal_error_text(r)
+            admin.log_api_call("fal.ai", model["endpoint"], "error",
+                               (time.time() - t0) * 1000.0,
+                               error=err, kind="submit")
             return {"ok": False, "error": "fal_error",
-                    "message": "fal.ai said: " + _fal_error_text(r)}
+                    "message": err}
         try:
             data = r.json()
             request_id = data["request_id"]
             status_url = data["status_url"]
             response_url = data["response_url"]
         except (ValueError, KeyError):
-            return {"ok": False,
-                    "error": "fal.ai returned an unexpected reply."}
+            err = "fal.ai returned an unexpected reply."
+            admin.log_api_call("fal.ai", model["endpoint"], "error",
+                               (time.time() - t0) * 1000.0,
+                               error=err, kind="submit")
+            return {"ok": False, "error": err}
+        admin.log_api_call("fal.ai", model["endpoint"], "ok",
+                           (time.time() - t0) * 1000.0, kind="submit")
+        admin.bump_counter("generator")
         gid = uuid.uuid4().hex[:12]
         _GEN_JOBS[gid] = {
             "id": gid, "status": "queued", "stage": "In queue on fal.ai",
             "model_id": model["id"], "model_name": model["name"],
+            "endpoint": model["endpoint"],
             "kind": model["kind"], "prompt": prompt[:200],
             "status_url": status_url, "response_url": response_url,
             "created": time.time(), "url": None, "remote_url": None,
@@ -2614,6 +2868,7 @@ class Api:
         if time.time() - st["created"] > 1800:
             st["status"] = "error"
             st["error"] = "Timed out waiting for fal.ai (30 min)."
+            _admin_log_gen(st)
             return {"ok": True, **_gen_public(st)}
         settings = load_settings()
         key = (settings.get("fal_key") or "").strip()
@@ -2641,6 +2896,7 @@ class Api:
             st["status"] = "error"
             st["error"] = ("fal.ai reported status: "
                            + (status or "unknown"))
+            _admin_log_gen(st)
             return {"ok": True, **_gen_public(st)}
         # Completed: fetch the result payload.
         try:
@@ -2649,11 +2905,13 @@ class Api:
             if r.status_code >= 400:
                 st["status"] = "error"
                 st["error"] = "fal.ai said: " + _fal_error_text(r)
+                _admin_log_gen(st)
                 return {"ok": True, **_gen_public(st)}
             payload = r.json()
         except (requests.RequestException, ValueError) as e:
             st["status"] = "error"
             st["error"] = "Couldn't fetch the result: " + str(e)[:160]
+            _admin_log_gen(st)
             return {"ok": True, **_gen_public(st)}
         remote = None
         if isinstance(payload.get("video"), dict):
@@ -2665,6 +2923,7 @@ class Api:
         if not remote:
             st["status"] = "error"
             st["error"] = "fal.ai finished but returned no file."
+            _admin_log_gen(st)
             return {"ok": True, **_gen_public(st)}
         st["remote_url"] = remote
         # Download locally so the file survives + can enter the Library.
@@ -2689,6 +2948,7 @@ class Api:
             st["url"] = remote  # preview straight from fal.ai instead
         st["status"] = "done"
         st["stage"] = "Done"
+        _admin_log_gen(st)
         return {"ok": True, **_gen_public(st)}
 
     def gen_video_import(self, gen_id):
@@ -2736,8 +2996,9 @@ class Api:
         eid = uuid.uuid4().hex[:12]
         _ENHANCE_JOBS[eid] = {"id": eid, "status": "running", "pct": 0,
                               "stage": "Starting", "error": None,
-                              "url": None, "source_name":
-                              os.path.basename(path)}
+                              "url": None, "created": time.time(),
+                              "source_name": os.path.basename(path)}
+        admin.bump_counter("enhancer")
         t = threading.Thread(target=self._run_enhance,
                              args=(eid, path), daemon=True)
         t.start()
@@ -3223,7 +3484,8 @@ class Api:
             queries = [queries]
         clip_min, clip_max = self._clip_len_range(clip_len)
         moments, unmatched = find_moments_by_keywords(
-            job["words"], queries, clip_min, clip_max, max_clips=40)
+            job["words"], queries, clip_min, clip_max, max_clips=40,
+            category=self._detect_category(job))
         # dedupe: don't append the same query hit twice
         seen = {(round(m.get("start", 0), 2), round(m.get("end", 0), 2),
                  m.get("matched")) for m in job.get("moments", [])}
@@ -3241,6 +3503,23 @@ class Api:
         return {"ok": True, "found": len(fresh), "unmatched": unmatched}
 
     # -- render ----------------------------------------------------------
+    @staticmethod
+    def _reframe_note(ratio, src_w, src_h, face_track):
+        """How a render's frame was produced from the source - the
+        honest label stored on the render record."""
+        if not src_w or not src_h:
+            return ""
+        targets = {"9:16": 9 / 16, "16:9": 16 / 9, "1:1": 1.0,
+                   "4:5": 4 / 5}
+        t = targets.get(ratio)
+        if t and abs(src_w / src_h - t) < 0.03:
+            return f"Full frame (source already {ratio})"
+        if face_track:
+            return "Face-tracked crop"
+        if ratio in ("16:9", "1:1"):
+            return "Smart crop (face-aware)"
+        return "Centre crop"
+
     def _render_opts(self, options=None):
         """Assemble render options: per-call values layered over the
         Settings defaults (shared by Clip Maker and Hook Maker)."""
@@ -3252,7 +3531,8 @@ class Api:
                     "emojis", "highlight", "speaker_colors", "hook_overlay",
                     "cta_overlay", "cta_text", "safe_zone", "punch_zoom",
                     "emphasis_zoom", "emphasis_level", "broll",
-                    "enhance_clarity", "logo_path", "quality_tier"):
+                    "enhance_clarity", "logo_path", "quality_tier",
+                    "audio_polish", "denoise_audio"):
             opts.setdefault(key, settings.get(key))
         opts.setdefault("caption_style", "bold-pop")
         opts.setdefault("ratio", "9:16")
@@ -3309,7 +3589,8 @@ class Api:
                                     "hook_overlay", "cta_text", "safe_zone",
                                     "punch_zoom", "enhance_clarity",
                                     "emphasis_zoom", "emphasis_level",
-                                    "broll",
+                                    "broll", "audio_polish",
+                                    "denoise_audio",
                                     "logo_path", "quality_tier")}
         job["status"] = "working"
         job.pop("render_error", None)  # don't ship a stale failure
@@ -3358,6 +3639,8 @@ class Api:
                     emphasis_level=opts.get("emphasis_level",
                                             "gentle"),
                     broll=bool(opts.get("broll")),
+                    audio_polish=bool(opts.get("audio_polish")),
+                    denoise_audio=bool(opts.get("denoise_audio")),
                     enhance_clarity=bool(
                         opts.get("enhance_clarity")),
                     logo_path=opts.get("logo_path"),
@@ -3403,6 +3686,20 @@ class Api:
                        "virality": m["virality"],
                        "moment_index": i,
                        "url": self._download_url(job_id, out)}
+                # Phase 1: aspect + how the frame was reframed +
+                # whether the audio was polished - labelled on the
+                # record so the UI (and exports) can say it plainly.
+                _ratio = opts.get("ratio", "9:16")
+                _rd["aspect"] = _ratio
+                _rd["audio_polish"] = bool(opts.get("audio_polish"))
+                try:
+                    _sw, _sh, _sf = probe_video(job["video_path"])
+                except Exception:  # noqa: BLE001
+                    _sw = _sh = 0
+                _rd["reframe"] = self._reframe_note(
+                    _ratio, _sw, _sh, bool(opts.get("face_track", True)))
+                if m.get("platform"):
+                    _rd["platform"] = m["platform"]["name"]
                 if eff_params:
                     _rd["caption_params"] = eff_params
                     m["caption_params"] = eff_params
@@ -3494,6 +3791,79 @@ class Api:
             return {"ok": False, "error": "VTT failed: " + str(e)[:160]}
         return {"ok": True, "path": vtt_path,
                 "url": self._download_url(job_id, vtt_path)}
+
+    # -- caption translation (Phase 1) --------------------------------
+    def translate_captions(self, job_id, render_idx, lang):
+        """Translate one rendered clip's captions with the Built-in
+        AI into <clip>_<lang>.srt + .vtt, cue count and timings
+        preserved exactly. Honest needs-AI state when no model is
+        downloaded - never a fabricated translation."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        job = JOBS.get(job_id)
+        try:
+            render_idx = int(render_idx)
+        except (TypeError, ValueError):
+            render_idx = -1
+        if not job or not (0 <= render_idx
+                            < len(job.get("renders", []))):
+            return {"ok": False, "error": "Clip not found."}
+        lang = str(lang or "").strip().lower()
+        if lang not in TRANSLATE_LANGS:
+            return {"ok": False,
+                    "error": "Pick a supported language."}
+        if not local_ai.model_ready():
+            return {"ok": False, "error": "needs_ai",
+                    "message": _pipeline.TRANSLATE_NEEDS_AI}
+        if (job.get("translate") or {}).get("busy"):
+            return {"ok": False,
+                    "error": "A translation is already running "
+                             "for this project."}
+        job["translate"] = {"busy": True, "lang": lang,
+                            "render_idx": render_idx, "error": ""}
+        t = threading.Thread(target=self._run_translate,
+                             args=(job_id, render_idx, lang),
+                             daemon=True)
+        t.start()
+        return {"ok": True}
+
+    def _run_translate(self, job_id, render_idx, lang):
+        job = JOBS[job_id]
+        try:
+            r, m, words = self._render_words(job, render_idx)
+
+            def _cb(pct, stage):
+                job["translate"] = {"busy": True, "lang": lang,
+                                    "render_idx": render_idx,
+                                    "error": "",
+                                    "progress": pct,
+                                    "stage": stage}
+
+            cues = pipeline_translate_captions(
+                words, m["start"], m["end"], lang, progress_cb=_cb)
+            base = os.path.splitext(r["path"])[0] + "_" + lang
+            srt_path = base + ".srt"
+            vtt_path = base + ".vtt"
+            _pipeline.write_srt_cues(cues, srt_path)
+            _pipeline.write_vtt_cues(cues, vtt_path)
+            r.setdefault("translations", {})[lang] = {
+                "srt": self._download_url(job_id, srt_path),
+                "vtt": self._download_url(job_id, vtt_path),
+                "lines": len(cues)}
+            job["translate"] = {"busy": False, "lang": lang,
+                                "render_idx": render_idx,
+                                "error": "", "done": True}
+            _job_log(job_id, "Captions translated ("
+                     + TRANSLATE_LANGS[lang] + ") - "
+                     + os.path.basename(srt_path))
+        except Exception as e:  # noqa: BLE001
+            job["translate"] = {"busy": False, "lang": lang,
+                                "render_idx": render_idx,
+                                "error": str(e)[:220]}
+            _job_log(job_id, "ERROR: caption translation failed: "
+                     + str(e)[:200])
+        _save_job(job_id)
 
     def export_xml(self, job_id):
         """Premiere/DaVinci XML timeline of all rendered clips."""
@@ -3857,6 +4227,8 @@ class Api:
             "word_count": len(job["words"]),
             "moments": job["moments"],
             "renders": job["renders"],
+            "category": job.get("category", ""),
+            "translate": job.get("translate") or {},
             "log": job.get("log", []),
         }
 
@@ -3996,6 +4368,139 @@ _CLOSE_GUARD_SNIPPET = b"""
 """
 
 
+# ---------------------------------------------------------------------------
+# Owner Admin Panel: session extraction + dashboard payload
+# ---------------------------------------------------------------------------
+
+_ADMIN_COOKIE = "itraji_admin"
+
+
+def _admin_token_from(environ):
+    """The admin session token from the HttpOnly cookie, or the
+    X-Admin-Token header (non-browser clients)."""
+    hdr = environ.get("HTTP_X_ADMIN_TOKEN")
+    if hdr:
+        return hdr.strip()
+    cookie = environ.get("HTTP_COOKIE") or ""
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part.startswith(_ADMIN_COOKIE + "="):
+            return part[len(_ADMIN_COOKIE) + 1:].strip()
+    return ""
+
+
+def _admin_stats_payload():
+    """Assemble the dashboard payload from this installation's own
+    records only (see admin.py's docstring for the honesty rules).
+
+    Source of every number:
+    - videos/clips/series/activity for Clip Maker: job.json files
+      across both work roots (incl. a custom data_dir root).
+    - generator/enhancer/remover activity + failures, and clip-job
+      failures: the in-memory session job dicts (errors are
+      session-only by design and are labeled as such in the UI).
+    - downloads + per-tool run counts: admin counters, bumped at
+      the real call sites, existing only since this build.
+    - storage: capped byte walks of the work roots, the models
+      data area and the app folder.
+    - license/device: the live license state + this PC's machine
+      code; server/uptime: process start time."""
+    _load_library()
+    disk_jobs = admin.collect_disk_jobs(_work_roots())
+    disk_ids = {j.get("_job_id") for j in disk_jobs}
+    session_rows, failed = [], []
+
+    def fail_row(ts, tool, title, error):
+        failed.append({"ts": ts or 0, "tool": tool,
+                       "title": title or tool,
+                       "error": str(error or "")[:300]})
+
+    for jid, j in list(JOBS.items()):
+        err = j.get("error") or j.get("detect_error") or ""
+        if jid not in disk_ids:
+            session_rows.append({
+                "ts": j.get("created") or 0, "tool": "Clip Maker",
+                "title": j.get("title") or jid,
+                "status": j.get("status") or "", "error": err})
+        if err or j.get("status") == "error":
+            fail_row(j.get("created"), "Clip Maker",
+                     j.get("title") or jid, err or "Job failed")
+    for st in list(_GEN_JOBS.values()):
+        session_rows.append({
+            "ts": st.get("created") or 0, "tool": "AI Generator",
+            "title": st.get("model_name") or "Generation",
+            "status": st.get("status") or "",
+            "error": st.get("error") or ""})
+        if st.get("status") == "error":
+            fail_row(st.get("created"), "AI Generator",
+                     st.get("model_name"), st.get("error"))
+    for st in list(_REMOVER_JOBS.values()):
+        session_rows.append({
+            "ts": st.get("created") or 0, "tool": "Caption Remover",
+            "title": st.get("source_name") or "Removal",
+            "status": st.get("status") or "",
+            "error": st.get("error") or ""})
+        if st.get("status") == "error":
+            fail_row(st.get("created"), "Caption Remover",
+                     st.get("source_name"), st.get("error"))
+    for st in list(_ENHANCE_JOBS.values()):
+        session_rows.append({
+            "ts": st.get("created") or 0, "tool": "Video Enhancer",
+            "title": st.get("source_name") or "Enhance",
+            "status": st.get("status") or "",
+            "error": st.get("error") or ""})
+        if st.get("status") == "error":
+            fail_row(st.get("created"), "Video Enhancer",
+                     st.get("source_name"), st.get("error"))
+    failed.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+
+    counters = admin.read_counters()
+    stats = admin.aggregate_stats(disk_jobs, session_rows, failed[:30],
+                                  counters)
+
+    roots = _work_roots()
+    storage = {"work_bytes": sum(admin.dir_size_capped(r)
+                                 for r in roots),
+               "work_roots": roots,
+               "models_bytes": admin.dir_size_capped(local_ai.DATA_DIR),
+               "models_dir": local_ai.DATA_DIR,
+               "app_bytes": admin.dir_size_capped(BASE_DIR),
+               "app_dir": BASE_DIR}
+
+    state = _ensure_license()
+    payload = state.get("payload") or {}
+    settings = load_settings()
+    try:
+        dl = local_ai.download_state()
+    except Exception:  # noqa: BLE001
+        dl = {}
+    license_panel = {
+        "unlocked": bool(state.get("unlocked")),
+        "holder": payload.get("name") or "",
+        "role": payload.get("role") or "customer",
+        "machine_claim": payload.get("machine") or "",
+        "key_type": ("Universal - works on any PC"
+                     if payload.get("machine") == "ANY"
+                     else "This PC only"),
+        "expires": payload.get("exp") or "",
+        "machine_code": licensing.machine_code(),
+        "app_version": APP_VERSION,
+        "model_ready": bool(local_ai.model_ready()),
+        "model_file": local_ai.MODEL_FILE,
+        "model_downloading": bool(dl.get("downloading")),
+        "fal_key_set": bool((settings.get("fal_key") or "").strip()),
+    }
+    entries = admin.read_api_log(500)
+    return {"ok": True,
+            "generated_at": time.time(),
+            "uptime_s": int(time.time() - _APP_START_TS),
+            "stats": stats,
+            "storage": storage,
+            "license": license_panel,
+            "system": admin.system_info(disk_path=_work_root()),
+            "providers": admin.provider_summaries(entries)}
+
+
 def make_wsgi_app(api):
     ui_dir = os.path.abspath(os.path.join(BASE_DIR, "ui"))
 
@@ -4086,6 +4591,84 @@ def make_wsgi_app(api):
                 start_response, "200 OK", "application/json",
                 json.dumps({"ok": True, "active": bool(what),
                             "what": what}))
+
+        # --- Owner Admin Panel: dedicated routes -------------------
+        # These are NOT Api methods: unlock needs Set-Cookie control
+        # and every data route is gated on the server-side session
+        # store before a single byte of data is produced.
+        if path.startswith("/api/admin/"):
+            def _json(status, obj, extra=None):
+                body = json.dumps(obj).encode("utf-8")
+                hdrs = [("Content-Type", "application/json"),
+                        ("Content-Length", str(len(body)))]
+                hdrs += [("Set-Cookie", c) for c in (extra or [])]
+                start_response(status, hdrs)
+                return [body]
+
+            def _read_key():
+                try:
+                    length = int(environ.get("CONTENT_LENGTH") or 0)
+                except (TypeError, ValueError):
+                    length = 0
+                raw = (environ["wsgi.input"].read(length)
+                       if length > 0 else b"{}")
+                try:
+                    body = json.loads(raw or b"{}")
+                except ValueError:
+                    return ""
+                if isinstance(body, dict):
+                    if body.get("key"):
+                        return str(body["key"])
+                    args = body.get("args") or []
+                    if args:
+                        return str(args[0])
+                return ""
+
+            if method == "POST" and path == "/api/admin/unlock":
+                payload = admin.verify_owner_key(_read_key())
+                if payload is None:
+                    # One generic refusal for every failure mode:
+                    # damaged, forged, expired, wrong machine, or a
+                    # valid key without the owner claim.
+                    return _json("403 Forbidden",
+                                 {"ok": False,
+                                  "error": "That key doesn't unlock "
+                                           "the Admin Panel."})
+                token, ttl = admin.create_session()
+                cookie = (f"{_ADMIN_COOKIE}={token}; HttpOnly; "
+                          f"Path=/; SameSite=Strict; Max-Age={ttl}")
+                return _json("200 OK",
+                             {"ok": True, "expires_in": ttl,
+                              "holder": payload.get("name") or ""},
+                             extra=[cookie])
+            if method == "POST" and path == "/api/admin/logout":
+                admin.drop_session(_admin_token_from(environ))
+                cookie = (f"{_ADMIN_COOKIE}=; HttpOnly; Path=/; "
+                          f"SameSite=Strict; Max-Age=0")
+                return _json("200 OK", {"ok": True}, extra=[cookie])
+            left = admin.validate_session(_admin_token_from(environ))
+            if method == "GET" and path == "/api/admin/session":
+                if left is None:
+                    return _json("403 Forbidden",
+                                 {"ok": False, "active": False})
+                return _json("200 OK", {"ok": True, "active": True,
+                                        "seconds_left": left})
+            if left is None:
+                return _json("403 Forbidden",
+                             {"ok": False, "error": "admin_locked"})
+            if method == "GET" and path == "/api/admin/stats":
+                return _json("200 OK", _admin_stats_payload())
+            if method == "GET" and path == "/api/admin/api-log":
+                entries = admin.read_api_log(200)
+                return _json("200 OK",
+                             {"ok": True, "entries": entries,
+                              "providers":
+                                  admin.provider_summaries(entries),
+                              "failures": [e for e in entries
+                                           if e.get("status")
+                                           != "ok"][:50]})
+            return _json("404 Not Found",
+                         {"ok": False, "error": "unknown admin route"})
 
         # --- API: POST /api/<method> {"args": [...]} ---------------------
         if method == "POST" and path.startswith("/api/"):
@@ -4197,6 +4780,10 @@ def make_wsgi_app(api):
                 headers.append((
                     "Content-Disposition",
                     "attachment; filename=" + fname))
+                # Admin Panel counter: attachment responses are the
+                # app's real "user saved a file" events (inline
+                # media previews are not downloads).
+                admin.bump_counter("downloads")
             start_response("200 OK", headers)
 
             def _stream():
