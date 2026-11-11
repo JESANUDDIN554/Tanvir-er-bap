@@ -293,27 +293,69 @@ def debugger_present():
 # Signed integrity manifest over the loose distribution files
 # ---------------------------------------------------------------------------
 
+def _load_integrity_override(base_dir):
+    """Read the loose integrity override an applied update pack left
+    behind (see updater.py). An update pack carries a NEW signed
+    manifest as a loose integrity.py (compiled code cannot be
+    replaced in place); the updater verifies that manifest's
+    signature and stores it here as JSON. Returns:
+      None            - no override file (use the compiled manifest)
+      (manifest, sig) - a parsed override; the caller verifies sig
+      False           - the file exists but is malformed. That must
+                        FAIL the check, never fall back: falling back
+                        would let a half-written or forged override
+                        silently un-pin the updated files.
+    The override is exactly as trustworthy as integrity.py itself:
+    same private key, same canonical signed bytes."""
+    p = os.path.join(base_dir, "integrity_update.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        manifest = doc["manifest"]
+        sig = bytes.fromhex(doc["signature_hex"])
+        if not isinstance(manifest, dict) or not manifest:
+            return False
+        if not all(isinstance(k, str) and isinstance(v, str)
+                   for k, v in manifest.items()):
+            return False
+        return (manifest, sig)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def verify_integrity(base_dir):
     """Returns (ok, bad_relpath_or_None). Skipped when ITRAJI_DEV=1.
     The manifest + its Ed25519 signature live in integrity.py, signed
     by the issuer - editing a covered file breaks the hash, and the
-    manifest itself cannot be re-signed without the private key."""
+    manifest itself cannot be re-signed without the private key.
+    A validly-signed loose override (integrity_update.json, left by
+    an applied update pack) supersedes the compiled manifest."""
     if os.environ.get("ITRAJI_DEV") == "1":
         return (True, None)
-    try:
-        import integrity as _integ
-        manifest = _integ.MANIFEST
-        sig = bytes.fromhex(_integ.SIGNATURE_HEX)
-    except Exception:  # noqa: BLE001
-        # no manifest module: fine for a source checkout, not for the
-        # packaged app
-        import sys
-        if getattr(sys, "frozen", False):
-            return (False, "integrity.py")
-        return (True, None)
+    override = _load_integrity_override(base_dir)
+    if override is False:
+        return (False, "integrity_update.json")
+    if override is not None:
+        manifest, sig = override
+        sig_bad_name = "integrity_update.json"
+    else:
+        sig_bad_name = "integrity.py"
+        try:
+            import integrity as _integ
+            manifest = _integ.MANIFEST
+            sig = bytes.fromhex(_integ.SIGNATURE_HEX)
+        except Exception:  # noqa: BLE001
+            # no manifest module: fine for a source checkout, not for
+            # the packaged app
+            import sys
+            if getattr(sys, "frozen", False):
+                return (False, "integrity.py")
+            return (True, None)
     blob = json.dumps(manifest, sort_keys=True).encode("utf-8")
     if not ed25519.verify(bytes.fromhex(PUBLIC_KEY_HEX), blob, sig):
-        return (False, "integrity.py")
+        return (False, sig_bad_name)
     _TEXT_EXTS = (".html", ".js", ".css", ".md", ".txt", ".json")
     for rel, want in manifest.items():
         p = os.path.join(base_dir, rel)

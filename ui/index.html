@@ -1114,6 +1114,26 @@
       </div>
     </div>
     <div class="field">
+      <label class="field-label">Storage <span class="hint">— where the big files live</span></label>
+      <p class="sub" style="margin:6px 0 0">Put the AI model (~9 GB) and new projects on a bigger drive, e.g. D:\ItrajiData. If the model is already downloaded, saving a new location moves it there safely. Existing projects stay where they are and stay in your Library — the location applies to new projects.</p>
+      <p class="sub" id="storageState" style="margin:6px 0 0">Checking…</p>
+      <div class="bar hidden" id="storageMoveBarWrap" style="margin-top:10px"><div id="storageMoveBar" class="fill"></div></div>
+      <div class="row row-tight" style="margin-top:10px">
+        <input id="storageDirInput" type="text" placeholder="D:\ItrajiData" spellcheck="false" style="flex:1">
+        <button id="storageSaveBtn" class="ghost-btn" type="button">Save location</button>
+      </div>
+      <span class="hint" id="storageResult"></span>
+    </div>
+    <div class="field">
+      <label class="field-label">Updates <span class="hint">— apply an update without reinstalling</span></label>
+      <p class="sub" style="margin:6px 0 0">Current version: <span id="updateVersion">v2.0</span>. When you receive an update pack (.zip), apply it here — it replaces just the changed files, keeps everything else, backs up the old files, and rolls back by itself if anything fails. No deleting, no reinstalling.</p>
+      <div class="row row-tight" style="margin-top:10px">
+        <input id="updatePathInput" type="text" placeholder="Path to the update pack (.zip)" spellcheck="false" style="flex:1">
+        <button id="applyUpdateBtn" class="ghost-btn" type="button">Apply update</button>
+      </div>
+      <span class="hint" id="updateResult"></span>
+    </div>
+    <div class="field">
       <label class="field-label">Old version folders <span class="hint">— leftover copies of the app from older downloads</span></label>
       <p class="sub" style="margin:6px 0 0">Old copies of the app can cause confusion — delete the ones you don't use. The copy you're running is never listed.</p>
       <div class="row row-tight" style="margin-top:10px">

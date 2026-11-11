@@ -51,6 +51,7 @@ a = Analysis(
         "numpy",
         "local_ai",
         "licensing",
+        "updater",
         "ed25519",
         "integrity",
     ],

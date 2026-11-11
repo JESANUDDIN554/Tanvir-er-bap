@@ -3094,6 +3094,8 @@ $("settingsBtn").addEventListener("click", async () => {
     ? "A key is saved on this PC. Type a new one to replace it."
     : "No key saved.";
   openSettings();
+  refreshStorage();
+  refreshUpdateInfo();
 });
 $("closeSettingsBtn").addEventListener("click", closeSettings);
 $("saveSettingsBtn").addEventListener("click", async () => {
@@ -3114,6 +3116,92 @@ $("falKeyClearBtn").addEventListener("click", async () => {
   $("falKeyInput").value = "";
   $("falKeyState").textContent = "No key saved.";
   toast("fal.ai key removed");
+});
+
+/* ---------------- storage location + update packs ---------------
+   Storage: the server owns the truth (storage_status) - where the
+   model effectively lives, where new projects go, and any running
+   model move. Saving a new location can kick off a background
+   move; this section polls while one runs.
+   Updates: apply_update takes the pack's file PATH (the app's
+   convention for local files) and the server verifies the pack's
+   signature before touching anything. */
+let storageTimer = null;
+
+async function refreshStorage() {
+  let st;
+  try { st = await api.storage_status(); } catch (e) { return; }
+  if (!st || !st.ok) return;
+  const state = $("storageState");
+  if (!state) return;
+  const mv = st.move || {};
+  if (mv.active) {
+    state.textContent = "Moving the AI model to the new location — "
+      + (mv.pct || 0) + "%… keep the app open.";
+    show($("storageMoveBarWrap"));
+    $("storageMoveBar").style.width = (mv.pct || 0) + "%";
+    if (!storageTimer)
+      storageTimer = setInterval(refreshStorage, 1200);
+    return;
+  }
+  hide($("storageMoveBarWrap"));
+  if (storageTimer) { clearInterval(storageTimer); storageTimer = null; }
+  const where = st.model_location === "custom"
+    ? "in your storage folder"
+    : st.model_location === "default" ? "in the app folder"
+    : "not downloaded yet";
+  state.textContent = "AI model: " + where
+    + " · New projects folder: " + (st.work_root || "");
+  if (mv.error)
+    $("storageResult").textContent = "The last move failed ("
+      + mv.error + ") — the old location is still in use.";
+  if (document.activeElement !== $("storageDirInput"))
+    $("storageDirInput").value = st.data_dir || "";
+}
+
+$("storageSaveBtn").addEventListener("click", async () => {
+  const btn = $("storageSaveBtn");
+  const res = $("storageResult");
+  btn.disabled = true;
+  res.textContent = "Saving…";
+  try {
+    const r = await api.set_data_dir($("storageDirInput").value.trim());
+    if (!r.ok) throw new Error(r.error || "could not save the location");
+    res.textContent = r.message || "Saved.";
+    refreshStorage();
+  } catch (e) {
+    res.textContent = e.message;
+  }
+  btn.disabled = false;
+});
+
+async function refreshUpdateInfo() {
+  try {
+    const r = await api.update_info();
+    if (r && r.ok) $("updateVersion").textContent = "v" + r.version;
+  } catch (e) { /* the static version text stays */ }
+}
+
+$("applyUpdateBtn").addEventListener("click", async () => {
+  const btn = $("applyUpdateBtn");
+  const res = $("updateResult");
+  const path = $("updatePathInput").value.trim();
+  if (!path) {
+    res.textContent = "Paste the update pack's file path first.";
+    return;
+  }
+  btn.disabled = true;
+  res.textContent = "Checking the pack's signature and applying…";
+  try {
+    const r = await api.apply_update(path);
+    if (!r.ok) throw new Error(r.error || "update failed");
+    res.textContent = (r.message || "Update applied.")
+      + " (pack version " + r.version + ")";
+    toast("Update applied — restart the app");
+  } catch (e) {
+    res.textContent = e.message;
+  }
+  btn.disabled = false;
 });
 
 /* ---------------- old version folders (Settings cleanup) ----------

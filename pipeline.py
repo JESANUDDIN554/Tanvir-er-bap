@@ -2893,21 +2893,27 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
     try:
         tracker = FaceTracker()
         if tracker.backend == "none":
-            raise RuntimeError("no_face_backend")
-        if progress_cb:
-            progress_cb(3, "Detecting faces")
-        samples = sample_face_centers(
-            video_path, start, end, tracker, progress_cb=None)
-        samples = [(t - start, cx) for t, cx in samples]
-        trajectory = smooth_trajectory(samples, src_w, crop_w)
-        if progress_cb:
-            n_found = sum(1 for _, cx in samples if cx is not None)
-            progress_cb(12, f"Face tracking: {n_found} face samples")
-    except Exception as e:  # noqa: BLE001 - never break a render
-        if "no_face_backend" in str(e):
-            raise RuntimeError(
-                "Face tracking needs opencv-python - "
-                "reinstall with Install.bat")
+            # No face detector available: the bundled YuNet model is
+            # missing/corrupt AND this OpenCV build ships no Haar
+            # cascade (opencv-python 5.x dropped the bundled XML).
+            # Degrade to the documented center-crop fallback instead
+            # of failing the render - the old hard failure blamed a
+            # missing opencv-python even when cv2 was installed and
+            # working fine.
+            if progress_cb:
+                progress_cb(3, "Face tracking unavailable - "
+                               "using a center crop")
+        else:
+            if progress_cb:
+                progress_cb(3, "Detecting faces")
+            samples = sample_face_centers(
+                video_path, start, end, tracker, progress_cb=None)
+            samples = [(t - start, cx) for t, cx in samples]
+            trajectory = smooth_trajectory(samples, src_w, crop_w)
+            if progress_cb:
+                n_found = sum(1 for _, cx in samples if cx is not None)
+                progress_cb(12, f"Face tracking: {n_found} face samples")
+    except Exception:  # noqa: BLE001 - never break a render
         trajectory = None  # center crop fallback
 
     center_left = (src_w - crop_w) / 2.0
@@ -3601,6 +3607,19 @@ def render_clip(video_path, moment, words, style_name, out_path,
         quality_tier, _ENCODE_TIERS["maximum"])
     if custom_styles:
         set_custom_styles(custom_styles)
+    if style_name and style_name not in CUSTOM_STYLES \
+            and style_name not in STYLES:
+        # An unknown style id used to fall back to Bold Pop inside
+        # _get_style with no signal anywhere, so a typo'd style (or a
+        # stale project saved against a renamed style) rendered the
+        # WRONG captions and nobody could tell. Fail loudly instead:
+        # every legitimate caller sends an id from the corepack
+        # styles or the user's custom styles (both checked here), so
+        # a miss is a real error the user should hear about.
+        raise ValueError(
+            f"Unknown caption style '{style_name}' - it is not one "
+            "of the built-in or custom styles, so this render was "
+            "stopped instead of silently using Bold Pop.")
 
     cap_src = edited_words if edited_words is not None else words
     win_words = [w for w in cap_src if w["end"] > start and w["start"] < end]
@@ -4116,6 +4135,25 @@ def _lama_session():
     return sess, img_name, mask_name
 
 
+def _lama_inpaint_full(sess, img_name, mask_name, frame, cy0, cy1,
+                       crop_mask):
+    """_lama_inpaint with the FULL frame as context, the mask given
+    in working-crop coordinates. Returns the cleaned full frame.
+
+    Why not inpaint the caption strip directly: given only the
+    strip (band + a thin context margin), LaMa starves - on dark,
+    textured shots it reconstructs the very letters it should
+    erase from the glyph fragments at the mask boundary (sweep2
+    T2, measured on the same frame/mask: strip plate kept 82% of
+    the text's edge energy; full-frame plate kept 9%). Context is
+    the lever; mask size is not (a column-grown strip mask still
+    kept 85%)."""
+    import numpy as np
+    full_mask = np.zeros(frame.shape[:2], np.float32)
+    full_mask[cy0:cy1] = crop_mask
+    return _lama_inpaint(sess, img_name, mask_name, frame, full_mask)
+
+
 def _lama_inpaint(sess, img_name, mask_name, crop_bgr, mask01):
     """Run LaMa (fixed 512x512) on a working crop with a tight 0/1
     mask; returns the inpainted crop at the crop's own resolution.
@@ -4475,8 +4513,9 @@ def _remove_captions_ai(src, out, W, H, y0, y1, duration, cb, tier):
                 since_inpaint += 1
             else:
                 m = _crop_text_mask(det, crop, by0, by1)
-                back = _lama_inpaint(sess, img_name, mask_name, crop, m)
-                band = back[y0 - cy0:y1 - cy0]
+                back = _lama_inpaint_full(sess, img_name, mask_name,
+                                          frame, cy0, cy1, m)
+                band = back[y0:y1]
                 last_small = small
                 last_band = band
                 since_inpaint = 0
@@ -4593,6 +4632,9 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
     plate = None          # clean (text-free) working crop, full res
     plate_src = None      # the plate as built - warps always sample
     #                       this pristine copy, never a previous warp
+    plate_hist = None     # histogram of the frame the plate was
+    #                       built from (scene-cut check below)
+    stale_votes = 0       # consecutive frames voting "scene changed"
     Dmap = None           # accumulated scene displacement since the
     #                       plate was built (flow resolution)
     prev_small = None     # previous frame's crop, flow resolution
@@ -4738,6 +4780,32 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
                         or plate_age > age_limit \
                         or cum_disp > disp_budget:
                     rebuild = True
+            # ---- scene-cut check against the PLATE's own frame ----
+            # The triggers above compare CONSECUTIVE frames, so a
+            # 2-3 frame crossfade slips between them: each step stays
+            # correlated with the last, a fade is flow-consistent
+            # (fb_err ~ 0), and once the new scene settles, its low
+            # motion never trips the age/drift limits either - the
+            # OLD scene's plate, smeared caption and all, gets
+            # painted over the new scene indefinitely (sweep2 T2:
+            # a title-card plate ghosting through a whole clip).
+            # Compare each frame against the frame the plate was
+            # built from instead: after any real scene change the
+            # correlation drops and STAYS dropped. Three consecutive
+            # votes ride out brief occlusions and blur frames.
+            if plate_hist is not None and not rebuild \
+                    and not gate_closed:
+                cur_hist = cv2.calcHist([small], [0], None, [64],
+                                        [0, 256]).flatten()
+                denom = float(np.linalg.norm(cur_hist)
+                              * np.linalg.norm(plate_hist)) or 1.0
+                ref_corr = float(cur_hist @ plate_hist / denom)
+                if ref_corr < 0.75:
+                    stale_votes += 1
+                    if stale_votes >= 3:
+                        rebuild = True
+                else:
+                    stale_votes = 0
             if gate_closed:
                 # Text-free window: no plate work and no painting -
                 # the frame passes through untouched. Drop the plate
@@ -4747,6 +4815,8 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
                 plate = None
                 plate_src = None
                 Dmap = None
+                plate_hist = None
+                stale_votes = 0
             elif rebuild:
                 # A plate must be text-free EVERYWHERE text could
                 # appear, not just where this frame's mask looked:
@@ -4759,8 +4829,12 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
                     build_mask = np.maximum(build_mask, prev_mask)
                 build_mask = cv2.dilate(
                     build_mask, np.ones((9, 9), np.float32))
-                plate_src = _lama_inpaint(sess, img_name, mask_name,
-                                          crop, build_mask)
+                # Full-frame context for the inpaint (see
+                # _lama_inpaint_full): a strip-only plate keeps the
+                # letters on dark/textured shots.
+                plate_src = _lama_inpaint_full(
+                    sess, img_name, mask_name, frame, cy0, cy1,
+                    build_mask)[cy0:cy1].copy()
                 plates += 1
                 # Verify the plate really is text-free; if letters
                 # survived the inpaint, widen the mask with what is
@@ -4772,14 +4846,17 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
                     build_mask = cv2.dilate(
                         np.maximum(build_mask, pth),
                         np.ones((9, 9), np.float32))
-                    plate_src = _lama_inpaint(sess, img_name,
-                                              mask_name, crop,
-                                              build_mask)
+                    plate_src = _lama_inpaint_full(
+                        sess, img_name, mask_name, frame, cy0, cy1,
+                        build_mask)[cy0:cy1].copy()
                     plates += 1
                 plate = plate_src
                 Dmap = np.zeros((fh, fw, 2), np.float32)
                 plate_age = 0
                 cum_disp = 0.0
+                plate_hist = cv2.calcHist([small], [0], None, [64],
+                                          [0, 256]).flatten()
+                stale_votes = 0
             else:
                 # Track by warping the PRISTINE plate with the total
                 # accumulated displacement - never by re-warping last

@@ -42,6 +42,7 @@ from pipeline import (  # noqa: E402
 
 import local_ai  # noqa: E402  (built-in local LLM: engine/model/server)
 import licensing  # noqa: E402  (signed license + core pack + integrity)
+import updater  # noqa: E402  (signed file-replacement update packs)
 from pipeline import load_corepack as _load_corepack  # noqa: E402
 import pipeline as _pipeline  # noqa: E402
 
@@ -55,10 +56,61 @@ _ENHANCE_JOBS = {}  # Video Enhancer runs (session-only)
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"),
                               ".clipmaker_pc_settings.json")
 
+# The app's version, shown in Settings -> Updates. This is the
+# version string the UI already displays ("v2.0"); bump it when a
+# release changes compiled code. Update packs carry their own
+# version for the apply-result line.
+APP_VERSION = "2.0"
+
 # Job pruning: long desktop sessions must not grow JOBS forever.
 JOB_TTL_S = 6 * 3600   # drop non-working jobs older than 6h
 JOB_HARD_CAP = 40      # ...and never keep more than 40
 JOB_KEEP_MIN = 20      # hard-cap pruning stops here (most recent kept)
+
+
+# -- Work roots (Settings -> Storage) ------------------------------------
+# New projects/jobs are written under _work_root(): <data_dir>/work
+# when the user chose a storage location, else the app's own work
+# folder (exactly the pre-Storage behaviour). Projects created
+# BEFORE a switch stay in the folder that already holds them -
+# _job_folder/_session_folder find them in either root, so the
+# Library and downloads keep working across the switch.
+
+def _work_root():
+    dd = local_ai.custom_data_dir()
+    if dd:
+        return os.path.join(dd, "work")
+    return os.path.join(BASE_DIR, "work")
+
+
+def _work_roots():
+    roots = [_work_root()]
+    legacy = os.path.join(BASE_DIR, "work")
+    if legacy not in roots:
+        roots.append(legacy)
+    return roots
+
+
+def _job_folder(job_id):
+    """The folder of an existing job, whichever root holds it; for
+    a job that exists nowhere yet, its folder under the effective
+    root (the creation path)."""
+    for root in _work_roots():
+        p = os.path.join(root, job_id)
+        if os.path.isdir(p):
+            return p
+    return os.path.join(_work_root(), job_id)
+
+
+def _session_folder(name):
+    """Same lookup for session folders (remover-*, enhance-*):
+    find the existing one in either root, else the effective
+    root's path for creation."""
+    for root in _work_roots():
+        p = os.path.join(root, name)
+        if os.path.isdir(p):
+            return p
+    return os.path.join(_work_root(), name)
 
 
 def _drop_job(jid):
@@ -67,8 +119,7 @@ def _drop_job(jid):
         return
     # free the disk too - a pruned job's /files URLs 404 anyway
     import shutil
-    shutil.rmtree(os.path.join(BASE_DIR, "work", jid),
-                  ignore_errors=True)
+    shutil.rmtree(_job_folder(jid), ignore_errors=True)
 
 
 def _prune_jobs():
@@ -103,8 +154,8 @@ _LIBRARY_LOADED = False
 
 
 def _is_library_job(job_id):
-    return os.path.isfile(
-        os.path.join(BASE_DIR, "work", job_id, "job.json"))
+    return any(os.path.isfile(os.path.join(root, job_id, "job.json"))
+               for root in _work_roots())
 
 
 def _save_job(job_id):
@@ -117,7 +168,7 @@ def _save_job(job_id):
             "title", "source", "video_path", "duration", "words",
             "moments", "renders", "status", "stage", "language",
             "created")}
-        folder = os.path.join(BASE_DIR, "work", job_id)
+        folder = _job_folder(job_id)
         os.makedirs(folder, exist_ok=True)
         tmp = os.path.join(folder, "job.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -133,12 +184,15 @@ def _load_library():
     if _LIBRARY_LOADED:
         return
     _LIBRARY_LOADED = True
-    work = os.path.join(BASE_DIR, "work")
-    try:
-        names = os.listdir(work)
-    except OSError:
-        return
-    for name in names:
+    # Scan EVERY work root: projects created before a storage
+    # switch live in the legacy root and must stay in the Library.
+    names = []
+    for work in _work_roots():
+        try:
+            names += [(work, n) for n in os.listdir(work)]
+        except OSError:
+            continue
+    for work, name in names:
         if name in JOBS:
             continue
         meta = os.path.join(work, name, "job.json")
@@ -214,6 +268,9 @@ DEFAULT_SETTINGS = {
                                    #   export_name}] - local posting planner
     "fal_key": "",                 # user's own fal.ai API key (Studio
                                    # Generator) - never sent to the UI
+    "data_dir": "",                # Settings -> Storage: folder for
+                                   # the AI model + new projects;
+                                   # "" = the app folder (default)
 }
 
 # Clip-length presets -> (min_s, max_s) for moment detection.
@@ -558,6 +615,13 @@ def _uninstall_data_paths():
         candidates.append(local_ai.DATA_DIR)
     except Exception:  # noqa: BLE001 - local_ai imports above anyway
         pass
+    # A user-chosen storage location holds data too (Settings ->
+    # Storage): its work root and model folder belong to a
+    # remove-data uninstall just like the defaults.
+    dd = local_ai.custom_data_dir()
+    if dd:
+        candidates.append(os.path.join(dd, "work"))
+        candidates.append(os.path.join(dd, "models"))
     out, seen = [], set()
     for p in candidates:
         if not p:
@@ -716,6 +780,20 @@ def _job_log(job_id, text):
         del log[:len(log) - _JOB_LOG_CAP]
 
 
+def _release_render_lock(job):
+    """Release a job's render lock early, from inside the worker
+    that holds it, BEFORE the job's status flips to its final value
+    (sweep2 T4). Safe to call speculatively: a double release is
+    swallowed, and the worker's finally-block release in
+    _run_render stays in place as the backstop."""
+    lock = job.get("_render_lock")
+    if lock is not None:
+        try:
+            lock.release()
+        except RuntimeError:
+            pass  # already released
+
+
 def _remover_log(rid, text):
     st = _REMOVER_JOBS.get(rid)
     if st is None:
@@ -724,6 +802,29 @@ def _remover_log(rid, text):
     log.append({"t": time.time(), "text": str(text)})
     if len(log) > _JOB_LOG_CAP:
         del log[:len(log) - _JOB_LOG_CAP]
+
+
+def _copy_video_unchanged(src, out):
+    """Copy a video into the output slot WITHOUT re-encoding it:
+    try a stream-copy remux into .mp4 first (keeps the bytes
+    bit-exact per stream), and if the source container/codecs
+    refuse that, fall back to a plain file copy. Used when the
+    Caption Remover finds no captions: the honest result is the
+    original video, not a degraded re-encode."""
+    import shutil
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", src,
+             "-c", "copy", out],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=1800,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode == 0 and os.path.exists(out) \
+                and os.path.getsize(out) > 0:
+            return
+    except Exception:  # noqa: BLE001 - fall through to plain copy
+        pass
+    shutil.copyfile(src, out)
 
 
 # -- Studio Generator: fal.ai model catalog ------------------------------
@@ -895,9 +996,134 @@ class Api:
 
     def save_settings(self, settings):
         current = load_settings()
-        current.update(settings or {})
+        settings = dict(settings or {})
+        # data_dir has its own endpoint (set_data_dir below):
+        # changing it can mean moving a 9 GB model, which a generic
+        # settings save must never trigger - or silently bypass.
+        settings.pop("data_dir", None)
+        current.update(settings)
         save_settings(current)
         return {"ok": True}
+
+    # -- in-app updates (signed file-replacement packs) ---------------
+    def update_info(self):
+        return {"ok": True, "version": APP_VERSION}
+
+    def apply_update(self, path):
+        """Apply a signed update pack (.zip) the user picked:
+        replaces the app's loose files in place, with backup +
+        automatic rollback - see updater.py / tools/UPDATE_PACKS.md.
+        No reinstall, no delete: the Setup stays the route for big
+        (compiled-code) updates, and the updater says so when a
+        pack tries to carry one."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        p = (path or "").strip().strip('"')
+        if not p or not os.path.isfile(p):
+            return {"ok": False, "error": "Choose an update pack "
+                                          "(.zip) file first."}
+        if not p.lower().endswith(".zip"):
+            return {"ok": False, "error": "Update packs are .zip "
+                                          "files."}
+        try:
+            res = updater.apply_update_pack(p, BASE_DIR)
+        except updater.UpdateError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:  # noqa: BLE001 - surfaced to UI
+            return {"ok": False, "error": "Update failed: "
+                                         + str(e)[:200]}
+        return {"ok": True, "version": res["version"],
+                "files": res["files"],
+                "message": "Update applied - restart the app to "
+                           "use it."}
+
+    # -- storage location (Settings -> Storage) ------------------------
+    def storage_status(self):
+        """Where the big files live right now: the configured
+        data_dir, the EFFECTIVE model path (a model already sitting
+        in the app folder is found and used even after a new
+        location is chosen), the work root new projects will use,
+        and any in-progress model move."""
+        s = load_settings()
+        dd = (s.get("data_dir") or "").strip()
+        eff = local_ai.existing_model_path()
+        loc = "none"
+        if eff:
+            loc = "default"
+            if dd:
+                want = os.path.join(os.path.abspath(dd), "models",
+                                    local_ai.MODEL_FILE)
+                if os.path.abspath(eff) == want:
+                    loc = "custom"
+        return {"ok": True,
+                "data_dir": dd,
+                "effective_model_path": local_ai.model_path(),
+                "model_location": loc,
+                "model_ready": local_ai.model_ready(),
+                "work_root": _work_root(),
+                "legacy_work_root": os.path.join(BASE_DIR, "work"),
+                "move": local_ai.model_move_state()}
+
+    def set_data_dir(self, path):
+        """Save the storage location. When a downloaded model sits
+        at the old location and the new one has none, the model is
+        MOVED (copy -> verified -> original deleted) in the
+        background and the setting is only saved once the move
+        succeeds - if the move fails, the old location stays
+        active and the error is reported, never a silent switch
+        that orphans 9 GB."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        p = (path or "").strip().strip('"')
+        s = load_settings()
+        if not p:
+            local_ai.set_data_dir(None)
+            s["data_dir"] = ""
+            save_settings(s)
+            return {"ok": True, "data_dir": "",
+                    "message": "Storage location cleared - the app "
+                               "folder is used again."}
+        ap = os.path.abspath(p)
+        if ap == os.path.abspath(BASE_DIR):
+            return {"ok": False,
+                    "error": "That is the app's own folder - pick a "
+                             "different folder for the big files."}
+        try:
+            os.makedirs(os.path.join(ap, "models"), exist_ok=True)
+            probe = os.path.join(ap, "models", ".write-test")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+        except OSError as e:
+            return {"ok": False,
+                    "error": "That folder cannot be used: "
+                             + str(e)[:160]}
+        if local_ai.model_move_state().get("active"):
+            return {"ok": False,
+                    "error": "A model move is already running - "
+                             "wait for it to finish."}
+        eff = local_ai.existing_model_path()
+        want = os.path.join(ap, "models", local_ai.MODEL_FILE)
+        if eff and os.path.abspath(eff) != os.path.abspath(want):
+            def _done(ok, err, _ap=ap):
+                if ok:
+                    cur = load_settings()
+                    cur["data_dir"] = _ap
+                    save_settings(cur)
+            if local_ai.start_model_move(ap, on_done=_done):
+                return {"ok": True, "data_dir": ap, "moving": True,
+                        "message": "Moving the AI model to the new "
+                                   "location - keep the app open "
+                                   "until it finishes."}
+            return {"ok": False,
+                    "error": "The model move could not be started."}
+        local_ai.set_data_dir(ap)
+        s["data_dir"] = ap
+        save_settings(s)
+        return {"ok": True, "data_dir": ap,
+                "message": "Storage location saved."}
 
     # -- old-copy cleanup ----------------------------------------------
     def old_copies(self):
@@ -1079,7 +1305,7 @@ class Api:
             return {"ok": False,
                     "error": "That video is still busy - wait for it "
                              "to finish first."}
-        folder = os.path.join(BASE_DIR, "work", job_id)
+        folder = _job_folder(job_id)
         if job is None and not os.path.isdir(folder):
             return {"ok": False, "error": "Project not found."}
         _drop_job(job_id)  # pops JOBS + removes the folder when loaded
@@ -1090,7 +1316,7 @@ class Api:
     def _run_import(self, job_id, url, use_cookies, language):
         job = JOBS[job_id]
         try:
-            workdir = os.path.join(BASE_DIR, "work", job_id)
+            workdir = _job_folder(job_id)
             _job_log(job_id, "Download started")
             video_path, title, duration = download_video(
                 url, workdir, _job_progress(job_id),
@@ -1162,7 +1388,7 @@ class Api:
         job = JOBS.get(job_id)
         if not job or not job.get("video_path"):
             return {"ok": False}
-        thumb = os.path.join(BASE_DIR, "work", job_id, "thumb.jpg")
+        thumb = os.path.join(_job_folder(job_id), "thumb.jpg")
         if not os.path.exists(thumb):
             import subprocess
             os.makedirs(os.path.dirname(thumb), exist_ok=True)
@@ -1476,7 +1702,7 @@ class Api:
                      + mode_names.get(mode, mode) + ")")
         try:
             settings = load_settings()
-            work = os.path.join(BASE_DIR, "work", "remover-" + rid)
+            work = _session_folder("remover-" + rid)
             os.makedirs(work, exist_ok=True)
             if is_url:
                 _remover_log(rid, "Download started")
@@ -1491,6 +1717,7 @@ class Api:
                     _remover_log(rid, "Download finished")
             else:
                 src = source
+            no_band = False
             if region and region.get("auto"):
                 _remover_log(rid, "Auto-detect: scanning the video to "
                                   "find the captions")
@@ -1504,12 +1731,34 @@ class Api:
                         f"{det['top_pct']:.0f}% - {det['bottom_pct']:.0f}% "
                         "of the frame height")
                 else:
-                    region = {"top_pct": 82.0, "bottom_pct": 100.0}
-                    _remover_log(rid, "No clear caption band found - "
-                                      "using the bottom band (82% - 100%). "
-                                      "Use Custom to adjust if needed.")
+                    # The probe says this video has no caption band
+                    # we trust. The old behaviour guessed the bottom
+                    # band (82%-100%) and inpainted it anyway, which
+                    # measurably DAMAGES a caption-free video (sweep2
+                    # T1: 26.6 dB PSNR vs the 44.5 dB of a plain
+                    # re-encode). Never paint a guessed band over a
+                    # clean video: return it unchanged and say so.
+                    no_band = True
+                    _remover_log(rid, "No caption band detected - "
+                                      "the video looks caption-free, "
+                                      "so it will be returned "
+                                      "unchanged. If it does have "
+                                      "captions, run again with a "
+                                      "Custom region.")
             out = os.path.join(work, "output.mp4")
             tier = settings.get("quality_tier", "maximum")
+            if no_band:
+                cb(60, "No captions found - returning the video "
+                       "unchanged")
+                _copy_video_unchanged(src, out)
+                st["status"] = "done"
+                st["pct"] = 100
+                st["stage"] = ("Done - no captions found, "
+                               "video unchanged")
+                st["url"] = "/remover-files/" + rid + "/output.mp4"
+                _remover_log(rid, "Finished - output.mp4 is the "
+                                  "original video, unchanged")
+                return
             try:
                 remove_captions(
                     src, region, mode, out,
@@ -1601,7 +1850,7 @@ class Api:
                           "change on a busy background)")
         try:
             settings = load_settings()
-            work = os.path.join(BASE_DIR, "work", "remover-" + rid)
+            work = _session_folder("remover-" + rid)
             os.makedirs(work, exist_ok=True)
             if is_url:
                 _remover_log(rid, "Download started")
@@ -1623,9 +1872,14 @@ class Api:
                         f"{det['top_pct']:.0f}% - {det['bottom_pct']:.0f}% "
                         "of the frame height")
                 else:
-                    region = {"top_pct": 82.0, "bottom_pct": 100.0}
-                    _remover_log(rid, "No clear caption band found - "
-                                      "using the bottom band (82% - 100%).")
+                    # Same rule as the full run: never paint a guessed
+                    # band over a video the probe calls clean. A
+                    # preview has nothing to show in that case, so
+                    # stop honestly instead of previewing damage.
+                    raise RuntimeError(
+                        "No caption band detected - nothing to "
+                        "preview. If the video does have captions, "
+                        "choose a Custom region.")
             out = os.path.join(work, "output.mp4")
             tier = settings.get("quality_tier", "maximum")
             engine = "temporal" if mode == "auto" else mode
@@ -1941,6 +2195,15 @@ class Api:
         return job, lock, None
 
     def _hook_end(self, job, ok, stage):
+        # Release before the status flips (same sweep2 T4 race as
+        # _render_clips): an observer must never see a finished
+        # status while the render lock is still held.
+        lock = job.get("_render_lock")
+        if lock is not None:
+            try:
+                lock.release()
+            except RuntimeError:
+                pass  # already released
         if ok:
             job["status"] = "done"
             job["stage"] = stage
@@ -1949,12 +2212,6 @@ class Api:
             job["status"] = job.pop("_hook_prev_status", "transcribed")
             job["stage"] = stage
         job.pop("_hook_prev_status", None)
-        lock = job.get("_render_lock")
-        if lock is not None:
-            try:
-                lock.release()
-            except RuntimeError:
-                pass  # already released
 
     def _hook_out_path(self, job, outdir, prefix):
         """Next free hook-render filename in the job's clips folder.
@@ -1978,7 +2235,7 @@ class Api:
         renders (its words are stored rebased onto the clip timeline,
         so SRT/VTT exports and merges treat it like a merged entry).
         Returns the render entry's index in job["renders"]."""
-        outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
+        outdir = os.path.join(_job_folder(job_id), "clips")
         os.makedirs(outdir, exist_ok=True)
         out = self._hook_out_path(job, outdir, "hook")
         moment = {"start": start, "end": end, "title": "Hook",
@@ -2123,8 +2380,7 @@ class Api:
                         ic = i
                         break
             if ic is None:
-                outdir = os.path.join(BASE_DIR, "work", job_id,
-                                      "clips")
+                outdir = os.path.join(_job_folder(job_id), "clips")
                 os.makedirs(outdir, exist_ok=True)
                 out = self._hook_out_path(job, outdir, "hookclip")
                 cm = dict(moment)
@@ -2199,7 +2455,7 @@ class Api:
         fmt = (fmt or "txt").lower()
         if fmt not in ("txt", "srt", "vtt"):
             return {"ok": False, "error": "Unknown format."}
-        folder = os.path.join(BASE_DIR, "work", job_id)
+        folder = _job_folder(job_id)
         os.makedirs(folder, exist_ok=True)
         path = os.path.join(folder, "transcript." + fmt)
         try:
@@ -2351,7 +2607,7 @@ class Api:
         st["remote_url"] = remote
         # Download locally so the file survives + can enter the Library.
         folder_name = "gen-" + st["id"]
-        folder = os.path.join(BASE_DIR, "work", folder_name)
+        folder = os.path.join(_work_root(), folder_name)
         os.makedirs(folder, exist_ok=True)
         ext = ".png" if st["kind"] == "image" else ".mp4"
         if ".jpg" in remote or ".jpeg" in remote:
@@ -2434,7 +2690,7 @@ class Api:
 
         try:
             settings = load_settings()
-            folder = os.path.join(BASE_DIR, "work", "enhance-" + eid)
+            folder = _session_folder("enhance-" + eid)
             os.makedirs(folder, exist_ok=True)
             out = os.path.join(folder, "enhanced.mp4")
             enhance_video(src, out, progress_cb=cb,
@@ -2458,8 +2714,8 @@ class Api:
 
     def enhance_open_folder(self, eid):
         st = _ENHANCE_JOBS.get(eid or "")
-        folder = (st or {}).get("folder") or os.path.join(
-            BASE_DIR, "work", "enhance-" + (eid or ""))
+        folder = (st or {}).get("folder") or _session_folder(
+            "enhance-" + (eid or ""))
         os.makedirs(folder, exist_ok=True)
         try:
             if sys.platform == "win32":
@@ -2658,7 +2914,7 @@ class Api:
 
     def _render_clips(self, job_id, indices, opts):
         job = JOBS[job_id]
-        outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
+        outdir = os.path.join(_job_folder(job_id), "clips")
         os.makedirs(outdir, exist_ok=True)
         # Keep clips from earlier render batches: a second batch must
         # extend the project, not replace it (Download-all relies on
@@ -2717,11 +2973,17 @@ class Api:
                 _job_log(job_id, "Render finished - "
                          + os.path.basename(out))
             job["renders"] = renders
+            # Release BEFORE the status flips to done: the caller's
+            # finally used to be the only release, so a re-render
+            # started in that gap saw status=done yet was refused
+            # with render_in_progress (sweep2 T4).
+            _release_render_lock(job)
             job["status"] = "done"
             job["stage"] = f"Done - {len(renders)} clips rendered"
             job["progress"] = 100
             job.pop("render_error", None)
         except Exception as e:  # noqa: BLE001
+            _release_render_lock(job)
             job["status"] = "moments"
             job["render_error"] = "Render failed: " + str(e)[:220]
             job["stage"] = "Render failed"
@@ -2750,7 +3012,7 @@ class Api:
 
     def _download_url(self, job_id, path):
         from urllib.parse import quote
-        rel = os.path.relpath(path, os.path.join(BASE_DIR, "work", job_id))
+        rel = os.path.relpath(path, _job_folder(job_id))
         parts = [quote(p) for p in rel.replace(os.sep, "/").split("/")]
         return "/files/" + job_id + "/" + "/".join(parts)
 
@@ -2793,7 +3055,7 @@ class Api:
                 dur = 0
             clips.append({"path": r["path"], "title": r["title"],
                           "duration": dur or 1.0})
-        outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
+        outdir = os.path.join(_job_folder(job_id), "clips")
         out = os.path.join(outdir, "timeline.fcpxml")
         try:
             write_xml_timeline(clips, out)
@@ -2924,7 +3186,7 @@ class Api:
         job = JOBS.get(job_id)
         if job:
             sources.append(job.get("renders", []))
-        meta = os.path.join(BASE_DIR, "work", job_id, "job.json")
+        meta = os.path.join(_job_folder(job_id), "job.json")
         try:
             with open(meta, encoding="utf-8") as f:
                 sources.append(json.load(f).get("renders", []))
@@ -2953,7 +3215,7 @@ class Api:
                     "error": "No rendered clip files were found for "
                              "this project on this PC. Render the "
                              "clips again, then download."}
-        outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
+        outdir = os.path.join(_job_folder(job_id), "clips")
         os.makedirs(outdir, exist_ok=True)
         # unique name per build: a rebuild can never truncate the
         # file a download is streaming, and vice versa
@@ -3022,7 +3284,7 @@ class Api:
         emojis = ui_opts.get("emojis", settings.get("emojis", False))
         highlight = ui_opts.get("highlight",
                                 settings.get("highlight", False))
-        outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
+        outdir = os.path.join(_job_folder(job_id), "clips")
         os.makedirs(outdir, exist_ok=True)
         ass_fd, ass_path = __import__("tempfile").mkstemp(suffix=".ass",
                                                           prefix="prev_")
@@ -3079,7 +3341,7 @@ class Api:
             if p and not os.path.isfile(p):
                 return {"ok": False, "error": "Intro/outro file not found: "
                                               + p[:120]}
-        outdir = os.path.join(BASE_DIR, "work", job_id, "clips")
+        outdir = os.path.join(_job_folder(job_id), "clips")
         os.makedirs(outdir, exist_ok=True)
         out = os.path.join(outdir,
                            f"merged_{len(job['renders']) + 1:02d}.mp4")
@@ -3147,8 +3409,8 @@ class Api:
 
     def open_folder(self, job_id):
         job = JOBS.get(job_id)
-        folder = os.path.join(BASE_DIR, "work", job_id, "clips") if job \
-            else os.path.join(BASE_DIR, "work")
+        folder = os.path.join(_job_folder(job_id), "clips") if job \
+            else _work_root()
         os.makedirs(folder, exist_ok=True)
         try:
             if sys.platform == "win32":
@@ -3422,7 +3684,7 @@ def make_wsgi_app(api):
         # --- Caption Remover output: GET /remover-files/<id>/output.mp4 -
         if method == "GET" and path.startswith("/remover-files/"):
             rid = path[len("/remover-files/"):].split("/", 1)[0]
-            fpath = os.path.join(BASE_DIR, "work", "remover-" + rid,
+            fpath = os.path.join(_session_folder("remover-" + rid),
                                  "output.mp4")
             if rid not in _REMOVER_JOBS or not os.path.isfile(fpath):
                 return _wsgi_response(start_response, "404 Not Found",
@@ -3459,7 +3721,7 @@ def make_wsgi_app(api):
                     or ".." in rel or rel.startswith("/") or not rel):
                 return _wsgi_response(start_response, "404 Not Found",
                                       "text/plain", "not found")
-            base = os.path.abspath(os.path.join(BASE_DIR, "work", job_id))
+            base = os.path.abspath(_job_folder(job_id))
             fpath = os.path.abspath(os.path.join(base, rel))
             if not fpath.startswith(base + os.sep) \
                     or not os.path.isfile(fpath):
@@ -4241,6 +4503,13 @@ def main():
     if licensing.debugger_present():
         licensing.mark_tampered()
     _ensure_license()
+
+    # Apply the saved storage location (Settings -> Storage) before
+    # anything resolves model or work paths this session.
+    try:
+        local_ai.set_data_dir(load_settings().get("data_dir") or "")
+    except Exception:  # noqa: BLE001 - a bad setting must not brick
+        pass              # the boot; defaults apply instead
 
     # Single instance: a repeated launch never starts a second server and
     # never opens anything - no second window, no browser tab, ever. It

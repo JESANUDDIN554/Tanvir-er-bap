@@ -104,8 +104,80 @@ def _model_urls():
     return urls
 
 
+# ---------------------------------------------------------------------------
+# User-chosen storage location (Settings -> Storage)
+# ---------------------------------------------------------------------------
+# app.py applies the saved `data_dir` setting via set_data_dir().
+# ONLY the big GGUF's home moves (plus, on the app.py side, the
+# work root for new projects); the engine, the LaMa/OCR models and
+# everything else keep living under DATA_DIR exactly as before.
+# The env test hook ITRAJI_LOCAL_DATA_DIR always wins: when it is
+# set, set_data_dir() is ignored entirely.
+
+_custom_data_dir = None
+
+
+def set_data_dir(path):
+    """Point the AI model at a user-chosen folder (None/"" clears).
+    Ignored when ITRAJI_LOCAL_DATA_DIR overrides the data area."""
+    global _custom_data_dir
+    if os.environ.get("ITRAJI_LOCAL_DATA_DIR"):
+        return
+    p = (path or "").strip()
+    _custom_data_dir = os.path.abspath(p) if p else None
+
+
+def custom_data_dir():
+    return _custom_data_dir
+
+
+def _gguf_dirs():
+    """Folders that may hold the model GGUF, best first: the
+    user-chosen location, then the legacy/app location. The legacy
+    folder is ALWAYS in the list, so a model that already exists
+    there (e.g. the Full install's baked-in 9 GB) is never orphaned
+    by choosing a new location."""
+    dirs = []
+    if _custom_data_dir:
+        dirs.append(os.path.join(_custom_data_dir, "models"))
+    if MODELS_DIR not in dirs:
+        dirs.append(MODELS_DIR)
+    return dirs
+
+
+def model_download_dir():
+    """Where a NEW model download lands: the chosen location when
+    set, else the default models folder."""
+    return _gguf_dirs()[0]
+
+
+def _file_complete(p):
+    """True when p is a finished model file (same rule model_ready
+    has always used: exact pinned size, or >1 MB for test
+    overrides)."""
+    if not os.path.isfile(p):
+        return False
+    if not _MODEL_OVERRIDDEN:
+        return os.path.getsize(p) == MODEL_SIZE
+    return os.path.getsize(p) > 1_000_000
+
+
+def existing_model_path():
+    """The complete model file to USE - chosen location first,
+    legacy second - or None when no complete model exists."""
+    for d in _gguf_dirs():
+        p = os.path.join(d, MODEL_FILE)
+        if _file_complete(p):
+            return p
+    return None
+
+
 def model_path():
-    return os.path.join(MODELS_DIR, MODEL_FILE)
+    """The effective model path: the existing complete model when
+    one is found (chosen location first, legacy second), else the
+    path a download would write to."""
+    return existing_model_path() or os.path.join(
+        model_download_dir(), MODEL_FILE)
 
 
 def _expected_model_size():
@@ -135,12 +207,7 @@ def engine_path():
 def model_ready():
     if not engine_path():
         return False
-    p = model_path()
-    if not os.path.isfile(p):
-        return False
-    if not _MODEL_OVERRIDDEN:
-        return os.path.getsize(p) == MODEL_SIZE
-    return os.path.getsize(p) > 1_000_000
+    return existing_model_path() is not None
 
 
 def model_info():
@@ -156,6 +223,102 @@ def model_info():
         "size_gb": round((size or 0) / 1e9, 2),
         "downloaded": os.path.isfile(p),
     }
+
+
+# ---------------------------------------------------------------------------
+# Moving the model to a new storage location
+# ---------------------------------------------------------------------------
+
+_move_state = {"active": False, "pct": 0, "error": None,
+               "done": False, "target": ""}
+_move_lock = threading.Lock()
+_move_thread = None
+
+
+def model_move_state():
+    with _move_lock:
+        return dict(_move_state)
+
+
+def _set_move_state(**kw):
+    with _move_lock:
+        _move_state.update(kw)
+
+
+def start_model_move(new_data_dir, on_done=None):
+    """Move the existing model into <new_data_dir>/models on a
+    background thread: copy -> verify the copy (size always, and
+    SHA-256 against the pinned hash for the production model) ->
+    delete the original -> switch the effective location. On ANY
+    failure the partial copy is removed, the original stays put
+    and active, and the error lands in model_move_state() and
+    on_done(False, err). Returns False (no-op) when a move is
+    already running, there is no complete model to move, or the
+    model already lives at the target."""
+    global _move_thread
+    with _move_lock:
+        if _move_state["active"]:
+            return False
+    src = existing_model_path()
+    if not src:
+        return False
+    dst_dir = os.path.join(os.path.abspath(new_data_dir), "models")
+    dst = os.path.join(dst_dir, MODEL_FILE)
+    if os.path.abspath(src) == os.path.abspath(dst):
+        return False
+    _set_move_state(active=True, pct=0, error=None, done=False,
+                    target=dst)
+
+    def _work():
+        tmp = dst + ".moving"
+        try:
+            os.makedirs(dst_dir, exist_ok=True)
+            total = os.path.getsize(src)
+            done_b = 0
+            with open(src, "rb") as fin, open(tmp, "wb") as fout:
+                while True:
+                    chunk = fin.read(1 << 20)
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+                    done_b += len(chunk)
+                    _set_move_state(
+                        pct=int(done_b / total * 100) if total
+                        else 100)
+            if os.path.getsize(tmp) != total:
+                raise OSError("the copy came out the wrong size - "
+                              "the original was kept")
+            if not _MODEL_OVERRIDDEN:
+                h = hashlib.sha256()
+                with open(tmp, "rb") as f:
+                    while True:
+                        chunk = f.read(1 << 20)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+                if h.hexdigest() != MODEL_SHA256:
+                    raise OSError("the copy failed its integrity "
+                                  "check - the original was kept")
+            os.replace(tmp, dst)
+            os.remove(src)
+            set_data_dir(new_data_dir)
+            _set_move_state(active=False, pct=100, done=True)
+            if on_done:
+                on_done(True, None)
+        except Exception as e:  # noqa: BLE001 - reported, not raised
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            err = str(e)[:200]
+            _set_move_state(active=False, error=err, done=False)
+            if on_done:
+                on_done(False, err)
+
+    _move_thread = threading.Thread(target=_work, daemon=True)
+    _move_thread.start()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -639,18 +802,42 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
             # trailing window and are judged per chunk.
             stream_t0 = time.monotonic()
             samples = deque([(stream_t0, done)])
+            stream_error = None
             try:
                 with open(tmp, "ab" if have > 0 else "wb") as f:
-                    # 64 KB chunks, deliberately not 1 MB: the
-                    # buffered reader only yields once a full chunk
-                    # is available, so at 1 MB a ~5 KB/s route
-                    # yields (and stamps progress) less often than
-                    # the 120 s watchdog window, and throughput
-                    # samples arrive too coarsely to judge. At 64 KB
-                    # even that route yields every ~13 s.
-                    for chunk in r.iter_content(chunk_size=1 << 16):
+                    # Read the raw stream in 64 KB reads, deliberately
+                    # not iter_content: iter_content only yields FULL
+                    # chunks, so when a connection breaks (or a server
+                    # that lied about Content-Length closes) the final
+                    # partial chunk is discarded inside urllib3 - up
+                    # to 64 KB of received bytes thrown away per
+                    # attempt, which against a length-lying,
+                    # range-refusing server made every attempt end
+                    # one chunk short and the download never converge
+                    # (sweep2 N5). raw.read() hands over every byte
+                    # actually received before it raises. 64 KB reads
+                    # (not 1 MB) for the same reason as before: at
+                    # 1 MB a ~5 KB/s route yields (and stamps
+                    # progress) less often than the 120 s watchdog
+                    # window, and throughput samples arrive too
+                    # coarsely to judge; at 64 KB even that route
+                    # yields every ~13 s.
+                    raw = getattr(r, "raw", None)
+                    while True:
+                        try:
+                            if raw is not None:
+                                chunk = raw.read(1 << 16)
+                            else:  # transport without a raw stream
+                                chunk = next(r.iter_content(1 << 16),
+                                             b"")
+                        except Exception as e:  # noqa: BLE001
+                            # Judged after the loop: a premature
+                            # close raises here only AFTER every
+                            # received byte has been delivered.
+                            stream_error = e
+                            break
                         if not chunk:
-                            continue
+                            break
                         f.write(chunk)
                         done += len(chunk)
                         _mark_progress()
@@ -665,6 +852,16 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
                     raise _PermanentDownloadError(
                         f"not enough free disk space ({e})")
                 raise
+            if stream_error is not None:
+                # The stream broke. If the .part nevertheless holds
+                # exactly the expected byte count (the classic case:
+                # Content-Length lied long, the true body arrived in
+                # full, then the close raised), the download is not
+                # a failure - fall through to _verify_part and let
+                # the SHA-256 gate decide. Anything shorter keeps
+                # the original error and the normal resume path.
+                if not (expected_size and done == expected_size):
+                    raise stream_error
             break
     _verify_part(tmp, total, expected_sha256, stage=stage)
 
