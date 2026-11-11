@@ -94,20 +94,6 @@
 <main>
   <!-- ============ STUDIO HUB (home) ============ -->
   <section id="hubView" class="step-card hub-view">
-    <div class="hub-hero">
-      <div class="card-kicker">Itraji Studio</div>
-      <h1>What are we creating today?</h1>
-      <p class="sub">Every tool runs on your PC. The Built-in AI works fully offline — only the Video Generator uses the cloud, with your own fal.ai key.</p>
-      <div class="row">
-        <input id="hubUrlInput" type="text" placeholder="Paste a video link to start clipping…" spellcheck="false">
-        <button id="hubImportBtn" class="primary">Import &amp; clip</button>
-      </div>
-      <div class="row row-tight">
-        <input id="hubPathInput" type="text" placeholder="…or a local file path, e.g. C:\Videos\myvideo.mp4" spellcheck="false">
-        <button id="hubFileBtn" class="ghost-btn">Use local file</button>
-      </div>
-    </div>
-
     <div class="field-label home-label">Create</div>
     <div class="tool-grid" id="hubCreativeGrid">
       <button type="button" class="tool-card" data-tool="clipmaker" data-name="clip maker import video viral clips">
@@ -149,7 +135,7 @@
       </div>
       <div id="homeRecentsEmpty" class="empty-state hidden">
         <div class="empty-title">No projects yet</div>
-        <div class="empty-sub">Import your first video above and it will show up here, ready to reopen anytime.</div>
+        <div class="empty-sub">Import your first video with Clip Maker and it will show up here, ready to reopen anytime.</div>
       </div>
       <div id="homeRecents" class="library-grid"></div>
     </div>
@@ -538,6 +524,59 @@
       <div class="empty-sub">Generate your selected moments and the finished videos will land here.</div>
     </div>
     <div id="renders" class="renders-grid"></div>
+
+    <div id="enhancePanel" class="enh-panel hidden">
+      <div class="row-between">
+        <div>
+          <div class="empty-title" style="text-align:left">Your Clips Are Ready!</div>
+          <div class="empty-sub">Enhance them with the built-in Video Enhancer — the originals stay untouched.</div>
+        </div>
+        <span id="enhSummary" class="stage"></span>
+      </div>
+      <div class="row row-tight" style="margin-top:12px">
+        <div class="segmented" id="enhModeSeg">
+          <button type="button" data-value="smart" class="seg on">Smart (auto)</button>
+          <button type="button" data-value="custom" class="seg">Custom</button>
+        </div>
+        <span class="hint" id="enhModeHint">Analyses each clip and picks its settings — a clip that is already clean at full size is skipped, not re-encoded.</span>
+      </div>
+      <div id="enhCustom" class="row row-tight hidden" style="margin-top:10px">
+        <label class="enh-opt">Upscale
+          <select id="enhTarget" class="select">
+            <option value="0">No upscale</option>
+            <option value="1080">1080p</option>
+            <option value="1440">2K (1440)</option>
+            <option value="2160">4K (2160)</option>
+          </select></label>
+        <label class="enh-opt">Sharpen
+          <select id="enhSharpen" class="select">
+            <option value="off">Off</option>
+            <option value="light">Light</option>
+            <option value="medium">Medium</option>
+          </select></label>
+        <label class="enh-opt">Denoise
+          <select id="enhDenoise" class="select">
+            <option value="off">Off</option>
+            <option value="light">Light</option>
+            <option value="strong">Strong</option>
+          </select></label>
+        <label class="switch-row" for="enhColour"><span class="switch-text">Auto colour</span><span class="switch"><input type="checkbox" id="enhColour"><span class="track"><span class="thumb"></span></span></span></label>
+        <label class="switch-row hidden" id="enhStabWrap" for="enhStabilize"><span class="switch-text">Stabilize</span><span class="switch"><input type="checkbox" id="enhStabilize"><span class="track"><span class="thumb"></span></span></span></label>
+      </div>
+      <div id="enhClips" class="enh-clips"></div>
+      <div id="enhProgress" class="hidden" style="margin-top:12px">
+        <div class="bar"><div id="enhBar" class="fill"></div></div>
+        <div class="stage" id="enhStage">Enhancing…</div>
+      </div>
+      <p id="enhError" class="error hidden"></p>
+      <div id="enhDoneBanner" class="enh-done hidden">AI ENHANCEMENT COMPLETED — <span id="enhDoneText"></span></div>
+      <div class="row" style="margin-top:12px">
+        <button id="enhAllBtn" class="primary">Enhance All Clips</button>
+        <button id="enhPauseBtn" class="ghost-btn hidden">Pause queue</button>
+        <button id="enhDlAllBtn" class="ghost-btn">Download All Clips</button>
+        <button id="enhZipBtn" class="ghost-btn hidden">Download All Enhanced (ZIP)</button>
+      </div>
+    </div>
 
     <div class="planner-box">
       <div class="field-label">Posting planner <span class="hint">— local schedule queue. No auto-posting: it just keeps your plan.</span></div>
@@ -1125,6 +1164,28 @@
     </div>
     <div class="row">
       <button id="closePreviewBtn" class="ghost-btn">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- before/after compare modal (post-clipping enhancement) -->
+<div id="compareModal" class="modal hidden">
+  <div class="modal-box wide">
+    <h2 id="compareTitle">Before / After</h2>
+    <div class="compare-stage" id="compareStage">
+      <video id="compareAfter" muted loop playsinline></video>
+      <video id="compareBefore" muted loop playsinline></video>
+      <span class="compare-tag tag-before">Before</span>
+      <span class="compare-tag tag-after">After</span>
+      <div class="compare-divider" id="compareDivider"></div>
+    </div>
+    <input id="compareSlider" type="range" min="0" max="100" value="50" style="width:100%">
+    <div class="row row-tight">
+      <button id="comparePlayBtn" class="ghost-btn small" type="button">Play both</button>
+      <span id="compareStats" class="stage"></span>
+    </div>
+    <div class="row">
+      <button id="compareCloseBtn" class="ghost-btn">Close</button>
     </div>
   </div>
 </div>

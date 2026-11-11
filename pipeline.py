@@ -1657,6 +1657,401 @@ def enhance_video(video_path, out_path, progress_cb=None,
 
 
 # ---------------------------------------------------------------------------
+# Post-clipping batch enhancement (the Enhance-All queue in app.py)
+#
+# Everything here drives the SAME ffmpeg toolbox as enhance_video above
+# (Lanczos scale, hqdn3d, unsharp, eq) - there is no second engine.
+# A "plan" decides the filter chain:
+#   {target: short-side px to upscale to (None = keep), sharpen:
+#    off|light|medium, denoise: off|light|strong, colour: bool,
+#    stabilize: bool, skip: bool, why: str}
+# Frame interpolation is deliberately NOT offered: the bundled ffmpeg
+# ships minterpolate, but motion-compensated interpolation at
+# 1080x1920 measured >15x slower than realtime on CPU (an 8s clip
+# took minutes), which would wedge a batch queue; the cheap modes
+# (dup/blend) are not real interpolation and are not sold as such.
+# ---------------------------------------------------------------------------
+
+_ENHANCE_CAPS = None
+
+
+def enhance_capabilities():
+    """Which optional enhance filters the ACTUAL runtime ffmpeg has.
+    The UI only offers what this returns True for, so a build whose
+    ffmpeg lacks a filter simply never shows the option."""
+    global _ENHANCE_CAPS
+    if _ENHANCE_CAPS is not None:
+        return dict(_ENHANCE_CAPS)
+    caps = {"stabilize": False}
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           text=True, timeout=20)
+        out = r.stdout or ""
+        caps["stabilize"] = ("vidstabdetect" in out
+                             and "vidstabtransform" in out)
+    except Exception:  # noqa: BLE001 - no ffmpeg, no options
+        pass
+    _ENHANCE_CAPS = caps
+    return dict(caps)
+
+
+def _grab_gray_frame(video_path, t, sw=128):
+    """One small grayscale frame as bytes (ffmpeg rawvideo), or None."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, t):.2f}",
+             "-i", video_path, "-frames:v", "1",
+             "-vf", f"scale={sw}:-2,format=gray", "-f", "rawvideo", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+        out = r.stdout or b""
+        if len(out) < sw * 8:
+            return None
+        return out
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def analyze_clip(video_path):
+    """Cheap content probe for Smart enhance: dimensions/duration via
+    ffprobe, plus luma / noise / contrast / motion from 3 sampled
+    grayscale frames (pure Python over ~128px-wide frames, every 2nd
+    pixel - about a second per clip).
+
+    noise = mean |pixel - local 2x2 mean| (high-frequency residual):
+    measured calibration on this machine - clean studio-style frames
+    ~0.0-0.5, mild residual noise ~1-3, noisy broadcast ~8-12.
+    Returns None when probing fails (callers use safe defaults)."""
+    try:
+        W, H, fps = probe_video(video_path)
+        dur = probe_duration(video_path) or 0.0
+        if not W or not H or not dur:
+            return None
+        f1 = _grab_gray_frame(video_path, dur * 0.25)
+        f2 = _grab_gray_frame(video_path, dur * 0.60)
+        f3 = _grab_gray_frame(video_path, dur * 0.60 + 0.5)
+        frames = [f for f in (f1, f2) if f]
+        if not frames:
+            return None
+        sw = 128
+        sh = len(frames[0]) // sw
+        npix = 0
+        total = 0
+        dev = 0.0
+        for f in frames:
+            for i in range(0, len(f), 2):
+                v = f[i]
+                total += v
+                npix += 1
+        luma = total / max(1, npix)
+        for f in frames:
+            for i in range(0, len(f), 2):
+                d = f[i] - luma
+                dev += d if d >= 0 else -d
+        contrast = dev / max(1, npix)
+        # noise: residual against the 2x2 neighbourhood mean
+        acc = 0.0
+        cnt = 0
+        for f in frames:
+            for y in range(0, sh - 1, 2):
+                row = y * sw
+                nxt = row + sw
+                for x in range(0, sw - 1, 2):
+                    p = f[row + x]
+                    blur = (p + f[row + x + 1] + f[nxt + x]
+                            + f[nxt + x + 1]) >> 2
+                    d = p - blur
+                    acc += d if d >= 0 else -d
+                    cnt += 1
+        noise = acc / max(1, cnt)
+        motion = 0.0
+        if f2 and f3 and len(f2) == len(f3):
+            s = 0
+            n = 0
+            for i in range(0, len(f2), 2):
+                d = f2[i] - f3[i]
+                s += d if d >= 0 else -d
+                n += 1
+            motion = s / max(1, n)
+        return {"w": W, "h": H, "fps": fps, "duration": dur,
+                "short": min(W, H), "portrait": H > W,
+                "luma": round(luma, 1), "noise": round(noise, 2),
+                "contrast": round(contrast, 1),
+                "motion": round(motion, 2)}
+    except Exception:  # noqa: BLE001 - analysis is advisory only
+        return None
+
+
+def smart_enhance_plan(a):
+    """Decide a plan from analyze_clip() output. Conservative by
+    design: faces (portrait clips - this app's renders are talking-
+    head verticals) never get more than light sharpening, heavy
+    motion caps temporal denoise (smear guard), and a clip that is
+    already clean at full size is honestly skipped, not re-encoded."""
+    if not a:
+        return {"target": None, "sharpen": "light", "denoise": "light",
+                "colour": False, "stabilize": False, "skip": False,
+                "why": "Analysis unavailable - safe defaults "
+                       "(light denoise + light sharpen)."}
+    short, noise, luma = a["short"], a["noise"], a["luma"]
+    contrast, motion = a["contrast"], a["motion"]
+    target = 1080 if short < 1080 else None
+    if noise >= 5.0:
+        denoise = "strong"
+    elif noise >= 1.8:
+        denoise = "light"
+    else:
+        denoise = "off"
+    if motion > 20 and denoise == "strong":
+        denoise = "light"  # fast motion + strong temporal denoise = smear
+    colour = bool(luma < 60 or luma > 198 or contrast < 18)
+    if noise >= 5.0:
+        sharpen = "off"  # sharpening heavy noise makes it worse
+    elif target:
+        sharpen = "light"  # upscaling softens; restore a little bite
+    elif noise < 1.2:
+        sharpen = "off"  # already crisp and clean - nothing to gain,
+        # and this is what lets a finished full-size clip be skipped
+    elif a["portrait"]:
+        sharpen = "light"  # face cap: never aggressive on portraits
+    elif noise < 3.5:
+        sharpen = "medium"
+    else:
+        sharpen = "light"
+    skip = (target is None and denoise == "off" and not colour
+            and sharpen == "off")
+    bits = []
+    if target:
+        bits.append(f"upscale to {target}p")
+    if denoise != "off":
+        bits.append(f"{denoise} denoise (noise {noise})")
+    if colour:
+        bits.append(f"auto colour (luma {luma}, contrast {contrast})")
+    if sharpen != "off":
+        bits.append(f"{sharpen} sharpen")
+    why = ("Already high quality - skipped."
+           if skip else "Smart: " + (", ".join(bits) or "no change"))
+    return {"target": target, "sharpen": sharpen, "denoise": denoise,
+            "colour": colour, "stabilize": False, "skip": skip,
+            "why": why}
+
+
+def manual_enhance_plan(options, a):
+    """Normalise the user's Custom options into a plan. Upscale
+    targets never downscale; a target at/below the source size is
+    dropped (and noted in the plan's why)."""
+    options = options or {}
+    short = (a or {}).get("short")
+    target = options.get("target") or None
+    if target:
+        try:
+            target = int(target)
+        except (TypeError, ValueError):
+            target = None
+    note = ""
+    if target and short and target <= short:
+        note = f" (already >= {target}p, no upscale)"
+        target = None
+    sharpen = options.get("sharpen") or "off"
+    if sharpen not in ("off", "light", "medium"):
+        sharpen = "off"
+    denoise = options.get("denoise") or "off"
+    if denoise not in ("off", "light", "strong"):
+        denoise = "off"
+    caps = enhance_capabilities()
+    stabilize = bool(options.get("stabilize")) and caps["stabilize"]
+    bits = []
+    if target:
+        bits.append(f"upscale to {target}p")
+    if denoise != "off":
+        bits.append(f"{denoise} denoise")
+    if options.get("colour"):
+        bits.append("auto colour")
+    if sharpen != "off":
+        bits.append(f"{sharpen} sharpen")
+    if stabilize:
+        bits.append("stabilize")
+    return {"target": target, "sharpen": sharpen, "denoise": denoise,
+            "colour": bool(options.get("colour")),
+            "stabilize": stabilize, "skip": False,
+            "why": "Custom: " + (", ".join(bits) or "re-encode") + note}
+
+
+def plan_is_empty(plan):
+    """True when a plan would change nothing at all."""
+    return (not plan.get("target") and plan.get("denoise") == "off"
+            and not plan.get("colour") and plan.get("sharpen") == "off"
+            and not plan.get("stabilize"))
+
+
+def build_enhance_passes(src, out_path, plan, a, quality_tier="maximum",
+                         transforms_path=None):
+    """Build the ffmpeg pass list for a plan. Returns a list of
+    {cmd, lo, hi, stage} with progress windows over the whole job.
+    Stabilization (when planned) is a vidstabdetect pass (0-12%)
+    followed by the main transform+enhance pass."""
+    W = (a or {}).get("w") or 0
+    H = (a or {}).get("h") or 0
+    passes = []
+    vf = []
+    if plan.get("stabilize") and transforms_path:
+        passes.append({
+            "cmd": ["ffmpeg", "-y", "-v", "error", "-i", src,
+                    "-vf", "vidstabdetect=shakiness=5:accuracy=15:"
+                           f"result={transforms_path}",
+                    "-f", "null", "-"],
+            "lo": 0, "hi": 12, "stage": "Analysing camera motion"})
+        vf.append(f"vidstabtransform=smoothing=30:"
+                  f"input={transforms_path}")
+    dn = plan.get("denoise")
+    if dn == "light":
+        vf.append("hqdn3d=3:2:4:3")
+    elif dn == "strong":
+        vf.append("hqdn3d=7:5:9:7")
+    target = plan.get("target")
+    if target and W and H and min(W, H) < target:
+        f = target / float(min(W, H))
+        tw = int(round(W * f / 2.0)) * 2
+        th = int(round(H * f / 2.0)) * 2
+        vf.append(f"scale={tw}:{th}:flags=lanczos")
+    if plan.get("colour"):
+        luma = (a or {}).get("luma", 115)
+        contrast_v = (a or {}).get("contrast", 40)
+        bright = max(-0.03, min(0.10, (115.0 - luma) * 0.0009))
+        cont = 1.12 if contrast_v < 18 else 1.07
+        vf.append(f"eq=contrast={cont:.2f}:brightness={bright:.3f}:"
+                  "saturation=1.10")
+    sh = plan.get("sharpen")
+    if sh == "light":
+        vf.append("unsharp=5:5:0.45:5:5:0.0")
+    elif sh == "medium":
+        vf.append("unsharp=5:5:0.8:5:5:0.0")
+    cmd = (["ffmpeg", "-y", "-v", "error", "-i", src]
+           + (["-vf", ",".join(vf)] if vf else [])
+           + ["-map", "0:v:0", "-map", "0:a?"]
+           + _encode_args(quality_tier)
+           + ["-c:a", "aac", "-b:a", "192k", out_path])
+    lo = 12 if passes else 0
+    passes.append({"cmd": cmd, "lo": lo, "hi": 100,
+                   "stage": "Enhancing"})
+    return passes
+
+
+class FfmpegCancelled(Exception):
+    """Raised by run_ffmpeg_controlled when the caller cancels."""
+
+
+def _suspend_process(pid):
+    """Suspend a child process (POSIX SIGSTOP / Windows
+    NtSuspendProcess). Returns True when the suspend took effect."""
+    try:
+        if os.name == "posix":
+            import signal
+            os.kill(pid, signal.SIGSTOP)
+            return True
+        if os.name == "nt":
+            import ctypes
+            ntdll = ctypes.WinDLL("ntdll")
+            kernel32 = ctypes.WinDLL("kernel32")
+            handle = kernel32.OpenProcess(0x0800, False, pid)
+            if not handle:
+                return False
+            try:
+                return ntdll.NtSuspendProcess(handle) == 0
+            finally:
+                kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _resume_process(pid):
+    try:
+        if os.name == "posix":
+            import signal
+            os.kill(pid, signal.SIGCONT)
+            return True
+        if os.name == "nt":
+            import ctypes
+            ntdll = ctypes.WinDLL("ntdll")
+            kernel32 = ctypes.WinDLL("kernel32")
+            handle = kernel32.OpenProcess(0x0800, False, pid)
+            if not handle:
+                return False
+            try:
+                return ntdll.NtResumeProcess(handle) == 0
+            finally:
+                kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def run_ffmpeg_controlled(cmd, duration, progress_cb, lo, hi, stage,
+                          control):
+    """_run_ffmpeg_progress with a control channel: control is a
+    dict the caller mutates - {"cancel": True} terminates the run
+    (FfmpegCancelled), {"pause": True} suspends the ffmpeg process
+    until cleared (falls back to a no-op flag the caller can read
+    via control["pause_unsupported"] when the OS refuses)."""
+    import threading as _th
+    full = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
+    proc = subprocess.Popen(full, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            errors="replace")
+    tail = []
+    state = {"done": False, "suspended": False}
+
+    def _reader():
+        try:
+            for line in proc.stdout:
+                tail.append(line.rstrip())
+                if line.startswith("out_time_ms=") and duration:
+                    try:
+                        t = int(line.split("=", 1)[1]) / 1e6
+                    except ValueError:
+                        continue
+                    frac = min(1.0, max(0.0, t / duration))
+                    if progress_cb:
+                        progress_cb(lo + int((hi - lo) * frac), stage)
+        except Exception:  # noqa: BLE001
+            pass
+        state["done"] = True
+
+    reader = _th.Thread(target=_reader, daemon=True)
+    reader.start()
+    try:
+        while not state["done"]:
+            if control.get("cancel"):
+                if state["suspended"]:
+                    _resume_process(proc.pid)  # a stopped process
+                    state["suspended"] = False  # cannot take SIGTERM
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:  # noqa: BLE001
+                    proc.kill()
+                raise FfmpegCancelled()
+            want_pause = bool(control.get("pause"))
+            if want_pause and not state["suspended"]:
+                if _suspend_process(proc.pid):
+                    state["suspended"] = True
+                else:
+                    control["pause_unsupported"] = True
+            elif not want_pause and state["suspended"]:
+                _resume_process(proc.pid)
+                state["suspended"] = False
+            reader.join(timeout=0.2)
+    finally:
+        if state["suspended"]:
+            _resume_process(proc.pid)
+        proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError("ffmpeg failed: "
+                           + " | ".join(tail[-6:])[:400])
+
+
+# ---------------------------------------------------------------------------
 # ASS caption builder (karaoke word highlight + hook overlay)
 # ---------------------------------------------------------------------------
 

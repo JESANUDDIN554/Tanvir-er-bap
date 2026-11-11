@@ -1110,3 +1110,48 @@ button.danger-btn:disabled { background: var(--surface2); color: var(--muted2);
 .ai-success-title { font-weight: 900; letter-spacing: 0.8px;
   color: var(--accent); font-size: 15px; }
 .ai-check-row { padding: 5px 0; font-size: 13.5px; }
+
+/* ---- post-clipping enhancement panel ---- */
+.enh-panel { margin-top: 20px; background: rgba(var(--accent-rgb),0.04);
+  border: 1px solid rgba(var(--accent-rgb),0.18); border-radius: 14px;
+  padding: 16px; }
+.enh-clips { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.enh-row { display: flex; align-items: center; gap: 12px; padding: 9px 12px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; font-size: 13px; }
+.enh-row .planner-check { flex: none; }
+.enh-thumb { width: 46px; height: 72px; object-fit: cover; border-radius: 6px;
+  background: #000; flex: none; }
+.enh-thumb-ph { width: 46px; height: 72px; border-radius: 6px; background: #000;
+  flex: none; }
+.enh-main { flex: 1; min-width: 0; }
+.enh-name { font-weight: 650; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.enh-meta { color: var(--muted); font-size: 12px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.enh-status { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.enh-status .bar { height: 6px; margin: 5px 0 2px; }
+.enh-actions { display: flex; gap: 6px; flex: none; flex-wrap: wrap;
+  justify-content: flex-end; }
+.enh-opt { display: flex; flex-direction: column; gap: 4px; font-size: 12px;
+  color: var(--muted); }
+.enh-done { margin-top: 12px; border: 1px solid rgba(var(--accent-rgb), 0.5);
+  background: var(--accent-dim); border-radius: 10px; padding: 10px 14px;
+  font-weight: 800; letter-spacing: 0.4px; color: var(--accent);
+  font-size: 13.5px; }
+/* ---- before/after compare ---- */
+.compare-stage { position: relative; width: 100%; background: #000;
+  border-radius: 12px; overflow: hidden; --cmp: 50%; aspect-ratio: 9/16;
+  max-height: 62vh; margin: 0 auto; }
+.compare-stage video { position: absolute; inset: 0; width: 100%;
+  height: 100%; object-fit: contain; background: #000; }
+#compareBefore { clip-path: inset(0 calc(100% - var(--cmp)) 0 0); }
+.compare-divider { position: absolute; top: 0; bottom: 0;
+  left: var(--cmp); width: 2px; background: var(--accent);
+  transform: translateX(-1px); pointer-events: none; }
+.compare-tag { position: absolute; top: 10px; z-index: 2; font-size: 11px;
+  font-weight: 800; letter-spacing: 0.6px; padding: 3px 8px;
+  border-radius: 6px; background: rgba(0,0,0,0.65); color: #fff;
+  pointer-events: none; }
+.tag-before { left: 10px; }
+.tag-after { right: 10px; }

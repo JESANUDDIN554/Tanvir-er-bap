@@ -1357,6 +1357,7 @@ function renderRenders(renders) {
         <button class="ghost-btn small studioBtn" data-i="${i}">Edit captions</button>
         <button class="ghost-btn small srtBtn" data-i="${i}">SRT</button>
         <button class="ghost-btn small vttBtn" data-i="${i}">VTT</button>
+        <button class="ghost-btn small enhCardBtn" data-i="${i}">Enhance</button>
       </div>
       <div class="trim-row">
         <input type="text" class="trim-s" data-i="${i}" inputmode="decimal" placeholder="Start s" title="Trim start (seconds)">
@@ -1417,6 +1418,12 @@ function renderRenders(renders) {
       }
       startRender([mi]);
     }));
+  box.querySelectorAll(".enhCardBtn").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      await refreshEnhancePanel();
+      $("enhancePanel").scrollIntoView({ behavior: "smooth", block: "center" });
+      startEnhanceBatch([parseInt(btn.dataset.i, 10)]);
+    }));
   box.querySelectorAll(".planBtn").forEach((btn) =>
     btn.addEventListener("click", async () => {
       const i = parseInt(btn.dataset.i, 10);
@@ -1428,6 +1435,7 @@ function renderRenders(renders) {
     }));
   renderRenders._list = renders;
   refreshPlanner();
+  refreshEnhancePanel();
 }
 
 /* posting planner (local schedule queue - no auto-posting) */
@@ -2662,22 +2670,6 @@ $("homeSeeAllBtn").addEventListener("click", showLibrary);
 document.querySelectorAll(".tool-back").forEach((b) =>
   b.addEventListener("click", backToStudio));
 
-/* hub: quick import mirrors the Step-1 controls exactly */
-$("hubImportBtn").addEventListener("click", () => {
-  const url = $("hubUrlInput").value.trim();
-  if (!url) { toast("Paste a video link first", true); return; }
-  $("urlInput").value = url;
-  showWizard(1);
-  $("importBtn").click();
-});
-$("hubFileBtn").addEventListener("click", () => {
-  const p = $("hubPathInput").value.trim();
-  if (!p) { toast("Paste a local video file path first", true); return; }
-  $("localPathInput").value = p;
-  showWizard(1);
-  $("localFileBtn").click();
-});
-
 /* hub: tool cards */
 document.querySelectorAll(".tool-card").forEach((card) => {
   card.addEventListener("click", () => {
@@ -3121,6 +3113,298 @@ async function pollEnhancer() {
 $("enhancerFolderBtn").addEventListener("click", async () => {
   if (enhancerCurrentId) await api.enhance_open_folder(enhancerCurrentId);
 });
+
+/* ---------------- Post-clipping enhancement (Enhance All) ----------------
+   The "Your Clips Are Ready!" panel in step 3: batch-enhances the
+   project's renders with the built-in enhancer. Originals are never
+   touched; results land beside them as <name>_enhanced.mp4. */
+let enhBatchId = null;
+let enhTimer = null;
+let enhPanelData = [];       // last enhance_panel() renders
+let enhChecked = new Set();  // idxs ticked for enhancement
+let enhCapsLoaded = false;
+
+function enhOptions() {
+  const custom = $("enhModeSeg").querySelector(".seg.on") &&
+    $("enhModeSeg").querySelector(".seg.on").dataset.value === "custom";
+  return {
+    mode: custom ? "custom" : "smart",
+    target: parseInt($("enhTarget").value, 10) || 0,
+    sharpen: $("enhSharpen").value,
+    denoise: $("enhDenoise").value,
+    colour: $("enhColour").checked,
+    stabilize: $("enhStabilize").checked,
+  };
+}
+
+$("enhModeSeg").querySelectorAll(".seg").forEach((seg) =>
+  seg.addEventListener("click", () => {
+    $("enhModeSeg").querySelectorAll(".seg").forEach((s) =>
+      s.classList.toggle("on", s === seg));
+    const custom = seg.dataset.value === "custom";
+    $("enhCustom").classList.toggle("hidden", !custom);
+    $("enhModeHint").textContent = custom
+      ? "Your settings, applied to every ticked clip."
+      : "Analyses each clip and picks its settings — a clip that is already clean at full size is skipped, not re-encoded.";
+  }));
+
+async function refreshEnhancePanel() {
+  const panel = $("enhancePanel");
+  if (!jobId) { hide(panel); return; }
+  let res;
+  try { res = await api.enhance_panel(jobId); } catch (e) { return; }
+  if (!res || !res.ok || !res.renders || !res.renders.length) {
+    hide(panel);
+    return;
+  }
+  enhPanelData = res.renders;
+  if (!enhChecked.size)
+    res.renders.forEach((r) => enhChecked.add(r.idx));
+  show(panel);
+  const nEnh = res.renders.filter((r) => r.enhanced).length;
+  $("enhSummary").textContent =
+    `${res.renders.length} clip${res.renders.length > 1 ? "s" : ""}` +
+    (nEnh ? ` · ${nEnh} enhanced` : "");
+  $("enhZipBtn").classList.toggle("hidden", !nEnh);
+  if (!enhCapsLoaded) {
+    enhCapsLoaded = true;
+    try {
+      const caps = await api.enhance_caps();
+      if (caps && caps.stabilize) show($("enhStabWrap"));
+    } catch (e) { /* optional filters stay hidden */ }
+  }
+  renderEnhRows();
+}
+
+function enhRowStatus(r) {
+  if (r.enhanced)
+    return { text: `Enhanced ✓ ${r.enhanced.w}×${r.enhanced.h} · ` +
+      `${fmtBytes(r.enhanced.size)} · ${r.enhanced.seconds}s` +
+      (r.enhanced.why ? ` — ${r.enhanced.why}` : ""), cls: "done" };
+  return { text: "Not enhanced yet", cls: "" };
+}
+
+function renderEnhRows() {
+  const box = $("enhClips");
+  box.innerHTML = "";
+  enhPanelData.forEach((r) => {
+    const row = document.createElement("div");
+    row.className = "enh-row";
+    row.dataset.idx = r.idx;
+    const st = enhRowStatus(r);
+    row.innerHTML = `
+      <input type="checkbox" class="planner-check enh-check" data-i="${r.idx}"
+        ${enhChecked.has(r.idx) ? "checked" : ""} title="Include in Enhance All">
+      ${r.thumb_url
+        ? `<img class="enh-thumb" src="${r.thumb_url}" alt="">`
+        : `<div class="enh-thumb-ph"></div>`}
+      <div class="enh-main">
+        <div class="enh-name">${escapeHtml(r.title)}</div>
+        <div class="enh-meta">${r.w}×${r.h} · ${r.duration}s · ${fmtBytes(r.size)}</div>
+        <div class="enh-status" data-role="status">${escapeHtml(st.text)}</div>
+      </div>
+      <div class="enh-actions">
+        <button class="ghost-btn small enh-one" data-i="${r.idx}">Enhance</button>
+        ${r.enhanced ? `<button class="ghost-btn small enh-compare" data-i="${r.idx}">Compare</button>
+        <button class="ghost-btn small enh-dl" data-i="${r.idx}">Download</button>` : ""}
+      </div>`;
+    box.appendChild(row);
+  });
+  box.querySelectorAll(".enh-check").forEach((cb) =>
+    cb.addEventListener("change", () => {
+      const i = parseInt(cb.dataset.i, 10);
+      if (cb.checked) enhChecked.add(i); else enhChecked.delete(i);
+    }));
+  box.querySelectorAll(".enh-one").forEach((btn) =>
+    btn.addEventListener("click", () =>
+      startEnhanceBatch([parseInt(btn.dataset.i, 10)])));
+  box.querySelectorAll(".enh-compare").forEach((btn) =>
+    btn.addEventListener("click", () =>
+      openCompare(parseInt(btn.dataset.i, 10))));
+  box.querySelectorAll(".enh-dl").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const r = enhPanelData.find((x) =>
+        x.idx === parseInt(btn.dataset.i, 10));
+      if (r && r.enhanced) downloadUrl(r.enhanced.url);
+    }));
+}
+
+async function startEnhanceBatch(indices) {
+  hide($("enhError"));
+  hide($("enhDoneBanner"));
+  if (!indices.length) {
+    toast("Tick at least one clip to enhance", true);
+    return;
+  }
+  const res = await api.enhance_batch_start(jobId, indices, enhOptions());
+  if (!res.ok) {
+    $("enhError").textContent = res.error || "Enhance failed to start.";
+    show($("enhError"));
+    return;
+  }
+  enhBatchId = res.batch_id;
+  show($("enhProgress"));
+  $("enhBar").style.width = "0%";
+  $("enhStage").textContent = "Enhancing…";
+  show($("enhPauseBtn"));
+  $("enhPauseBtn").textContent = "Pause queue";
+  if (enhTimer) clearInterval(enhTimer);
+  enhTimer = setInterval(pollEnhBatch, 1000);
+  pollEnhBatch();
+}
+
+function enhSetRowState(idx, html, pct) {
+  const row = $("enhClips").querySelector(`.enh-row[data-idx="${idx}"]`);
+  if (!row) return;
+  const st = row.querySelector('[data-role="status"]');
+  if (st) st.innerHTML = html;
+  const acts = row.querySelector(".enh-actions");
+  if (acts && pct !== undefined) {
+    // keep buttons; progress lives in the status line
+  }
+}
+
+async function pollEnhBatch() {
+  if (!enhBatchId) { stopEnhPoll(); return; }
+  let st;
+  try { st = await api.enhance_batch_status(enhBatchId); }
+  catch (e) { return; }
+  if (!st.ok) { stopEnhPoll(); return; }
+  $("enhBar").style.width = (st.overall || 0) + "%";
+  const c = st.counts || {};
+  $("enhStage").textContent =
+    `Enhancing — ${c.done || 0} done` +
+    (c.skipped ? ` · ${c.skipped} skipped` : "") +
+    (c.failed ? ` · ${c.failed} failed` : "") +
+    ` · ${st.overall || 0}%`;
+  $("enhPauseBtn").textContent = st.paused ? "Resume queue" : "Pause queue";
+  (st.items || []).forEach((it) => {
+    let html;
+    if (it.state === "running")
+      html = `${escapeHtml(it.stage || "Enhancing")} — ${it.pct || 0}%` +
+        `<div class="bar"><div class="fill" style="width:${it.pct || 0}%"></div></div>`;
+    else if (it.state === "queued") html = "Queued";
+    else if (it.state === "done")
+      html = `Enhanced ✓ ${it.new ? it.new.w + "×" + it.new.h : ""} · ` +
+        `${it.seconds}s — ${escapeHtml(it.why || "")}`;
+    else if (it.state === "skipped")
+      html = escapeHtml(it.why || "Skipped");
+    else if (it.state === "failed")
+      html = `Failed — ${escapeHtml(it.error || "")} ` +
+        `<button class="ghost-btn small enh-retry" data-i="${it.idx}">Retry</button>`;
+    else if (it.state === "cancelled")
+      html = `Cancelled <button class="ghost-btn small enh-retry" data-i="${it.idx}">Retry</button>`;
+    else html = it.state;
+    if (it.state === "running" || it.state === "queued")
+      html += ` <button class="ghost-btn small enh-cancel" data-i="${it.idx}">Cancel</button>`;
+    enhSetRowState(it.idx, html);
+  });
+  $("enhClips").querySelectorAll(".enh-cancel").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      await api.enhance_batch_cancel(enhBatchId,
+        parseInt(btn.dataset.i, 10));
+      pollEnhBatch();
+    }));
+  $("enhClips").querySelectorAll(".enh-retry").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      await api.enhance_batch_retry(enhBatchId,
+        parseInt(btn.dataset.i, 10));
+      if (!enhTimer) {
+        show($("enhProgress"));
+        enhTimer = setInterval(pollEnhBatch, 1000);
+      }
+      pollEnhBatch();
+    }));
+  const active = (st.items || []).some((it) =>
+    it.state === "queued" || it.state === "running");
+  if (!active) {
+    stopEnhPoll();
+    hide($("enhProgress"));
+    hide($("enhPauseBtn"));
+    const done = c.done || 0, skipped = c.skipped || 0,
+      failed = c.failed || 0;
+    if (done || skipped) {
+      $("enhDoneText").textContent =
+        `${done} enhanced · ${skipped} skipped · ${failed} failed`;
+      show($("enhDoneBanner"));
+    }
+    if (failed) {
+      $("enhError").textContent =
+        `${failed} clip(s) failed — see the clip rows for the reason, then Retry.`;
+      show($("enhError"));
+    }
+    refreshEnhancePanel();
+  }
+}
+
+function stopEnhPoll() {
+  if (enhTimer) { clearInterval(enhTimer); enhTimer = null; }
+}
+
+$("enhAllBtn").addEventListener("click", () =>
+  startEnhanceBatch([...enhChecked].sort((a, b) => a - b)));
+$("enhPauseBtn").addEventListener("click", async () => {
+  if (!enhBatchId) return;
+  const st = await api.enhance_batch_status(enhBatchId);
+  if (st && st.ok && st.paused) await api.enhance_batch_resume(enhBatchId);
+  else await api.enhance_batch_pause(enhBatchId);
+  pollEnhBatch();
+});
+$("enhDlAllBtn").addEventListener("click", async () => {
+  const res = await api.make_zip(jobId, true);
+  if (res.ok && res.url) { downloadUrl(res.url); toast("Clips ZIP downloaded"); }
+  else toast(res.error || "ZIP failed", true);
+});
+$("enhZipBtn").addEventListener("click", async () => {
+  const res = await api.enhance_zip(jobId);
+  if (res.ok && res.url) { downloadUrl(res.url); toast("Enhanced ZIP downloaded"); }
+  else toast(res.error || "ZIP failed", true);
+});
+
+/* before/after compare */
+function openCompare(idx) {
+  const r = enhPanelData.find((x) => x.idx === idx);
+  if (!r || !r.enhanced) return;
+  $("compareTitle").textContent = "Before / After — " + r.title;
+  const stage = $("compareStage");
+  stage.style.aspectRatio = `${r.w} / ${r.h}`;
+  stage.style.width = r.w >= r.h ? "100%" : "min(400px, 100%)";
+  stage.style.setProperty("--cmp", "50%");
+  $("compareSlider").value = 50;
+  const before = $("compareBefore"), after = $("compareAfter");
+  before.src = r.url;
+  after.src = r.enhanced.url;
+  $("compareStats").textContent =
+    `${r.w}×${r.h} · ${fmtBytes(r.size)} → ` +
+    `${r.enhanced.w}×${r.enhanced.h} · ${fmtBytes(r.enhanced.size)} · ` +
+    `took ${r.enhanced.seconds}s`;
+  $("comparePlayBtn").textContent = "Play both";
+  show($("compareModal"));
+}
+function closeCompare() {
+  ["compareBefore", "compareAfter"].forEach((id) => {
+    const v = $(id);
+    try { v.pause(); } catch (e) { /* noop */ }
+    v.removeAttribute("src");
+    v.load();
+  });
+  hide($("compareModal"));
+}
+$("compareSlider").addEventListener("input", (e) => {
+  $("compareStage").style.setProperty("--cmp", e.target.value + "%");
+});
+$("comparePlayBtn").addEventListener("click", () => {
+  const b = $("compareBefore"), a = $("compareAfter");
+  if (b.paused && a.paused) {
+    b.currentTime = 0; a.currentTime = 0;
+    b.play(); a.play();
+    $("comparePlayBtn").textContent = "Pause both";
+  } else {
+    b.pause(); a.pause();
+    $("comparePlayBtn").textContent = "Play both";
+  }
+});
+$("compareCloseBtn").addEventListener("click", closeCompare);
 
 /* ---------------- Studio: Hook Maker ---------------- */
 let hookTimer = null;

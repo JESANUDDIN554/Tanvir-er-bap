@@ -54,6 +54,8 @@ BATCHES = {}
 _REMOVER_JOBS = {}  # Caption Remover runs (session-only, not Library)
 _GEN_JOBS = {}      # fal.ai generator runs (session-only)
 _ENHANCE_JOBS = {}  # Video Enhancer runs (session-only)
+_BENHANCE_BATCHES = {}  # Post-clipping Enhance-All queues (session-only;
+                        # results persist on the job's render records)
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"),
                               ".clipmaker_pc_settings.json")
 
@@ -2788,6 +2790,397 @@ class Api:
             pass
         return {"ok": True}
 
+    # -- Studio: post-clipping batch enhancement ------------------------
+    # "Enhance All Clips": a queue over the renders of one project,
+    # processed by the SAME enhancer toolbox as the Video Enhancer
+    # page (pipeline.enhance_video's filters; plans come from
+    # pipeline.smart_enhance_plan / manual_enhance_plan). Originals
+    # are never touched - output lands beside them as
+    # <name>_enhanced.mp4 and is recorded on the render record.
+
+    def enhance_caps(self):
+        """Optional-filter availability of the runtime ffmpeg."""
+        return {"ok": True, **_pipeline.enhance_capabilities()}
+
+    def _enh_thumb(self, job_id, src):
+        """Cached per-clip thumbnail (frame at ~1s) for the panel."""
+        thumb = os.path.splitext(src)[0] + ".thumb.jpg"
+        try:
+            if not os.path.isfile(thumb) \
+                    or os.path.getmtime(thumb) < os.path.getmtime(src):
+                dur = probe_duration(src) or 0
+                t = 1.0 if dur > 2 else max(0.0, dur / 2.0)
+                subprocess.run(
+                    ["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}",
+                     "-i", src, "-frames:v", "1",
+                     "-vf", "scale=270:-2", thumb],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=30)
+            if os.path.isfile(thumb):
+                return self._download_url(job_id, thumb)
+        except Exception:  # noqa: BLE001 - thumbs are decorative
+            pass
+        return None
+
+    def enhance_panel(self, job_id):
+        """Per-render info for the 'Your Clips Are Ready!' panel."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        _load_library()
+        job = JOBS.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Project not found."}
+        out = []
+        for i, r in enumerate(job.get("renders", [])):
+            p = r.get("path") or ""
+            if not p or not os.path.isfile(p):
+                continue
+            try:
+                W, H, _f = probe_video(p)
+                dur = probe_duration(p) or 0
+                size = os.path.getsize(p)
+            except Exception:  # noqa: BLE001
+                continue
+            enh = r.get("enhanced") or None
+            if enh and not os.path.isfile(enh.get("path") or ""):
+                enh = None
+            out.append({
+                "idx": i, "title": r.get("title") or
+                os.path.basename(p), "name": os.path.basename(p),
+                "w": W, "h": H, "duration": round(dur, 1),
+                "size": size, "url": self._download_url(job_id, p),
+                "thumb_url": self._enh_thumb(job_id, p),
+                "enhanced": enh})
+        return {"ok": True, "renders": out}
+
+    def enhance_batch_start(self, job_id, indices=None, options=None):
+        """Queue an Enhance-All/selected batch over a project's
+        renders. options: {mode: smart|custom, target, sharpen,
+        denoise, colour, stabilize} (custom fields ignored in smart
+        mode, where each clip's plan comes from its own analysis)."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        _load_library()
+        job = JOBS.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Project not found."}
+        options = options or {}
+        mode = options.get("mode") or "smart"
+        renders = job.get("renders", [])
+        if indices is None:
+            indices = list(range(len(renders)))
+        items = []
+        for i in indices:
+            try:
+                i = int(i)
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= i < len(renders)):
+                continue
+            r = renders[i]
+            src = r.get("path") or ""
+            if not src or not os.path.isfile(src):
+                continue
+            base, _ext = os.path.splitext(src)
+            items.append({
+                "idx": i, "title": r.get("title") or
+                os.path.basename(src), "src": src,
+                "out": base + "_enhanced.mp4",
+                "state": "queued", "pct": 0, "stage": "Queued",
+                "error": None, "plan": None, "why": None,
+                "seconds": None, "attempts": 0,
+                "orig": None, "new": None, "url": None,
+                "control": {"cancel": False, "pause": False}})
+        if not items:
+            return {"ok": False, "error": "No rendered clips on disk "
+                                          "to enhance."}
+        if mode != "smart":
+            probe = _pipeline.analyze_clip(items[0]["src"])
+            plan0 = _pipeline.manual_enhance_plan(options, probe)
+            if _pipeline.plan_is_empty(plan0) \
+                    and not plan0.get("target"):
+                return {"ok": False, "error": "Pick at least one "
+                        "enhancement option, or use Smart mode."}
+        bid = uuid.uuid4().hex[:12]
+        batch = {"id": bid, "job_id": job_id, "mode": mode,
+                 "options": options, "items": items, "paused": False,
+                 "state": "running", "worker_alive": False,
+                 "created": time.time()}
+        _BENHANCE_BATCHES[bid] = batch
+        self._benhance_kick(batch)
+        return {"ok": True, "batch_id": bid, "count": len(items)}
+
+    def _benhance_kick(self, batch):
+        if batch.get("worker_alive"):
+            return
+        batch["worker_alive"] = True
+        t = threading.Thread(target=self._run_benhance,
+                             args=(batch,), daemon=True)
+        t.start()
+
+    def _run_benhance(self, batch):
+        try:
+            while True:
+                item = next((it for it in batch["items"]
+                             if it["state"] == "queued"), None)
+                if item is None:
+                    return
+                while batch["paused"]:
+                    time.sleep(0.3)
+                    if not any(it["state"] == "queued"
+                               for it in batch["items"]):
+                        return
+                self._run_benhance_item(batch, item)
+        finally:
+            batch["worker_alive"] = False
+            if not any(it["state"] in ("queued", "running")
+                       for it in batch["items"]):
+                batch["state"] = "done"
+
+    def _run_benhance_item(self, batch, item):
+        item["state"] = "running"
+        item["pct"] = 0
+        item["stage"] = "Analysing"
+        item["error"] = None
+        ctl = item["control"]
+        ctl["cancel"] = False
+        ctl["pause"] = bool(batch["paused"])
+        src = item["src"]
+        tmp = os.path.splitext(item["out"])[0] + ".part.mp4"
+        trf = os.path.splitext(item["out"])[0] + ".trf"
+        t0 = time.time()
+        try:
+            W, H, _f = probe_video(src)
+            dur = probe_duration(src) or 0
+            item["orig"] = {"w": W, "h": H,
+                            "size": os.path.getsize(src),
+                            "duration": round(dur, 1)}
+            a = _pipeline.analyze_clip(src)
+            if batch["mode"] == "smart":
+                plan = _pipeline.smart_enhance_plan(a)
+            else:
+                plan = _pipeline.manual_enhance_plan(
+                    batch["options"], a)
+            item["plan"] = {k: plan.get(k) for k in
+                            ("target", "sharpen", "denoise", "colour",
+                             "stabilize")}
+            item["why"] = plan.get("why")
+            if plan.get("skip"):
+                item["state"] = "skipped"
+                item["pct"] = 100
+                item["stage"] = "Skipped"
+                item["seconds"] = round(time.time() - t0, 1)
+                return
+            settings = load_settings()
+            passes = _pipeline.build_enhance_passes(
+                src, tmp, plan, a,
+                quality_tier=settings.get("quality_tier", "maximum"),
+                transforms_path=trf)
+
+            def cb(pct, text, _item=item):
+                _item["pct"] = max(0, min(100, int(pct)))
+                _item["stage"] = text
+
+            for ps in passes:
+                _pipeline.run_ffmpeg_controlled(
+                    ps["cmd"], dur, cb, ps["lo"], ps["hi"],
+                    ps["stage"], ctl)
+            if not os.path.isfile(tmp) \
+                    or os.path.getsize(tmp) < 1024:
+                raise RuntimeError("Enhance produced no output file.")
+            os.replace(tmp, item["out"])
+            W2, H2, _f2 = probe_video(item["out"])
+            item["new"] = {"w": W2, "h": H2,
+                           "size": os.path.getsize(item["out"])}
+            item["url"] = self._download_url(batch["job_id"],
+                                             item["out"])
+            item["seconds"] = round(time.time() - t0, 1)
+            item["pct"] = 100
+            item["stage"] = "Done"
+            item["state"] = "done"
+            # record on the render record + persist
+            _load_library()
+            job = JOBS.get(batch["job_id"])
+            if job and 0 <= item["idx"] < len(job.get("renders", [])):
+                job["renders"][item["idx"]]["enhanced"] = {
+                    "path": item["out"], "url": item["url"],
+                    "w": W2, "h": H2,
+                    "size": item["new"]["size"],
+                    "seconds": item["seconds"],
+                    "why": item["why"]}
+                _save_job(batch["job_id"])
+            _job_log(batch["job_id"],
+                     "Enhanced - " + os.path.basename(item["out"]))
+        except _pipeline.FfmpegCancelled:
+            item["state"] = "cancelled"
+            item["stage"] = "Cancelled"
+            for p in (tmp, trf):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        except Exception as e:  # noqa: BLE001 - surfaced per clip
+            for p in (tmp, trf):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            item["attempts"] += 1
+            if item["attempts"] < 2:
+                item["state"] = "queued"
+                item["stage"] = "Retrying"
+                item["error"] = None
+            else:
+                item["state"] = "failed"
+                item["stage"] = "Failed"
+                item["error"] = str(e)[:300]
+        finally:
+            try:
+                os.remove(trf)
+            except OSError:
+                pass
+
+    def _benhance_public(self, batch):
+        items = []
+        for it in batch["items"]:
+            items.append({k: it.get(k) for k in (
+                "idx", "title", "state", "pct", "stage", "error",
+                "plan", "why", "seconds", "attempts", "orig", "new",
+                "url")})
+        total = len(items) or 1
+        eff = sum(100 if it["state"] in ("done", "skipped", "failed",
+                                         "cancelled")
+                  else (it["pct"] if it["state"] == "running" else 0)
+                  for it in batch["items"])
+        counts = {}
+        for it in batch["items"]:
+            counts[it["state"]] = counts.get(it["state"], 0) + 1
+        return {"ok": True, "id": batch["id"], "job_id": batch["job_id"],
+                "mode": batch["mode"], "paused": batch["paused"],
+                "state": batch["state"],
+                "overall": int(eff / total), "counts": counts,
+                "items": items}
+
+    def enhance_batch_status(self, batch_id):
+        batch = _BENHANCE_BATCHES.get(batch_id or "")
+        if not batch:
+            return {"ok": False, "error": "That enhance queue is gone "
+                                          "(the app was restarted). "
+                                          "Finished clips stay on "
+                                          "their render cards."}
+        return self._benhance_public(batch)
+
+    def enhance_batch_pause(self, batch_id):
+        batch = _BENHANCE_BATCHES.get(batch_id or "")
+        if not batch:
+            return {"ok": False, "error": "Queue not found."}
+        batch["paused"] = True
+        for it in batch["items"]:
+            if it["state"] == "running":
+                it["control"]["pause"] = True
+        return self._benhance_public(batch)
+
+    def enhance_batch_resume(self, batch_id):
+        batch = _BENHANCE_BATCHES.get(batch_id or "")
+        if not batch:
+            return {"ok": False, "error": "Queue not found."}
+        batch["paused"] = False
+        for it in batch["items"]:
+            it["control"]["pause"] = False
+        self._benhance_kick(batch)
+        return self._benhance_public(batch)
+
+    def enhance_batch_cancel(self, batch_id, idx):
+        batch = _BENHANCE_BATCHES.get(batch_id or "")
+        if not batch:
+            return {"ok": False, "error": "Queue not found."}
+        for it in batch["items"]:
+            if it["idx"] == idx:
+                if it["state"] == "running":
+                    it["control"]["cancel"] = True
+                elif it["state"] == "queued":
+                    it["state"] = "cancelled"
+                    it["stage"] = "Cancelled"
+                break
+        return self._benhance_public(batch)
+
+    def enhance_batch_retry(self, batch_id, idx):
+        batch = _BENHANCE_BATCHES.get(batch_id or "")
+        if not batch:
+            return {"ok": False, "error": "Queue not found."}
+        for it in batch["items"]:
+            if it["idx"] == idx and it["state"] in ("failed",
+                                                    "cancelled"):
+                it["state"] = "queued"
+                it["stage"] = "Queued"
+                it["error"] = None
+                it["attempts"] = 0
+                it["pct"] = 0
+                batch["state"] = "running"
+                self._benhance_kick(batch)
+                break
+        return self._benhance_public(batch)
+
+    def enhance_zip(self, job_id):
+        """Download-all-enhanced ZIP: every enhanced file recorded
+        on the project's renders (plus any *_enhanced.mp4 beside
+        them), built on demand like make_zip."""
+        import zipfile
+        gate = _license_gate()
+        if gate:
+            return gate
+        _load_library()
+        job = JOBS.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Project not found."}
+        paths = []
+        seen = set()
+        for r in job.get("renders", []):
+            enh = r.get("enhanced") or {}
+            p = enh.get("path") or ""
+            if p and os.path.isfile(p) and p not in seen:
+                seen.add(p)
+                paths.append(p)
+            src = r.get("path") or ""
+            if src:
+                cand = os.path.splitext(src)[0] + "_enhanced.mp4"
+                if os.path.isfile(cand) and cand not in seen:
+                    seen.add(cand)
+                    paths.append(cand)
+        if not paths:
+            return {"ok": False, "error": "No enhanced clips yet - "
+                                          "run Enhance All first."}
+        outdir = os.path.join(_job_folder(job_id), "clips")
+        os.makedirs(outdir, exist_ok=True)
+        build = uuid.uuid4().hex[:8]
+        zpath = os.path.join(outdir, f"enhanced-{build}.zip")
+        tmp = zpath + ".part"
+        try:
+            with zipfile.ZipFile(tmp, "w",
+                                 zipfile.ZIP_DEFLATED) as z:
+                for p in paths:
+                    z.write(p, arcname=os.path.basename(p))
+            os.replace(tmp, zpath)
+        except Exception as e:  # noqa: BLE001
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return {"ok": False, "error": "ZIP failed: " + str(e)[:160]}
+        for name in os.listdir(outdir):
+            if name.startswith("enhanced-") and name.endswith(".zip") \
+                    and os.path.join(outdir, name) != zpath:
+                try:
+                    os.remove(os.path.join(outdir, name))
+                except OSError:
+                    pass
+        _job_log(job_id, f"Enhanced ZIP built - {len(paths)} clips")
+        return {"ok": True, "path": zpath,
+                "url": self._download_url(job_id, zpath),
+                "filename": "enhanced.zip", "clips": len(paths)}
+
     # -- per-clip trim -------------------------------------------------
     def trim_moment(self, job_id, index, start, end):
         """Adjust a moment's start/end (seconds), clamped to the video."""
@@ -3799,6 +4192,8 @@ def make_wsgi_app(api):
                 fname = os.path.basename(fpath)
                 if ext == ".zip" and fname.startswith("clips-"):
                     fname = "clips.zip"
+                if ext == ".zip" and fname.startswith("enhanced-"):
+                    fname = "enhanced.zip"
                 headers.append((
                     "Content-Disposition",
                     "attachment; filename=" + fname))
