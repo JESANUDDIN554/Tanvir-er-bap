@@ -8,6 +8,7 @@ let selectedMoments = [];
 let lastMoments = [];
 let lastMomentsSig = "";
 let lastRendersSig = "";
+let lastLimitNote = "";
 let lastErrSig = "";
 let lastQueueSig = "";
 let controlsInitFor = null;
@@ -266,6 +267,18 @@ async function poll() {
     show($("renderError"));
     toast("Render failed", true);
   }
+  if (st.limit_note && st.limit_note !== lastLimitNote) {
+    // A usage-limit outcome is not a render failure: show the
+    // note itself (how many clips were made vs stopped) and
+    // refresh the sidebar allowance chip.
+    lastLimitNote = st.limit_note;
+    hide($("renderProgress"));
+    $("renderError").textContent = st.limit_note;
+    show($("renderError"));
+    toast(st.limit_note);
+    refreshClipsChip();
+  }
+  if (!st.limit_note) lastLimitNote = "";
   if (st.status === "done") {
     hide($("renderProgress"));
     hide($("renderError"));   // clear any stale error from a previous failed run
@@ -851,6 +864,34 @@ $("localAiDownloadBtn").addEventListener("click", async () => {
   refreshLocalAiStatus();
 });
 
+/* ---------------- license clip allowance chip ----------------
+   Shown ONLY for keys with a signed clip limit: "Clips left: N"
+   under the Built-in AI sidebar card. Unlimited keys (and the
+   locked activation state) never see it. A tampered usage
+   record shows its own honest label instead of a number. */
+async function refreshClipsChip() {
+  const chip = $("clipsLeftChip"), num = $("clipsLeftNum");
+  if (!chip || !num) return;
+  let u;
+  try { u = await api.usage_status(); } catch (e) { return; }
+  if (!u || !u.ok || !u.capped) { hide(chip); return; }
+  chip.classList.remove("low", "out");
+  if (u.state === "tampered") {
+    num.textContent = "usage data problem";
+    chip.classList.add("out");
+  } else {
+    num.textContent = String(u.remaining ?? "–");
+    if ((u.remaining ?? 0) <= 0) chip.classList.add("out");
+    else if ((u.remaining ?? 0) <= 5) chip.classList.add("low");
+  }
+  chip.title = "Clips remaining on this license key"
+    + (u.state === "tampered" ? "" :
+      ` — ${u.used ?? 0} of ${u.max_clips} used`);
+  show(chip);
+}
+refreshClipsChip();
+setInterval(refreshClipsChip, 30000);
+
 /* Clip length is a RANGE ("min-max" seconds). Legacy single-length
    settings ("60s", "2min", ...) migrate to a sensible range; a custom
    value is either a range ("30-60") or one exact number ("45"). */
@@ -1407,7 +1448,7 @@ async function startRender(indices) {
   if (!indices.length) { toast("Select at least one moment", true); return; }
   hide($("renderError"));
   const res = await api.render(jobId, indices, collectRenderOptions());
-  if (!res.ok) { toast(res.error || "Render failed", true); return; }
+  if (!res.ok) { toast(res.message || res.error || "Render failed", true); return; }
   reveal($("step3"));
   setStep(3);
   show($("renderProgress"));
@@ -3730,6 +3771,7 @@ async function pollHook() {
   }
   renderHookOut(st.renders || []);
   toast("Hook render finished");
+  refreshClipsChip();
 }
 
 function renderHookOut(renders) {
@@ -4352,6 +4394,25 @@ function renderAdminStats(d) {
     ["Built-in AI model", lic.model_ready ? "Downloaded ✓"
       : (lic.model_downloading ? "Downloading…" : "Not downloaded")],
     ["fal.ai key", lic.fal_key_set ? "Saved ✓" : "Not set"],
+  ]);
+  const usageStateTxt = {
+    unlimited: "Unlimited key — no counting",
+    ok: "Counting normally",
+    limit: "Limit reached — new clip renders paused",
+    tampered: "Usage data problem — record failed its integrity check",
+  }[lic.usage_state || "unlimited"];
+  $("adLimitsList").innerHTML = dlRows([
+    ["Key holder", lic.holder || "—"],
+    ["Key type", (lic.key_type || "—")
+      + (lic.role === "owner" ? " · Owner" : "")],
+    ["Clip allowance", lic.clip_allowance == null
+      ? "Unlimited" : lic.clip_allowance + " clips"],
+    ["Clips used (this PC)", lic.clips_used == null
+      ? "—" : String(lic.clips_used)],
+    ["Clips remaining", lic.clips_remaining == null
+      ? (lic.clip_allowance == null ? "Unlimited" : "—")
+      : String(lic.clips_remaining)],
+    ["Usage record", usageStateTxt],
   ]);
   const ram = (sys.ram_total
     ? fmtBytes(sys.ram_free || 0) + " free of "

@@ -65,6 +65,9 @@
       <span class="side-ai-dot" id="sideAiDot"></span>
       <span class="side-ai-text"><span class="side-ai-title">Built-in AI</span><span class="side-ai-status" id="sideAiText">Checking…</span></span>
     </button>
+    <div id="clipsLeftChip" class="side-clips hidden" title="Clips remaining on this license key">
+      <span class="side-clips-label">Clips left</span><span class="side-clips-num" id="clipsLeftNum">–</span>
+    </div>
     <button id="settingsBtn" class="side-item" data-nav="settings" title="Settings"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>Settings</span></button>
   </div>
 </aside>
@@ -1117,6 +1120,14 @@
       <div class="find-box">
         <div class="field-label">System &amp; storage</div>
         <dl class="admin-dl" id="adSystemList"></dl>
+      </div>
+    </div>
+
+    <div class="field" style="margin-top:18px">
+      <div class="find-box">
+        <div class="field-label">License &amp; Limits</div>
+        <dl class="admin-dl" id="adLimitsList"></dl>
+        <p class="hint">The allowance is baked into the license key's signature at issue time — it can only be changed by issuing a new key. Counts are this PC's own record of completed clip renders under the active key.</p>
       </div>
     </div>
 

@@ -193,6 +193,29 @@ def verify_license(key_str):
     return payload, pack_key
 
 
+def payload_max_clips(payload):
+    """The optional signed clip allowance in a verified payload.
+
+    The issuer (tools/issue_license.py --max-clips N) can bake a
+    usage limit into a key: the signed payload then carries
+    "max_clips": N. Because the field rides inside the Ed25519
+    signature, it can neither be added, raised nor stripped after
+    the fact - verification above has already authenticated the
+    whole payload before this reader is ever called on it.
+
+    Returns the positive int allowance, or None for UNLIMITED -
+    which is what every key minted before this feature (and any
+    key minted without the flag) means: the field absent, zero,
+    negative or not an int at all is never a limit. Activation is
+    untouched either way; enforcement lives in usage.py/app.py."""
+    if not isinstance(payload, dict):
+        return None
+    v = payload.get("max_clips")
+    if isinstance(v, bool) or not isinstance(v, int):
+        return None
+    return v if v > 0 else None
+
+
 def load_corepack(base_dir, pack_key):
     """Decrypt corepack.enc with the license-derived pack key.
     Returns the pack dict. Raises LicenseError on failure."""

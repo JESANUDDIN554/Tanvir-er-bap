@@ -44,6 +44,7 @@ from pipeline import (  # noqa: E402
 
 import local_ai  # noqa: E402  (built-in local LLM: engine/model/server)
 import admin  # noqa: E402  (Owner Admin Panel: sessions/log/stats)
+import usage  # noqa: E402  (per-key clip limits: signed max_clips)
 import ai_components  # noqa: E402  (AI Installation Manager backend)
 import licensing  # noqa: E402  (signed license + core pack + integrity)
 import updater  # noqa: E402  (signed file-replacement update packs)
@@ -1749,6 +1750,16 @@ class Api:
                 "exp": payload.get("exp", ""),
                 "reason": st.get("reason", "")}
 
+    def usage_status(self):
+        """Clip allowance of the active key, for the sidebar
+        "Clips left" chip: capped keys report their numbers;
+        unlimited keys say capped=False and the chip stays
+        hidden. Tampered records surface as their own state."""
+        u = _usage_status()
+        return {"ok": True, "capped": bool(u["capped"]),
+                "max_clips": u["max_clips"], "used": u["used"],
+                "remaining": u["remaining"], "state": u["state"]}
+
     def activate_license(self, key):
         st = licensing.try_unlock((key or "").strip(), BASE_DIR,
                                   _load_corepack)
@@ -2409,6 +2420,9 @@ class Api:
         gate = _license_gate()
         if gate:
             return gate
+        ugate = _usage_gate()
+        if ugate:
+            return ugate
         _load_library()
         job = JOBS.get(job_id)
         if not job:
@@ -2437,6 +2451,7 @@ class Api:
         try:
             self._render_hook_file(job_id, job, hook_text, start, end,
                                    90)
+            _usage_count(1)  # one completed hook clip
             self._hook_end(job, True, "Hook clip ready")
         except Exception as e:  # noqa: BLE001
             job["render_error"] = "Hook render failed: " + str(e)[:220]
@@ -2455,6 +2470,9 @@ class Api:
         gate = _license_gate()
         if gate:
             return gate
+        ugate = _usage_gate()
+        if ugate:
+            return ugate
         _load_library()
         job = JOBS.get(job_id)
         if not job:
@@ -2548,6 +2566,7 @@ class Api:
                 raise RuntimeError(merged.get("error")
                                    or "merge failed")
             job["renders"][-1]["title"] = "Hook + clip"
+            _usage_count(1)  # the combo counts once, as one clip
             self._hook_end(job, True, "Hook + clip ready")
         except Exception as e:  # noqa: BLE001
             job["render_error"] = ("Hook + clip failed: "
@@ -2598,6 +2617,9 @@ class Api:
         gate = _license_gate()
         if gate:
             return gate
+        ugate = _usage_gate()
+        if ugate:
+            return ugate
         _load_library()
         job = JOBS.get(job_id)
         if not job:
@@ -2684,6 +2706,7 @@ class Api:
                     "url": self._download_url(job_id, out)})
                 _job_log(job_id, "Render finished - "
                          + os.path.basename(out))
+                _usage_count(1)  # the teaser counts once
                 self._hook_end(job, True, "Teaser ready")
                 _save_job(job_id)
                 return
@@ -2699,6 +2722,7 @@ class Api:
                 raise RuntimeError(merged.get("error")
                                    or "merge failed")
             job["renders"][-1]["title"] = "Teaser"
+            _usage_count(1)  # the teaser counts once, as one clip
             job["renders"][-1]["teaser"] = True
             job["renders"][-1]["teaser_note"] = (
                 f"Cold open {hs:.1f}-{he:.1f}s, then the full clip "
@@ -3563,6 +3587,9 @@ class Api:
         gate = _license_gate()
         if gate:
             return gate
+        ugate = _usage_gate()
+        if ugate:
+            return ugate
         job = JOBS.get(job_id)
         if not job or not job.get("moments"):
             return {"ok": False, "error": "Nothing to render yet."}
@@ -3594,6 +3621,7 @@ class Api:
                                     "logo_path", "quality_tier")}
         job["status"] = "working"
         job.pop("render_error", None)  # don't ship a stale failure
+        job.pop("limit_note", None)  # ...or a stale cap notice
         t = threading.Thread(
             target=self._run_render,
             args=(job_id, list(indices), opts),
@@ -3668,8 +3696,24 @@ class Api:
             eff_params = _pipeline.normalize_caption_params(
                 opts["caption_params"],
                 opts.get("caption_style", "bold-pop"))
+        # Usage limit: a capped key renders only while allowance
+        # remains. The remaining count is re-read before EVERY
+        # clip (another job may be counting against the same
+        # key), and each finished clip is counted the moment its
+        # file exists. Hitting the cap mid-batch keeps the clips
+        # already made and stops cleanly - see the tail below.
+        made = 0
+        limit_hit = False
+        tamper_hit = False
         try:
             for n, i in enumerate(indices):
+                u0 = _usage_status()
+                if u0["state"] == "tampered":
+                    tamper_hit = True
+                    break
+                if u0["capped"] and (u0["remaining"] or 0) <= 0:
+                    limit_hit = True
+                    break
                 m = job["moments"][i]
                 _job_log(job_id, f"Render started - clip {n + 1} of "
                                  f"{len(indices)}: {m['title']}")
@@ -3722,16 +3766,61 @@ class Api:
                 job["renders"] = renders
                 _job_log(job_id, "Render finished - "
                          + os.path.basename(out))
+                # count the finished clip against the key's
+                # allowance (no-op for unlimited keys)
+                made += 1
+                _usage_count(1)
             job["renders"] = renders
             # Release BEFORE the status flips to done: the caller's
             # finally used to be the only release, so a re-render
             # started in that gap saw status=done yet was refused
             # with render_in_progress (sweep2 T4).
             _release_render_lock(job)
-            job["status"] = "done"
-            job["stage"] = f"Done - {len(renders)} clips rendered"
-            job["progress"] = 100
-            job.pop("render_error", None)
+            if tamper_hit:
+                job["status"] = "moments"
+                job["stage"] = "Usage data problem"
+                job["limit_note"] = (
+                    "Usage data problem — contact your provider. "
+                    f"{made} of {len(indices)} clips were rendered "
+                    "before the render stopped.")
+                job["progress"] = 100
+                job.pop("render_error", None)
+                _job_log(job_id, "Usage record failed its integrity "
+                                 "check - batch stopped")
+            elif limit_hit:
+                # Honest partial: the clips that exist are listed,
+                # the stage + limit_note say exactly how many were
+                # made vs stopped - never a plain "Done".
+                u = _usage_status()
+                job["status"] = "moments"
+                job["stage"] = (
+                    f"Clip limit reached - {made} of "
+                    f"{len(indices)} clips rendered")
+                job["limit_note"] = (
+                    "Clip limit reached — this key includes "
+                    f"{u['max_clips']} clips and all are used. "
+                    f"{made} of {len(indices)} clips were rendered; "
+                    "the rest were stopped. Please contact your "
+                    "provider to top up.")
+                job["progress"] = 100
+                job.pop("render_error", None)
+                _job_log(job_id, "Clip limit reached - batch "
+                                 f"stopped after {made} clips")
+            else:
+                job["status"] = "done"
+                job["stage"] = f"Done - {len(renders)} clips rendered"
+                job["progress"] = 100
+                job.pop("render_error", None)
+                # A batch that lands exactly on the cap is a full
+                # success - but say the key is now used up, so the
+                # next refusal is never a surprise.
+                u = _usage_status()
+                if u["capped"] and u["state"] == "limit":
+                    job["limit_note"] = (
+                        "Clip limit reached — this key includes "
+                        f"{u['max_clips']} clips and all are now "
+                        "used. Please contact your provider to "
+                        "top up.")
         except Exception as e:  # noqa: BLE001
             _release_render_lock(job)
             job["status"] = "moments"
@@ -4220,6 +4309,7 @@ class Api:
             "error": job.get("error", ""),
             "detect_error": job.get("detect_error", ""),
             "render_error": job.get("render_error", ""),
+            "limit_note": job.get("limit_note", ""),
             "title": job["title"],
             "duration": job["duration"],
             "long_video": bool(job["duration"]
@@ -4315,6 +4405,50 @@ def _license_gate():
     if reason is None:
         return None
     return {"ok": False, "error": "locked", "message": reason}
+
+
+# -- Usage limits (signed "max_clips" allowance per key) -------------
+# Only NEW clip renders are gated/counted (see usage.py for the
+# record + HMAC design). Detection, transcription, the Library and
+# enhancements never consult this: at the cap the app stays fully
+# usable, only rendering pauses.
+
+def _usage_status():
+    """Usage state of the ACTIVE license key (see usage.status)."""
+    st = _ensure_license()
+    return usage.status(_current_license_key(),
+                        st.get("payload") or {})
+
+
+def _usage_gate():
+    """None when a new clip render may start, else an error dict.
+    Two distinct refusals: the allowance is used up (clip_limit),
+    or the local usage record failed its integrity check
+    (usage_data_problem) - never conflated."""
+    u = _usage_status()
+    if u["state"] == "tampered":
+        return {"ok": False, "error": "usage_data_problem",
+                "message": "Usage data problem — contact your "
+                           "provider."}
+    if u["state"] == "limit":
+        return {"ok": False, "error": "clip_limit",
+                "message": "Clip limit reached — this key includes "
+                           f"{u['max_clips']} clips. Please contact "
+                           "your provider to top up."}
+    return None
+
+
+def _usage_count(n=1):
+    """Count n completed clip renders against the active key.
+    No-op for unlimited keys (no record is ever written for
+    them). Returns the fresh usage status, or None on trouble -
+    counting must never break a finished render."""
+    try:
+        st = _ensure_license()
+        return usage.count_clip(_current_license_key(),
+                                st.get("payload") or {}, n)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _COREPACK_READY():
@@ -4474,6 +4608,10 @@ def _admin_stats_payload():
         dl = local_ai.download_state()
     except Exception:  # noqa: BLE001
         dl = {}
+    # License & Limits: the signed clip allowance (if any) + this
+    # installation's own usage record - the same numbers app.py's
+    # render gates enforce (usage.py). Unlimited keys say so.
+    lic_usage = usage.status(_current_license_key(), payload)
     license_panel = {
         "unlocked": bool(state.get("unlocked")),
         "holder": payload.get("name") or "",
@@ -4489,6 +4627,10 @@ def _admin_stats_payload():
         "model_file": local_ai.MODEL_FILE,
         "model_downloading": bool(dl.get("downloading")),
         "fal_key_set": bool((settings.get("fal_key") or "").strip()),
+        "clip_allowance": lic_usage["max_clips"],
+        "clips_used": lic_usage["used"],
+        "clips_remaining": lic_usage["remaining"],
+        "usage_state": lic_usage["state"],
     }
     entries = admin.read_api_log(500)
     return {"ok": True,
