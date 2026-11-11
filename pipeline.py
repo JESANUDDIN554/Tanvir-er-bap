@@ -515,15 +515,21 @@ def _parse_local_moments(data, clip_max_s):
 
 
 def detect_moments_local(words, clip_min_s, clip_max_s,
-                         max_clips=8, progress_cb=None):
+                         max_clips=8, progress_cb=None,
+                         category="general", audio_profile=None):
     """Find viral moments with the built-in local AI.
 
     Mirrors detect_moments() inputs and output shape, but the model
     (Qwen2.5-14B via llama.cpp, see local_ai.py) runs on this machine -
     no key. Raises RuntimeError with a plain message when the model
     is not downloaded yet or the engine fails; never invents moments.
+
+    A content category appends its focus line to the prompt; the
+    Phase-1 subscores attached afterwards stay signal-derived (the
+    model's own virality/hook/reason are untouched).
     """
     import local_ai
+    category, _cat = category_info(category)
 
     if not PROMPT_TEMPLATE:
         raise RuntimeError(_LOCKED_MSG)
@@ -548,6 +554,9 @@ def detect_moments_local(words, clip_min_s, clip_max_s,
         prompt = PROMPT_TEMPLATE.format(
             min_s=clip_min_s, max_s=clip_max_s,
             max_clips=max_clips, transcript=transcript_text(cwords))
+        if _cat["focus"]:
+            prompt += ("\n\nContent category: " + _cat["label"]
+                       + ". " + _cat["focus"])
         reply = local_ai.chat(
             [{"role": "user", "content": prompt}], progress_cb)
         try:
@@ -583,6 +592,11 @@ def detect_moments_local(words, clip_min_s, clip_max_s,
               if w["end"] > m["start"] and w["start"] < m["end"]]
         m["signals"] = window_signals(ww, prev_content,
                                       m["end"] - m["start"])
+        _attach_subscores(
+            m, ww, prev_content, m["end"] - m["start"],
+            category=category,
+            audio_level=_window_audio_level(audio_profile,
+                                            m["start"], m["end"]))
         prev_content = _content_words(ww)
     if progress_cb:
         progress_cb(100, f"Found {len(picked)} moments")
@@ -634,10 +648,15 @@ def _content_words(win_words):
             and _clean_word(w["word"]) not in _OFFLINE_STOPWORDS}
 
 
-def _window_components(win_words, prev_content, win_dur):
+def _window_components(win_words, prev_content, win_dur, lexicon=None):
     """Raw signal components for one candidate window - shared by the
     offline scorer and the score-explanation chips so the explanation
-    always matches the number it explains."""
+    always matches the number it explains.
+
+    lexicon: optional set of category words (content-category modes);
+    hits are reported separately (lex_hits/lex_score) and never change
+    the base components, so a general/no-category run is numerically
+    identical to before."""
     n = len(win_words)
     density = n / max(win_dur, 0.1)  # words per second
     # ~1.5 wps is calm speech, ~2.8+ is rapid/excited
@@ -650,6 +669,17 @@ def _window_components(win_words, prev_content, win_dur):
     energy_hits = [w["word"].strip(",.!?;:") for w in win_words
                    if _clean_word(w["word"]) in OFFLINE_ENERGY_WORDS]
     energy_score = min(100, len(energy_hits) * 22)
+
+    lex_hits = []
+    if lexicon:
+        lex_hits = [w["word"].strip(",.!?;:")
+                    for w in win_words
+                    if _clean_word(w["word"]) in lexicon]
+    lex_score = min(100, len(lex_hits) * 20)
+
+    emo_hits = [w["word"].strip(",.!?;:") for w in win_words
+                if _clean_word(w["word"]) in EMOTION_WORDS]
+    emo_score = min(100, len(emo_hits) * 20)
 
     caps = sum(1 for w in win_words
                if len(w["word"]) > 2 and w["word"].isupper())
@@ -676,6 +706,8 @@ def _window_components(win_words, prev_content, win_dur):
         "density": density, "density_score": density_score,
         "punct": punct, "punct_score": punct_score,
         "energy_hits": energy_hits, "energy_score": energy_score,
+        "lex_hits": lex_hits, "lex_score": lex_score,
+        "emo_hits": emo_hits, "emo_score": emo_score,
         "caps": caps, "caps_score": caps_score,
         "novelty_score": novelty_score,
         "silence": silence, "silence_pen": silence_pen,
@@ -726,10 +758,441 @@ def window_signals(win_words, prev_content=None, win_dur=None):
                                             win_dur))
 
 
-def _score_offline_window(win_words, prev_content, win_dur):
+# ---------------------------------------------------------------------------
+# Phase 1: multi-dimensional scoring + content-category modes
+# ---------------------------------------------------------------------------
+# Every detected moment gains named subscores (hook / retention /
+# emotion / story) next to its existing overall virality, each with a
+# one-line reason measured from the same window, plus a platform
+# recommendation. All subscores are SIGNAL-DERIVED and deterministic:
+# transcript measurements (pace, punctuation, lexical hits, novelty,
+# sentence structure) and, when the caller supplies an audio energy
+# profile, the window's voice level relative to the whole video.
+# No model ever overrides a number; the Built-in AI's own overall
+# virality/hook on its moments stays the model's, as before.
+
+EMOTION_WORDS = {
+    "afraid", "scared", "terrified", "terrifying", "panic", "panicked",
+    "angry", "furious", "mad", "screaming", "screams", "scream",
+    "crying", "cried", "tears", "laughing", "laughs", "hilarious",
+    "shocked", "shocking", "surprised", "surprise", "desperate",
+    "begging", "please", "help", "hurting", "pain", "afraid",
+    "worried", "nervous", "excited", "thrilled", "amazed", "stunned",
+    "speechless", "unbelievable", "incredible", "horrible", "terrible",
+    "awful", "wonderful", "beautiful", "hate", "hated", "love",
+    "loved", "scary", "frightened", "alarmed", "distraught",
+}
+
+# Category modes: a per-project content category re-weights detection
+# and subscores toward what performs in that genre. "weights" scale
+# the virality components (renormalised, so all-1.0 == the historical
+# formula exactly); "lexicon" words are counted as category hits and
+# feed "lex_bias" (max points added to a subscore at a full lexicon
+# score); "focus" is the one line handed to the Built-in AI prompt.
+_CAT_W = {"density": 1.0, "energy": 1.0, "punct": 1.0,
+          "novelty": 1.0, "caps": 1.0}
+CATEGORIES = {
+    "general": {
+        "label": "General",
+        "focus": "",
+        "lexicon": set(),
+        "weights": dict(_CAT_W),
+        "lex_bias": {"hook": 0, "retention": 0, "emotion": 0,
+                     "story": 0},
+    },
+    "bodycam": {
+        "label": "Bodycam / Police",
+        "focus": ("Bodycam/police footage: prioritise escalation, "
+                  "shouted commands, resistance, pursuits, weapons, "
+                  "arrests and surprise reveals over calm talk."),
+        "lexicon": {
+            "stop", "hands", "police", "officer", "officers", "arrest",
+            "arrested", "arresting", "chase", "chasing", "pursuit",
+            "fleeing", "fled", "resist", "resisting", "resisted",
+            "weapon", "gun", "knife", "shots", "fired", "taser",
+            "tased", "backup", "suspect", "suspects", "driver",
+            "license", "warrant", "detain", "detained", "custody",
+            "handcuffs", "cuffs", "siren", "sirens", "radio",
+            "dispatch", "vehicle", "pulled", "traffic", "dui",
+            "intoxicated", "property", "trespassing",
+        },
+        "weights": {"density": 1.0, "energy": 1.25, "punct": 1.15,
+                    "novelty": 0.85, "caps": 1.2},
+        "lex_bias": {"hook": 10, "retention": 4, "emotion": 16,
+                     "story": 6},
+    },
+    "podcast": {
+        "label": "Podcast",
+        "focus": ("Podcast conversation: prioritise personal stories, "
+                  "disagreements, revelations, hot takes and laughter "
+                  "over small talk."),
+        "lexicon": {
+            "story", "remember", "believe", "honestly", "honest",
+            "actually", "opinion", "disagree", "secret", "learned",
+            "mistake", "regret", "funny", "laughed", "laughing",
+            "crazy", "realised", "realized", "truth", "admit",
+            "confession", "experience", "growing", "childhood",
+        },
+        "weights": {"density": 0.9, "energy": 1.0, "punct": 1.0,
+                    "novelty": 1.2, "caps": 0.8},
+        "lex_bias": {"hook": 8, "retention": 8, "emotion": 8,
+                     "story": 14},
+    },
+    "interview": {
+        "label": "Interview",
+        "focus": ("Interview: prioritise revealing answers, career "
+                  "turning points, challenges, advice and surprising "
+                  "admissions over introductions and small talk."),
+        "lexicon": {
+            "question", "answer", "career", "started", "challenge",
+            "challenges", "advice", "success", "failure", "failed",
+            "journey", "experience", "inspired", "decision",
+            "difficult", "learned", "opportunity", "risk",
+        },
+        "weights": {"density": 0.9, "energy": 0.95, "punct": 1.05,
+                    "novelty": 1.15, "caps": 0.8},
+        "lex_bias": {"hook": 8, "retention": 8, "emotion": 6,
+                     "story": 12},
+    },
+    "gaming": {
+        "label": "Gaming",
+        "focus": ("Gaming footage: prioritise clutch plays, wins and "
+                  "losses, boss fights, rare loot, big reactions and "
+                  "funny fails over quiet grinding."),
+        "lexicon": {
+            "kill", "kills", "killed", "clutch", "win", "winning",
+            "won", "lose", "losing", "lost", "boss", "level",
+            "headshot", "stream", "chat", "raid", "loot", "respawn",
+            "insane", "clip", "ranked", "match", "round", "final",
+        },
+        "weights": {"density": 1.1, "energy": 1.2, "punct": 1.1,
+                    "novelty": 0.95, "caps": 1.1},
+        "lex_bias": {"hook": 10, "retention": 6, "emotion": 12,
+                     "story": 4},
+    },
+    "education": {
+        "label": "Education",
+        "focus": ("Educational content: prioritise clear explanations, "
+                  "key insights, common mistakes, worked examples and "
+                  "memorable takeaways over introductions."),
+        "lexicon": {
+            "learn", "important", "remember", "example", "because",
+            "understand", "concept", "step", "steps", "mistake",
+            "tip", "tips", "explains", "explain", "means", "reason",
+            "actually", "works", "formula", "method",
+        },
+        "weights": {"density": 0.95, "energy": 0.9, "punct": 0.9,
+                    "novelty": 1.2, "caps": 0.7},
+        "lex_bias": {"hook": 6, "retention": 12, "emotion": 3,
+                     "story": 10},
+    },
+    "news": {
+        "label": "News / Commentary",
+        "focus": ("News and commentary: prioritise breaking "
+                  "developments, official statements, confirmed facts, "
+                  "witness accounts and strong reactions over "
+                  "background recaps."),
+        "lexicon": {
+            "breaking", "report", "reported", "officials", "official",
+            "confirmed", "incident", "statement", "investigation",
+            "according", "witnesses", "witness", "update",
+            "developing", "authorities", "announced", "scene",
+        },
+        "weights": {"density": 1.0, "energy": 1.05, "punct": 1.0,
+                    "novelty": 1.15, "caps": 0.9},
+        "lex_bias": {"hook": 8, "retention": 6, "emotion": 6,
+                     "story": 10},
+    },
+}
+
+
+def category_info(category):
+    """(key, info) for a category key - unknown keys land on general."""
+    key = str(category or "general").strip().lower()
+    if key not in CATEGORIES:
+        key = "general"
+    return key, CATEGORIES[key]
+
+
+def audio_energy_profile(video_path, bucket_s=1.0):
+    """Per-bucket voice level of a video's audio, or None.
+
+    Streams the audio through ffmpeg as 8 kHz mono PCM (no temp
+    files, constant memory) and returns [{"t", "mean_db", "peak_db"}]
+    plus the median mean level under key "_median_db" on the list's
+    first element... (kept simple: returns (buckets, median_db)).
+    Any failure (no audio stream, ffmpeg error) returns None - the
+    scorers then simply drop their audio terms."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    sr = 8000
+    per = int(sr * bucket_s)
+    cmd = ["ffmpeg", "-v", "error", "-i", str(video_path),
+           "-vn", "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    buckets = []
+    try:
+        idx = 0
+        while True:
+            raw = proc.stdout.read(per * 2)
+            if not raw:
+                break
+            a = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+            if not len(a):
+                break
+            rms = float(np.sqrt(np.mean(a * a))) if len(a) else 0.0
+            peak = float(np.max(np.abs(a))) if len(a) else 0.0
+            mean_db = 20 * math.log10(rms / 32768.0) if rms > 0 else -80.0
+            peak_db = 20 * math.log10(peak / 32768.0) if peak > 0 else -80.0
+            buckets.append({"t": round(idx * bucket_s, 2),
+                            "mean_db": round(mean_db, 1),
+                            "peak_db": round(peak_db, 1)})
+            idx += 1
+    except Exception:  # noqa: BLE001 - profiling is best-effort
+        buckets = []
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            proc.wait(timeout=30)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+    if len(buckets) < 2:
+        return None
+    means = sorted(b["mean_db"] for b in buckets)
+    median_db = means[len(means) // 2]
+    return buckets, median_db
+
+
+def _window_audio_level(profile, start, end):
+    """(mean_db, peak_db, arousal 0-100) for [start, end] from an
+    audio_energy_profile() result, or None. Arousal is the window's
+    level ABOVE the video's own median - a shout in a quiet video
+    counts more than the same level in a loud one."""
+    if not profile:
+        return None
+    buckets, median_db = profile
+    sel = [b for b in buckets if end > b["t"] >= start - 1.0]
+    if not sel:
+        return None
+    import numpy as np
+    lin = [10 ** (b["mean_db"] / 20.0) for b in sel]
+    mean_db = 20 * math.log10(max(float(np.mean(lin)), 1e-6))
+    peak_db = max(b["peak_db"] for b in sel)
+    arousal = max(0.0, min(100.0, (mean_db - median_db) / 14.0 * 100.0))
+    return mean_db, peak_db, arousal
+
+
+_STORY_MARKERS = {
+    "then", "suddenly", "but", "because", "until", "finally",
+    "after", "before", "when", "so", "started", "began", "ended",
+    "turns", "turned", "realised", "realized", "discovered",
+}
+
+
+def _subscores(win_words, prev_content, win_dur, category="general",
+               audio_level=None, components=None):
+    """Named subscores for one window: {hook, retention, emotion,
+    story} (0-100 ints), a one-line reason per subscore, and a
+    platform recommendation {name, why}.
+
+    Deterministic and signal-derived. With category "general" and no
+    audio the hook number equals the historical offline hook formula
+    exactly; other categories shift weights/lexicon, never invent."""
+    key, cat = category_info(category)
+    c = components or _window_components(
+        win_words, prev_content, win_dur, lexicon=cat["lexicon"])
+    density = c["density"]
+    energy = c["energy_score"]
+    punct = c["punct_score"]
+    novelty = c["novelty_score"]
+    caps = c["caps_score"]
+
+    def clamp(v):
+        return int(max(2, min(99, round(v))))
+
+    # -- hook: the historical formula, plus a capped category-lexicon
+    # contribution when a category is active.
+    hook = 0.5 * energy + 0.3 * punct + 0.2 * caps
+    if key != "general":
+        hook += cat["lex_bias"]["hook"] * c["lex_score"] / 100.0
+    hook = clamp(hook)
+
+    # -- retention: pace in the spoken sweet spot, fresh material,
+    # open loops (questions), minus dead air / fillers.
+    pace_fit = max(0.0, 100.0 - abs(density - 2.3) / 1.9 * 100.0)
+    retention = (0.30 * pace_fit + 0.25 * novelty
+                 + 0.20 * c["density_score"] + 0.15 * punct
+                 + 0.10 * energy
+                 - 0.6 * c["silence_pen"] - 0.4 * c["filler_pen"])
+    if key != "general":
+        retention += cat["lex_bias"]["retention"] * c["lex_score"] / 100.0
+    retention = clamp(retention)
+
+    # -- emotion: energy words + emotion lexicon + shouting, lifted
+    # by measured voice arousal when an audio profile is available.
+    emotion = (0.45 * energy + 0.25 * c["emo_score"]
+               + 0.15 * punct + 0.15 * caps)
+    if audio_level is not None:
+        emotion = 0.75 * emotion + 0.25 * audio_level[2]
+    if key != "general":
+        emotion += cat["lex_bias"]["emotion"] * c["lex_score"] / 100.0
+    emotion = clamp(emotion)
+
+    # -- story: narrative markers, complete-sentence framing, topic
+    # development (novelty), and enough words to hold an arc.
+    toks = [_clean_word(w["word"]) for w in win_words]
+    markers = [t for t in toks if t in _STORY_MARKERS]
+    marker_score = min(100, len(markers) * 16)
+    text = " ".join(w["word"] for w in win_words).strip()
+    sents = [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    completeness = 40.0
+    if text[:1].isupper():
+        completeness += 20
+    if text[-1:] in ".!?":
+        completeness += 25
+    if len(sents) >= 3:
+        completeness += 15
+    story = (0.35 * marker_score + 0.25 * novelty
+             + 0.20 * completeness
+             + 0.20 * (0.5 * energy + 0.5 * novelty))
+    if key != "general":
+        story += cat["lex_bias"]["story"] * c["lex_score"] / 100.0
+    story = clamp(story)
+
+    # -- reasons: name the strongest measured driver of each number.
+    def _hits(hits, n=3):
+        return ", ".join(sorted(set(hits))[:n])
+
+    hook_bits = []
+    if c["punct"]:
+        hook_bits.append(f"{c['punct']} question/exclamation marks")
+    if c["energy_hits"]:
+        hook_bits.append("energy words: " + _hits(c["energy_hits"]))
+    if key != "general" and c["lex_hits"]:
+        hook_bits.append(f"{cat['label']} words: "
+                         + _hits(c["lex_hits"]))
+    if c["caps"]:
+        hook_bits.append(f"{c['caps']} shouted words")
+    hook_reason = ("Strong opening signals - " + "; ".join(hook_bits)
+                   if hook_bits else
+                   "Steady spoken opening - no question, shout or "
+                   "high-energy words at the start")
+
+    ret_bits = [f"{density:.1f} words/sec pace",
+                f"{novelty:.0f}% fresh topic"]
+    if c["silence"] > 1.5:
+        ret_bits.append(f"{c['silence']:.1f}s of dead air hurts it")
+    elif c["filler_dur"] > 1.0:
+        ret_bits.append(f"{c['filler_dur']:.1f}s of fillers hurts it")
+    else:
+        ret_bits.append("no dead air")
+    retention_reason = "; ".join(ret_bits)
+
+    emo_bits = []
+    if c["emo_hits"]:
+        emo_bits.append("emotion words: " + _hits(c["emo_hits"]))
+    if c["energy_hits"]:
+        emo_bits.append("high-energy words: "
+                        + _hits(c["energy_hits"]))
+    if audio_level is not None and audio_level[2] >= 40:
+        emo_bits.append("voice level peaks well above the video's "
+                        "average")
+    if c["caps"]:
+        emo_bits.append(f"{c['caps']} shouted words")
+    emotion_reason = ("; ".join(emo_bits) if emo_bits else
+                      "Calm delivery - low emotional charge in the "
+                      "words and voice")
+
+    story_bits = []
+    if markers:
+        story_bits.append("story-arc words: "
+                          + ", ".join(sorted(set(markers))[:4]))
+    if text[-1:] in ".!?":
+        story_bits.append("lands on a complete sentence")
+    if novelty >= 60:
+        story_bits.append("topic keeps developing")
+    story_reason = ("; ".join(story_bits) if story_bits else
+                    "Loose segment - no clear setup-to-payoff arc in "
+                    "the words")
+
+    # -- platform: duration + the subscore profile pick the feed.
+    dur = win_dur
+    if dur <= 60 and hook >= 70:
+        platform = {"name": "TikTok",
+                    "why": "Under 60s with a strong opening hook - "
+                           "TikTok's feed rewards exactly that."}
+    elif story >= 70:
+        platform = {"name": "Facebook Reels",
+                    "why": "Story-driven clip - Facebook Reels "
+                           "audiences watch narrative clips longest."}
+    elif emotion >= 72:
+        platform = {"name": "Instagram Reels",
+                    "why": "High-emotion moment - Instagram Reels "
+                           "favours shareable reactions."}
+    elif dur <= 60:
+        platform = {"name": "YouTube Shorts",
+                    "why": "Punchy sub-60s cut - a safe Shorts length "
+                           "with captions doing the work."}
+    else:
+        platform = {"name": "Facebook Reels",
+                    "why": "Longer, steadier moment - fits Facebook "
+                           "Reels' longer watch sessions."}
+
+    return {"hook": hook, "retention": retention, "emotion": emotion,
+            "story": story,
+            "reasons": {"hook": hook_reason,
+                        "retention": retention_reason,
+                        "emotion": emotion_reason,
+                        "story": story_reason},
+            "platform": platform}
+
+
+def _attach_subscores(moment, win_words, prev_content, win_dur,
+                      category="general", audio_level=None,
+                      components=None):
+    """Attach the Phase-1 extras to a moment dict in place:
+    scores{viral,hook,retention,emotion,story}, score_reasons,
+    platform. viral/hook mirror the moment's existing overall and
+    hook_score so every surface tells one story."""
+    sub = _subscores(win_words, prev_content, win_dur,
+                     category=category, audio_level=audio_level,
+                     components=components)
+    moment["scores"] = {
+        "viral": int(moment.get("virality", 0) or 0),
+        "hook": int(moment.get("hook_score",
+                               sub["hook"]) or sub["hook"]),
+        "retention": sub["retention"],
+        "emotion": sub["emotion"],
+        "story": sub["story"],
+    }
+    moment["score_reasons"] = sub["reasons"]
+    moment["platform"] = sub["platform"]
+    return moment
+
+
+def _score_offline_window(win_words, prev_content, win_dur,
+                          category="general"):
     """Score one candidate window. Returns (virality, hook, flow, value,
-    reason_parts, signals)."""
-    c = _window_components(win_words, prev_content, win_dur)
+    reason_parts, signals).
+
+    With a content category, the virality components are re-weighted
+    (renormalised so all-weights-1.0 reproduces the historical number
+    exactly) and category-lexicon hits join the reason text."""
+    key, cat = category_info(category)
+    c = _window_components(win_words, prev_content, win_dur,
+                           lexicon=cat["lexicon"])
     density_score = c["density_score"]
     energy_score = c["energy_score"]
     punct_score = c["punct_score"]
@@ -739,10 +1202,18 @@ def _score_offline_window(win_words, prev_content, win_dur):
     filler_pen = c["filler_pen"]
     energy_hits = c["energy_hits"]
 
-    virality = (0.30 * density_score + 0.22 * energy_score
-                + 0.18 * punct_score + 0.15 * novelty_score
-                + 0.15 * caps_score
-                - 0.5 * silence_pen - 0.3 * filler_pen)
+    w = cat["weights"]
+    coefs = {"density": 0.30, "energy": 0.22, "punct": 0.18,
+             "novelty": 0.15, "caps": 0.15}
+    wsum = sum(coefs[k] * w[k] for k in coefs)
+    virality = (coefs["density"] * w["density"] * density_score
+                + coefs["energy"] * w["energy"] * energy_score
+                + coefs["punct"] * w["punct"] * punct_score
+                + coefs["novelty"] * w["novelty"] * novelty_score
+                + coefs["caps"] * w["caps"] * caps_score) / wsum
+    if key != "general":
+        virality += 0.35 * c["lex_score"] * 0.30
+    virality = (virality - 0.5 * silence_pen - 0.3 * filler_pen)
     virality = max(5, min(99, round(virality)))
 
     hook = round(0.5 * energy_score + 0.3 * punct_score
@@ -757,6 +1228,9 @@ def _score_offline_window(win_words, prev_content, win_dur):
                 if energy_hits else ""),
              f"{c['punct']} exclamations/questions",
              f"{novelty_score:.0f}% topic novelty"]
+    if key != "general" and c["lex_hits"]:
+        parts.append(f"{len(c['lex_hits'])} {cat['label']} words"
+                     + ": " + ", ".join(sorted(set(c["lex_hits"]))[:4]))
     if c["silence"] > 1.5:
         parts.append(f"{c['silence']:.1f}s silence (penalty)")
     if c["filler_dur"] > 1.0:
@@ -780,13 +1254,17 @@ def _extract_title_hook(win_words):
     return title, hook
 
 
-def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8):
+def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8,
+                           category="general", audio_profile=None):
     """Heuristic moment detection from the local transcript. No model needed.
 
     Returns list of {start, end, title, hook, virality, hook_score,
-    flow_score, value_score, reason, offline: True}. Titles and hooks are
-    extracted verbatim from the transcript - never invented.
+    flow_score, value_score, reason, offline: True} - Phase 1 adds
+    scores{...}/score_reasons/platform (see _subscores) and honours a
+    content category. Titles and hooks are extracted verbatim from
+    the transcript - never invented.
     """
+    category, _cat = category_info(category)
     if not words or clip_max_s <= 0 or max_clips <= 0:
         return []
     dur = words[-1]["end"]
@@ -836,7 +1314,8 @@ def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8):
                 prev_content = _content_words(win_words)
                 continue
             virality, hook_s, flow_s, value_s, parts, sigs = \
-                _score_offline_window(win_words, prev_content, e - s)
+                _score_offline_window(win_words, prev_content, e - s,
+                                      category=category)
             prev_content = _content_words(win_words)
             scored.append((virality, s, e, win_words, hook_s, flow_s,
                            value_s, parts, sigs))
@@ -874,6 +1353,18 @@ def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8):
             "signals": sigs,
             "offline": True,
         })
+    # Phase-1 subscores over the picked moments in time order (the
+    # novelty chain runs across the moments the user actually gets).
+    prev_content = set()
+    for m in sorted(moments, key=lambda x: x["start"]):
+        mw = [w for w in words
+              if w["end"] > m["start"] and w["start"] < m["end"]]
+        _attach_subscores(
+            m, mw, prev_content, m["end"] - m["start"],
+            category=category,
+            audio_level=_window_audio_level(audio_profile,
+                                            m["start"], m["end"]))
+        prev_content = _content_words(mw)
     moments.sort(key=lambda m: m["virality"], reverse=True)
     return moments
 
@@ -1618,6 +2109,115 @@ def find_hook_moment(words, duration=0.0, moments=None):
                 return seg
         return _pack(cand[0], "detected", -1)
     return _segment()
+
+
+def _hook_reason(sent, score):
+    """One-line reason a sentence scored as a hook (measured features
+    only - the same features _score_hook_sentence rewards)."""
+    toks = [_clean_word(w["word"]) for w in sent["words"]]
+    bits = []
+    text = sent["text"].rstrip()
+    if text.endswith("?"):
+        bits.append("asks a question the viewer wants answered")
+    elif text.endswith("!"):
+        bits.append("lands as an exclamation")
+    stakes = [t for t in toks if t in _HOOK_STAKES_WORDS]
+    if stakes:
+        bits.append("high-stakes words: "
+                    + ", ".join(sorted(set(stakes))[:3]))
+    energy = [t for t in toks if t in OFFLINE_ENERGY_WORDS]
+    if energy:
+        bits.append("energy words: "
+                    + ", ".join(sorted(set(energy))[:3]))
+    if any(any(ch.isdigit() for ch in w["word"]) for w in sent["words"]):
+        bits.append("a concrete number makes it specific")
+    if toks and toks[0] in _HOOK_OPENERS:
+        bits.append(f"opens with '{toks[0]}'")
+    if not bits:
+        bits.append("punchy, self-contained line")
+    return "; ".join(bits)
+
+
+def rank_hook_candidates(words, moments=None, duration=0.0, limit=10):
+    """Ranked hook candidates across the WHOLE video (Hook v2).
+
+    Sources: the opening sentence of every detected moment (blended
+    with that moment's own hook score) and the strongest standalone
+    transcript sentences anywhere in the video. Each candidate is
+    {start, end, text, score, reason, source, moment_index} where
+    start/end are the RENDER window (already trimmed to the 3-8s
+    hook range) and text is the verbatim sentence the window opens
+    with. Deduped by window overlap; the top entry is the AI pick.
+    Extractive only - nothing is rewritten or invented."""
+    words = words or []
+    if not words:
+        return []
+    dur = float(duration or 0) or words[-1]["end"]
+    sents = _transcript_sentences(words)
+    sent_by_start = {}
+    for s in sents:
+        sent_by_start.setdefault(round(s["start"], 2), s)
+
+    cands = []
+
+    def _add(start, end, text, score, reason, source, moment_index):
+        rs, re_ = hook_render_window(words, start, end)
+        if re_ - rs < 1.0:
+            return
+        cands.append({
+            "start": rs, "end": re_,
+            "text": " ".join(str(text).split())[:90],
+            "score": int(max(5, min(98, round(score)))),
+            "reason": reason, "source": source,
+            "moment_index": moment_index,
+        })
+
+    # (a) detected moments: their opening line, blended with the
+    # moment's own hook score so a proven moment outranks a stray line.
+    for i, m in enumerate(moments or []):
+        win = [w for w in words
+               if w["end"] > m["start"] and w["start"] < m["end"]]
+        msents = _transcript_sentences(win)
+        if not msents:
+            continue
+        first = msents[0]
+        base = _score_hook_sentence(first)
+        own = m.get("hook_score")
+        if own is None:
+            own = m.get("virality", base)
+        score = 0.6 * base + 0.4 * float(own or base)
+        reason = (f"Opens detected moment #{i + 1} "
+                  f"(viral {int(m.get('virality', 0) or 0)}) - "
+                  + _hook_reason(first, base))
+        _add(first["start"], first["end"], first["text"], score,
+             reason, "moment", i)
+
+    # (b) standalone sentences anywhere in the transcript.
+    ranked = sorted(sents, key=_score_hook_sentence, reverse=True)
+    for s in ranked[:limit * 2]:
+        _add(s["start"], s["end"], s["text"],
+             _score_hook_sentence(s), _hook_reason(s, 0),
+             "sentence", -1)
+
+    # dedupe: best-first, drop candidates whose render window
+    # overlaps a kept one by >50% of the shorter window.
+    cands.sort(key=lambda c: c["score"], reverse=True)
+    kept = []
+    for c in cands:
+        overlap = False
+        for k in kept:
+            inter = max(0.0, min(c["end"], k["end"])
+                        - max(c["start"], k["start"]))
+            if inter > 0.5 * min(c["end"] - c["start"],
+                                 k["end"] - k["start"]):
+                overlap = True
+                break
+        if not overlap:
+            kept.append(c)
+        if len(kept) >= limit:
+            break
+    kept.sort(key=lambda c: c["score"], reverse=True)
+    return kept
 
 
 def enhance_video(video_path, out_path, progress_cb=None,
@@ -2960,6 +3560,164 @@ def write_vtt(words, start, end, out_path):
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# Phase 1: caption translation (Built-in AI, cue-faithful)
+# ---------------------------------------------------------------------------
+# Translates the SAME cues write_srt/write_vtt export for a clip -
+# same grouping, same timestamps - so a translated file lines up with
+# its source export cue for cue. The model only ever receives the
+# cue texts and must return exactly as many lines as it was given;
+# a count mismatch is retried once, then reported honestly. Without
+# the Built-in AI model there is no translation - no fake output.
+
+TRANSLATE_LANGS = {
+    "bn": "Bengali", "es": "Spanish", "hi": "Hindi", "ar": "Arabic",
+    "pt": "Portuguese", "fr": "French", "de": "German", "ur": "Urdu",
+}
+
+TRANSLATE_NEEDS_AI = (
+    "Caption translation runs on the Built-in AI, which isn't "
+    "downloaded yet on this PC. Download it (Step 2 card or the AI "
+    "Manager), then translate.")
+
+
+def caption_cues(words, start, end):
+    """The cue list for a window, built exactly like write_srt's:
+    [{start, end, text}] with the export's own timestamps."""
+    win = [w for w in words if w["end"] > start and w["start"] < end]
+    win.sort(key=lambda w: w["start"])
+    return [{"start": line[0]["start"], "end": line[-1]["end"],
+             "text": " ".join(w["word"] for w in line)}
+            for line in _group_lines(win)]
+
+
+def _cue_ts(s, sep=","):
+    s = max(0, s)
+    h, rem = divmod(int(s), 3600)
+    m, sec = divmod(rem, 60)
+    ms = int((s % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{sec:02d}{sep}{ms:03d}"
+
+
+def write_srt_cues(cues, out_path):
+    blocks = []
+    for n, c in enumerate(cues, 1):
+        blocks.append(f"{n}\n{_cue_ts(c['start'])} --> "
+                      f"{_cue_ts(c['end'])}\n{c['text']}\n")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(blocks))
+    return out_path
+
+
+def write_vtt_cues(cues, out_path):
+    blocks = ["WEBVTT\n"]
+    for c in cues:
+        blocks.append(f"{_cue_ts(c['start'], '.')} --> "
+                      f"{_cue_ts(c['end'], '.')}\n{c['text']}\n")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(blocks))
+    return out_path
+
+
+def _extract_json_array(text, n):
+    """First balanced [...] in a model reply, as a list of exactly n
+    strings. Raises ValueError otherwise."""
+    if not text:
+        raise ValueError("empty model reply")
+    t = text.strip()
+    t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+    start = t.find("[")
+    if start < 0:
+        raise ValueError("no JSON array in model reply")
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(t)):
+        ch = t[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    data = json.loads(t[start:i + 1])
+                    if not isinstance(data, list) \
+                            or len(data) != n \
+                            or not all(isinstance(x, str)
+                                       for x in data):
+                        raise ValueError(
+                            f"expected {n} translated lines, got "
+                            f"{len(data) if isinstance(data, list) else 'a non-list'}")
+                    return data
+    raise ValueError("unbalanced JSON array in model reply")
+
+
+def translate_captions(words, start, end, lang, chat_fn=None,
+                       progress_cb=None):
+    """Translate a clip window's caption cues into `lang` (a key of
+    TRANSLATE_LANGS) with the Built-in AI.
+
+    Returns [{start, end, text}] - cue count and timings identical
+    to the source export. chat_fn is injectable for tests; the real
+    path is local_ai.chat and requires the downloaded model.
+    Raises RuntimeError with a plain message on any failure."""
+    lang = str(lang or "").strip().lower()
+    if lang not in TRANSLATE_LANGS:
+        raise RuntimeError("Pick a supported language first: "
+                           + ", ".join(sorted(TRANSLATE_LANGS)))
+    cues = caption_cues(words, start, end)
+    if not cues:
+        raise RuntimeError("This clip has no captions to translate.")
+    if chat_fn is None:
+        import local_ai
+        if not local_ai.model_ready():
+            raise RuntimeError(TRANSLATE_NEEDS_AI)
+        chat_fn = local_ai.chat
+    name = TRANSLATE_LANGS[lang]
+    out = []
+    chunk = 30
+    for i in range(0, len(cues), chunk):
+        part = cues[i:i + chunk]
+        lines = [c["text"] for c in part]
+        prompt = (
+            f"Translate each of these {len(lines)} subtitle lines "
+            f"into {name}. Subtitles must stay short and natural; "
+            "keep names, numbers and places unchanged. Reply with "
+            f"ONLY a JSON array of exactly {len(lines)} strings, in "
+            "the same order, with nothing else around it.\n"
+            + json.dumps(lines, ensure_ascii=False))
+        translated = None
+        last_err = None
+        for _attempt in range(2):
+            reply = chat_fn([{"role": "user", "content": prompt}])
+            try:
+                translated = _extract_json_array(reply, len(lines))
+                break
+            except ValueError as e:
+                last_err = e
+        if translated is None:
+            raise RuntimeError(
+                "The Built-in AI's translation could not be used "
+                f"({last_err}). Nothing was written - try again.")
+        out.extend({**c, "text": t.strip()}
+                   for c, t in zip(part, translated))
+        if progress_cb:
+            progress_cb(int(len(out) / len(cues) * 100),
+                        f"Translated {len(out)}/{len(cues)} lines "
+                        f"({name})")
+    return out
+
+
 def write_xml_timeline(clips, out_path, fps=30):
     """FCPXML 1.9 timeline of the rendered clips.
 
@@ -3056,7 +3814,7 @@ def parse_srt_file(path):
 
 
 def find_moments_by_keywords(words, queries, clip_min_s, clip_max_s,
-                             max_clips=8):
+                             max_clips=8, category="general"):
     """Offline keyword/phrase search over the transcript.
 
     Returns (moments, unmatched). Each moment carries
@@ -3101,7 +3859,7 @@ def find_moments_by_keywords(words, queries, clip_min_s, clip_max_s,
         win_words = [w for w in words if w["end"] > s and w["start"] < e]
         title, hook = _extract_title_hook(win_words)
         v = max(40, min(95, 45 + score))
-        moments.append({
+        m = {
             "start": round(s, 2), "end": round(e, 2),
             "title": title, "hook": hook, "virality": v,
             "hook_score": v, "flow_score": max(30, v - 10),
@@ -3109,7 +3867,9 @@ def find_moments_by_keywords(words, queries, clip_min_s, clip_max_s,
             "reason": f"Keyword match for: {q}",
             "signals": window_signals(win_words, None, e - s),
             "matched": q, "offline": True,
-        })
+        }
+        _attach_subscores(m, win_words, None, e - s, category=category)
+        moments.append(m)
     return moments[:max_clips], unmatched
 
 
@@ -3260,9 +4020,100 @@ def _kept_audio_filter(start, end, removed):
 # v3: generalized render engine (ratios, quality, caption magic)
 # ---------------------------------------------------------------------------
 
+def _sample_face_center(video_path, start, end, samples=5):
+    """Median (cx_frac, cy_frac) of the largest face across a few
+    frames of [start, end], via the bundled YuNet detector - or None
+    when no face is found / OpenCV can't read the video. Used to
+    place smart crops for the 16:9 and 1:1 aspect exports."""
+    try:
+        import cv2
+        from facetrack import MODEL_PATH
+        if not os.path.exists(MODEL_PATH):
+            return None
+        det = cv2.FaceDetectorYN.create(MODEL_PATH, "", (320, 320),
+                                        0.55, 0.3, 5000)
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        pts = []
+        try:
+            span = max(end - start, 0.1)
+            for i in range(samples):
+                t = start + span * (i + 0.5) / samples
+                cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                h, w = frame.shape[:2]
+                det.setInputSize((w, h))
+                _, faces = det.detect(frame)
+                if faces is None or len(faces) == 0:
+                    continue
+                f = max(faces, key=lambda f: float(f[2]) * float(f[3]))
+                pts.append(((float(f[0]) + float(f[2]) / 2.0) / w,
+                            (float(f[1]) + float(f[3]) / 2.0) / h))
+        finally:
+            cap.release()
+        if not pts:
+            return None
+        pts.sort()
+        return pts[len(pts) // 2]
+    except Exception:  # noqa: BLE001 - crop placement is best-effort
+        return None
+
+
+def _apply_audio_polish(clip_path, denoise=False):
+    """Post-pass: loudness-normalise a rendered clip to the social
+    platform target (-14 LUFS integrated, -1 dBTP, LRA 11), with an
+    optional gentle denoise (afftdn) first. Two-pass loudnorm: the
+    clip is measured (audio only), then the correction is applied
+    with the measured values so the landing is accurate; if the
+    measured pass fails it retries as a plain single pass. The video
+    stream is copied untouched. Raises RuntimeError on failure -
+    callers treat polish as best-effort and keep the unpolished clip.
+    """
+    pre = ["afftdn=nf=-25"] if denoise else []
+    target = "loudnorm=I=-14:TP=-1:LRA=11"
+    loud = target
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", clip_path, "-vn",
+             "-af", ",".join(pre + [target + ":print_format=json"]),
+             "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True)
+        tail = r.stderr[r.stderr.rfind("{"):]
+        vals = json.loads(tail[:tail.rfind("}") + 1])
+        loud = (target
+                + f":measured_I={vals['input_i']}"
+                + f":measured_TP={vals['input_tp']}"
+                + f":measured_LRA={vals['input_lra']}"
+                + f":measured_thresh={vals['input_thresh']}"
+                + f":offset={vals['target_offset']}:linear=true")
+    except Exception:  # noqa: BLE001 - fall back to single-pass
+        loud = target
+    tmp = clip_path + ".polish.mp4"
+    for attempt_af in (",".join(pre + [loud]), ",".join(pre + [target])):
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", clip_path,
+               "-c:v", "copy", "-af", attempt_af,
+               "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+               "-movflags", "+faststart", tmp]
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True)
+        if r.returncode == 0 and os.path.exists(tmp):
+            os.replace(tmp, clip_path)
+            return clip_path
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    raise RuntimeError("audio polish failed: " + r.stderr[-400:])
+
+
 def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
                     W, H, ratio, out_path, progress_cb=None,
-                    punch_zoom=False, enc_preset="slow", enc_crf="16"):
+                    punch_zoom=False, enc_preset="slow", enc_crf="16",
+                    face_center=None):
     """Face-tracked render: per-frame crop follows the smoothed face
     trajectory (or stays centered), frames piped to ffmpeg."""
     try:
@@ -3283,6 +4134,11 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
         crop_w = src_w
         crop_h = _even(src_w * rh / rw)
     y_top = int((src_h - crop_h) / 2)
+    if face_center and crop_h < src_h:
+        # square/landscape crop out of a taller frame: centre the
+        # band on the face instead of the frame middle
+        y_top = int(max(0, min(src_h - crop_h,
+                               face_center[1] * src_h - crop_h / 2)))
 
     trajectory = None
     try:
@@ -3417,14 +4273,15 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
         return _render_plain(video_path, start, end, keep_segs,
                              ass_path, W, H, ratio, out_path,
                              progress_cb, punch_zoom=punch_zoom,
-                             enc_preset=enc_preset, enc_crf=enc_crf)
+                             enc_preset=enc_preset, enc_crf=enc_crf,
+                             face_center=face_center)
     return out_path
 
 
 def _render_plain(video_path, start, end, keep_segs, ass_path,
                   W, H, ratio, out_path, progress_cb=None,
                   punch_zoom=False, enhance_clarity=False,
-                  enc_preset="slow", enc_crf="16"):
+                  enc_preset="slow", enc_crf="16", face_center=None):
     """ffmpeg-only render: crop/scale/captions, optional silence/filler
     cuts via filter_complex segment concat.
 
@@ -3432,8 +4289,31 @@ def _render_plain(video_path, start, end, keep_segs, ass_path,
         first 3s) then a slow drift, capped at 1.16x (zoompan, 1:1 frames).
     enhance_clarity: light denoise + unsharp ("enhance" - NOT an AI
         upscale; honest naming is deliberate).
+    face_center: optional (cx, cy) fractions of the subject's face -
+        for the 16:9 / 1:1 exports the crop band/square is centred on
+        the face instead of the frame middle (never a blurred pad).
     """
     crop = crop_filter(ratio)
+    if face_center and ratio in ("16:9", "1:1"):
+        try:
+            _sw, _sh, _sf = probe_video(video_path)
+        except Exception:  # noqa: BLE001 - keep the centre crop
+            _sw = _sh = 0
+        if _sw and _sh:
+            _cx, _cy = face_center
+            if ratio == "16:9":
+                _ch = _even(_sw * 9 / 16)
+                if _ch < _sh:
+                    _y = int(max(0, min(_sh - _ch,
+                                        _cy * _sh - _ch / 2)))
+                    crop = f"crop={_sw}:{_ch}:0:{_y}"
+            else:  # 1:1
+                _side = _even(min(_sw, _sh))
+                _x = int(max(0, min(_sw - _side,
+                                    _cx * _sw - _side / 2)))
+                _y = int(max(0, min(_sh - _side,
+                                    _cy * _sh - _side / 2)))
+                crop = f"crop={_side}:{_side}:{_x}:{_y}"
     vf = [crop, f"scale={W}:{H}:flags=lanczos"]
     if punch_zoom:
         # zoompan d=1 keeps a 1:1 frame mapping; fps is pinned to the
@@ -3969,7 +4849,8 @@ def render_clip(video_path, moment, words, style_name, out_path,
                 safe_zone=False, punch_zoom=False, enhance_clarity=False,
                 logo_path=None, quality_tier="maximum",
                 caption_params=None, emphasis_zoom=False,
-                emphasis_level="gentle", broll=False):
+                emphasis_level="gentle", broll=False,
+                audio_polish=False, denoise_audio=False):
     """Cut + reframe + burned captions + hook. Returns out_path.
 
     face_track=True -> per-frame face-following crop (OpenCV pipe).
@@ -3992,6 +4873,13 @@ def render_clip(video_path, moment, words, style_name, out_path,
         long talking stretch; needs internet; any failure renders
         without it. When used, a <out>.broll.json sidecar records the
         source for attribution.
+    audio_polish -> loudness-normalise the finished clip to -14 LUFS
+        (social platform target); denoise_audio adds a gentle afftdn
+        pass first. Post-pass on the rendered file, best-effort: a
+        failed polish keeps the unpolished clip and says so.
+    For the 16:9 / 1:1 aspect exports the crop is centred on the
+    sampled face position (smart crop - never a blurred pad); 9:16
+    keeps its historical centre/tracked behaviour.
     enhance_clarity -> light denoise + sharpen (honest "enhance",
         never "AI upscale").
     logo_path -> corner logo PNG watermarked top-left (brand kit).
@@ -4082,23 +4970,43 @@ def render_clip(video_path, moment, words, style_name, out_path,
               speaker_colors=speaker_colors, hook_overlay=hook_overlay,
               cta_text=cta_text, safe_zone=safe_zone,
               caption_params=caption_params)
+    # Face-aware crop placement for the landscape/square exports
+    # (sampled once per render; None -> centre crop as before).
+    face_center = None
+    if ratio in ("16:9", "1:1"):
+        face_center = _sample_face_center(video_path, start, end)
     try:
         if face_track:
             _render_tracked(video_path, start, end, keep_segs, removed,
                             ass_path, W, H, ratio, out_path, progress_cb,
                             punch_zoom=punch_zoom,
-                            enc_preset=enc_preset, enc_crf=enc_crf)
+                            enc_preset=enc_preset, enc_crf=enc_crf,
+                            face_center=face_center)
         else:
             _render_plain(video_path, start, end, keep_segs, ass_path,
                           W, H, ratio, out_path, progress_cb,
                           punch_zoom=punch_zoom,
                           enhance_clarity=enhance_clarity,
-                          enc_preset=enc_preset, enc_crf=enc_crf)
+                          enc_preset=enc_preset, enc_crf=enc_crf,
+                          face_center=face_center)
     finally:
         try:
             os.remove(ass_path)
         except OSError:
             pass
+
+    if audio_polish:
+        # best-effort post-pass (like the logo/zoom passes): a failed
+        # polish must never lose the finished clip
+        try:
+            _apply_audio_polish(out_path, denoise=denoise_audio)
+            if progress_cb:
+                progress_cb(96, "Audio polished to -14 LUFS"
+                            + (" (denoised)" if denoise_audio else ""))
+        except Exception as e:  # noqa: BLE001
+            if progress_cb:
+                progress_cb(96, "Audio polish skipped: "
+                            + str(e)[:80])
 
     if emphasis_zoom:
         # best-effort like the logo pass: a failed zoom must never
