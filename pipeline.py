@@ -350,12 +350,22 @@ def transcribe(video_path, model_name="base", progress_cb=None,
     except Exception:
         segments, _info = model.transcribe(audio, word_timestamps=True)
 
+    # Progress is reported as segments ARRIVE. faster-whisper yields
+    # segments lazily while it decodes, and each segment carries its
+    # end timestamp, so seg.end / audio_dur is real decode progress on
+    # the same 0-100 scale (15 -> 95 here, 100 at the end). The old
+    # code materialised list(segments) BEFORE this loop, so the
+    # callback sat at 15% for the entire decode - 843 s flat on a 2 h
+    # file - and then jumped straight to 100%.
+    audio_dur = len(audio) / 16000.0
     words = []
-    seg_list = list(segments)
-    total = max(len(seg_list), 1)
-    for i, seg in enumerate(seg_list):
-        if progress_cb and i % 5 == 0:
-            progress_cb(10 + int(i / total * 85), "Transcribing audio")
+    last_pct = 15
+    for seg in segments:
+        if progress_cb and audio_dur > 0:
+            pct = 15 + int(min(seg.end, audio_dur) / audio_dur * 80)
+            if pct > last_pct:
+                last_pct = pct
+                progress_cb(pct, "Transcribing audio")
         if seg.words:
             for w in seg.words:
                 words.append(
@@ -1303,13 +1313,31 @@ def detect_moments_offline(words, clip_min_s, clip_max_s, max_clips=8,
             s = max(ws, win_words[0]["start"])
             e = min(we, win_words[-1]["end"])
             if e - s < clip_min_s:
-                # speech fills only part of the window: stretch back
+                # Speech fills only part of the window: grow back
                 # toward the window bounds so the moment still lands
-                # inside the requested range when the window allows it
+                # inside the requested range. Growth is allocated in
+                # passes - half to the left, then the rest to the
+                # right, then any remainder the right side could not
+                # take goes back to the left. The old one-pass split
+                # capped the right side at `we` and silently DISCARDED
+                # the unused share, so whenever speech ran flush to
+                # the window end the moment came back up to need/2
+                # shorter than clip_min_s (proven: a [30, 60] request
+                # returning 25.5-29.0 s moments). Every candidate
+                # window is at least clip_min_s long, so the room to
+                # reach clip_min_s always exists inside the window;
+                # a moment may only stay shorter than clip_min_s when
+                # the whole transcript is shorter than clip_min_s
+                # (the lengths == [dur] fallback above).
                 need = clip_min_s - (e - s)
                 grow_l = min(need / 2.0, s - ws)
                 s -= grow_l
-                e = min(we, e + (need - grow_l))
+                need -= grow_l
+                grow_r = min(need, we - e)
+                e += grow_r
+                need -= grow_r
+                if need > 0:
+                    s = max(ws, s - need)
             if e - s < 5:
                 prev_content = _content_words(win_words)
                 continue
