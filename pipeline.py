@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 
 import requests
 
@@ -261,11 +262,20 @@ def _read_wav_mono16k(wav_path):
     if ch > 1:
         audio = audio.reshape(-1, ch).mean(axis=1)
     if sr != 16000:
-        # simple linear resample
+        # simple linear resample: the output grid must hold the
+        # TARGET sample count (len * 16000 / sr) mapped onto input
+        # indices. The old grid was built over the input count, so a
+        # 48 kHz file came back with ~48001 "16 kHz" samples - 3x
+        # stretched, with every downstream timestamp wrong. (Latent:
+        # the only production caller forces 16 kHz via ffmpeg.)
         import numpy as np2  # noqa: F811
-        old_idx = np2.linspace(0, len(audio), int(len(audio) * 16000 / sr))
-        audio = np2.interp(np2.arange(int(old_idx[-1]) + 1),
-                           np2.arange(len(audio)), audio)
+        n_out = int(len(audio) * 16000 / sr)
+        if n_out > 0 and len(audio) > 1:
+            audio = np2.interp(
+                np2.linspace(0, len(audio) - 1, n_out),
+                np2.arange(len(audio)), audio)
+        elif n_out > 0:
+            audio = np2.resize(audio, n_out)
     return (audio.astype("float32") / 32768.0)
 
 
@@ -343,12 +353,8 @@ def transcribe(video_path, model_name="base", progress_cb=None,
             progress_cb(100, "Transcription complete (0 words)")
         return []
 
-    try:
-        lang = None if language in (None, "auto", "") else language
-        segments, _info = model.transcribe(
-            audio, word_timestamps=True, vad_filter=True, language=lang)
-    except Exception:
-        segments, _info = model.transcribe(audio, word_timestamps=True)
+    lang = None if language in (None, "auto", "") else language
+    audio_dur = len(audio) / 16000.0
 
     # Progress is reported as segments ARRIVE. faster-whisper yields
     # segments lazily while it decodes, and each segment carries its
@@ -357,33 +363,59 @@ def transcribe(video_path, model_name="base", progress_cb=None,
     # code materialised list(segments) BEFORE this loop, so the
     # callback sat at 15% for the entire decode - 843 s flat on a 2 h
     # file - and then jumped straight to 100%.
-    audio_dur = len(audio) / 16000.0
-    words = []
-    last_pct = 15
-    for seg in segments:
-        if progress_cb and audio_dur > 0:
-            pct = 15 + int(min(seg.end, audio_dur) / audio_dur * 80)
-            if pct > last_pct:
-                last_pct = pct
-                progress_cb(pct, "Transcribing audio")
-        if seg.words:
-            for w in seg.words:
-                words.append(
-                    {"start": float(w.start), "end": float(w.end),
-                     "word": w.word.strip()}
-                )
-        else:
-            # fall back to segment-level timing split evenly across tokens
-            tokens = seg.text.strip().split()
-            if not tokens:
-                continue
-            dur = (seg.end - seg.start) / len(tokens)
-            for j, tok in enumerate(tokens):
-                words.append({
-                    "start": seg.start + j * dur,
-                    "end": seg.start + (j + 1) * dur,
-                    "word": tok,
-                })
+    _pct = {"last": 15}
+
+    def _collect(segments):
+        out = []
+        for seg in segments:
+            if progress_cb and audio_dur > 0:
+                pct = 15 + int(min(seg.end, audio_dur) / audio_dur * 80)
+                if pct > _pct["last"]:
+                    _pct["last"] = pct
+                    progress_cb(pct, "Transcribing audio")
+            if seg.words:
+                for w in seg.words:
+                    out.append(
+                        {"start": float(w.start), "end": float(w.end),
+                         "word": w.word.strip()}
+                    )
+            else:
+                # fall back to segment-level timing split evenly
+                # across tokens
+                tokens = seg.text.strip().split()
+                if not tokens:
+                    continue
+                dur = (seg.end - seg.start) / len(tokens)
+                for j, tok in enumerate(tokens):
+                    out.append({
+                        "start": seg.start + j * dur,
+                        "end": seg.start + (j + 1) * dur,
+                        "word": tok,
+                    })
+        return out
+
+    try:
+        segments, _info = model.transcribe(
+            audio, word_timestamps=True, vad_filter=True, language=lang)
+        words = _collect(segments)
+    except Exception:
+        # The fallback must cover DECODE-TIME failures too:
+        # model.transcribe() returns a lazy generator, so most real
+        # errors surface while _collect iterates it, not at the call.
+        # The old try wrapped only the call (its fallback never
+        # engaged for the common failure) and the retry silently
+        # dropped BOTH the VAD filter and the requested language.
+        # Retry once without VAD - the usual culprit - keeping the
+        # language, and say so on the progress line. Partial words
+        # from the failed attempt are discarded, never mixed in.
+        if progress_cb:
+            progress_cb(_pct["last"],
+                        "Transcribing audio (retrying without "
+                        "voice filtering)")
+        segments, _info = model.transcribe(
+            audio, word_timestamps=True, vad_filter=False,
+            language=lang)
+        words = _collect(segments)
     words = [w for w in words if w["word"]]
     # Word timings must live inside the audio they came from. On
     # near-silent or pathological input the decoder can emit words
@@ -487,9 +519,40 @@ def _local_transcript_chunks(words, max_chars=_LOCAL_TRANSCRIPT_BUDGET):
     return chunks
 
 
-def _parse_local_moments(data, clip_max_s):
+def _grow_to_min(s, e, min_s, lo, hi):
+    """Grow [s, e] toward min_s inside [lo, hi], allocating the
+    growth in passes (half left, rest right, remainder back left) -
+    the same allocation the offline detector's F3 fix uses, so no
+    share is silently discarded at a bound. Returns (s, e); the
+    result reaches min_s whenever [lo, hi] is at least min_s wide."""
+    need = min_s - (e - s)
+    if need <= 0:
+        return s, e
+    grow_l = min(need / 2.0, s - lo)
+    s -= grow_l
+    need -= grow_l
+    grow_r = min(need, hi - e)
+    e += grow_r
+    need -= grow_r
+    if need > 0:
+        grow_l = min(need, s - lo)
+        s -= grow_l
+    return s, e
+
+
+def _parse_local_moments(data, clip_max_s, clip_min_s=0.0,
+                         span_lo=0.0, span_hi=None):
     """Validate/normalize one reply's moments - same field rules as
-    detect_moments(); virality capped at 99 like the offline path."""
+    detect_moments(); virality capped at 99 like the offline path.
+
+    clip_min_s is enforced like the offline detector enforces it:
+    the model was ASKED for [clip_min_s, clip_max_s] but its raw
+    timestamps were previously trusted, so a 30-60s request could
+    return 4s clips. Sub-minimum moments are grown inside the
+    transcript span they were picked from ([span_lo, span_hi]);
+    a moment that cannot reach clip_min_s even across the whole
+    span is dropped - except when the whole span is shorter than
+    clip_min_s, where the full span is the honest answer."""
     out = []
     for m in data.get("moments", []):
         try:
@@ -500,6 +563,15 @@ def _parse_local_moments(data, clip_max_s):
             # clamp to clip-length bounds
             if end - start > clip_max_s:
                 end = start + clip_max_s
+            if clip_min_s and end - start < clip_min_s:
+                hi = span_hi if span_hi is not None else end
+                start, end = _grow_to_min(start, end, clip_min_s,
+                                          span_lo, hi)
+                if end - start < clip_min_s - 0.01:
+                    if hi - span_lo < clip_min_s:
+                        start, end = span_lo, hi
+                    else:
+                        continue
             v = max(0, min(99, int(m.get("virality", 50))))
 
             def _sub(key):
@@ -575,7 +647,20 @@ def detect_moments_local(words, clip_min_s, clip_max_s,
             raise RuntimeError(
                 "Built-in AI returned an answer that could not be "
                 f"read ({e}). Please run detection again.") from e
-        moments.extend(_parse_local_moments(data, clip_max_s))
+        # Growth span for sub-minimum moments: the chunk the model
+        # picked from - or the whole transcript when the chunk
+        # itself is shorter than clip_min_s (a tiny final chunk
+        # must not cap a moment below the requested minimum).
+        if cwords and (cwords[-1]["end"] - cwords[0]["start"]
+                       >= clip_min_s or not words):
+            span = (cwords[0]["start"], cwords[-1]["end"])
+        elif words:
+            span = (words[0]["start"], words[-1]["end"])
+        else:
+            span = (0.0, None)
+        moments.extend(_parse_local_moments(
+            data, clip_max_s, clip_min_s,
+            span_lo=span[0], span_hi=span[1]))
 
     # merge: best first, drop moments overlapping a picked one by
     # >30% of the shorter clip (same rule as the offline detector)
@@ -2270,18 +2355,30 @@ def enhance_video(video_path, out_path, progress_cb=None,
         vf = "unsharp=5:5:0.8:5:5:0.0"
     os.makedirs(os.path.dirname(os.path.abspath(out_path)),
                 exist_ok=True)
+    # Encode to a .part sibling and rename on success (the batch
+    # enhancer's pattern): writing straight to the final path meant
+    # a failed re-enhance DESTROYED the previously good file, and a
+    # render orphaned by an app kill kept writing the final name.
+    final_path = out_path
+    out_path = _part_sibling(final_path)
     cmd = (["ffmpeg", "-y", "-i", video_path, "-vf", vf,
             "-map", "0:v:0", "-map", "0:a?"]
            + _encode_args(quality_tier)
            + ["-c:a", "aac", "-b:a", "192k", out_path])
-    _run_ffmpeg_progress(cmd, duration, progress_cb, 3, 97,
-                         "Enhancing (upscale + sharpen)")
+    try:
+        _run_ffmpeg_progress(cmd, duration, progress_cb, 3, 97,
+                             "Enhancing (upscale + sharpen)")
+    except Exception:
+        _remove_quietly(out_path)
+        raise
     if not os.path.isfile(out_path) \
             or os.path.getsize(out_path) < 1024:
+        _remove_quietly(out_path)
         raise RuntimeError("Enhance produced no output file.")
+    os.replace(out_path, final_path)
     if progress_cb:
         progress_cb(100, "Done")
-    return out_path
+    return final_path
 
 
 # ---------------------------------------------------------------------------
@@ -2634,6 +2731,8 @@ def run_ffmpeg_controlled(cmd, duration, progress_cb, lo, hi, stage,
         try:
             for line in proc.stdout:
                 tail.append(line.rstrip())
+                if len(tail) > 60:
+                    del tail[:30]  # only the last lines are ever read
                 if line.startswith("out_time_ms=") and duration:
                     try:
                         t = int(line.split("=", 1)[1]) / 1e6
@@ -2673,7 +2772,11 @@ def run_ffmpeg_controlled(cmd, duration, progress_cb, lo, hi, stage,
     finally:
         if state["suspended"]:
             _resume_process(proc.pid)
-        proc.wait()
+        try:
+            proc.wait(timeout=30)
+        except Exception:  # noqa: BLE001 - wedged ffmpeg: kill it
+            proc.kill()
+            proc.wait()
     if proc.returncode != 0:
         raise RuntimeError("ffmpeg failed: "
                            + " | ".join(tail[-6:])[:400])
@@ -3347,8 +3450,15 @@ def write_srt(words, start, end, out_path):
     blocks = []
     for n, line in enumerate(_group_lines(win), 1):
         text = " ".join(w["word"] for w in line)
-        blocks.append(f"{n}\n{ts(line[0]['start'])} --> "
-                      f"{ts(line[-1]['end'])}\n{text}\n")
+        # Clamp to the clip window: a word straddling the cut keeps
+        # its full span in the transcript, but a cue must never start
+        # before or end after the clip it belongs to (exports shipped
+        # cue ends past the render's real duration).
+        cs = max(start, line[0]["start"])
+        ce = min(end, line[-1]["end"])
+        if ce <= cs:
+            continue
+        blocks.append(f"{n}\n{ts(cs)} --> {ts(ce)}\n{text}\n")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(blocks))
     return out_path
@@ -3611,12 +3721,20 @@ TRANSLATE_NEEDS_AI = (
 
 def caption_cues(words, start, end):
     """The cue list for a window, built exactly like write_srt's:
-    [{start, end, text}] with the export's own timestamps."""
+    [{start, end, text}] with the export's own timestamps. Cue
+    times are clamped to the window (see write_srt): a word
+    straddling the cut must not push a cue past the clip's end."""
     win = [w for w in words if w["end"] > start and w["start"] < end]
     win.sort(key=lambda w: w["start"])
-    return [{"start": line[0]["start"], "end": line[-1]["end"],
-             "text": " ".join(w["word"] for w in line)}
-            for line in _group_lines(win)]
+    cues = []
+    for line in _group_lines(win):
+        cs = max(start, line[0]["start"])
+        ce = min(end, line[-1]["end"])
+        if ce <= cs:
+            continue
+        cues.append({"start": cs, "end": ce,
+                     "text": " ".join(w["word"] for w in line)})
+    return cues
 
 
 def _cue_ts(s, sep=","):
@@ -4608,10 +4726,35 @@ def _find_broll_window(cap_words, total_dur):
     return (round(w0, 2), round(w1, 2), kw)
 
 
+_BROLL_CACHE_MAX_BYTES = 500 * 1024 * 1024
+_BROLL_CACHE_MAX_FILES = 60
+
+
 def _broll_cache_dir():
     import local_ai
     d = os.path.join(local_ai.MODELS_DIR, "broll_cache")
     os.makedirs(d, exist_ok=True)
+    # Cap the cache: it grew by one stock clip per b-roll render,
+    # forever. Oldest files go first; everything in here is a
+    # re-downloadable stock clip, never user work.
+    try:
+        files = [(os.path.getmtime(os.path.join(d, n)),
+                  os.path.getsize(os.path.join(d, n)),
+                  os.path.join(d, n))
+                 for n in os.listdir(d)
+                 if os.path.isfile(os.path.join(d, n))]
+        total = sum(sz for _m, sz, _p in files)
+        files.sort()
+        while files and (total > _BROLL_CACHE_MAX_BYTES
+                         or len(files) > _BROLL_CACHE_MAX_FILES):
+            _m, sz, p = files.pop(0)
+            try:
+                os.remove(p)
+                total -= sz
+            except OSError:
+                pass
+    except OSError:
+        pass
     return d
 
 
@@ -5003,6 +5146,15 @@ def render_clip(video_path, moment, words, style_name, out_path,
     face_center = None
     if ratio in ("16:9", "1:1"):
         face_center = _sample_face_center(video_path, start, end)
+    # The encode and every post-pass below work on a .part sibling;
+    # the finished file is renamed onto the real name at the end.
+    # Writing straight to the final path meant a failed RE-render
+    # destroyed the previously good clip at that path, and an
+    # ffmpeg orphaned by an app kill kept writing the final name
+    # and produced a complete clip the app had no record of.
+    _final_out = out_path
+    out_path = _part_sibling(_final_out)
+    _render_ok = False
     try:
         if face_track:
             _render_tracked(video_path, start, end, keep_segs, removed,
@@ -5017,11 +5169,14 @@ def render_clip(video_path, moment, words, style_name, out_path,
                           enhance_clarity=enhance_clarity,
                           enc_preset=enc_preset, enc_crf=enc_crf,
                           face_center=face_center)
+        _render_ok = True
     finally:
         try:
             os.remove(ass_path)
         except OSError:
             pass
+        if not _render_ok:
+            _remove_quietly(out_path)
 
     if audio_polish:
         # best-effort post-pass (like the logo/zoom passes): a failed
@@ -5117,16 +5272,20 @@ def render_clip(video_path, moment, words, style_name, out_path,
                     pass
     if broll_meta:
         # attribution sidecar: app.py folds it into the render record
-        # (and from there into posting packages), then removes it
+        # (and from there into posting packages), then removes it.
+        # It belongs to the FINAL path, not the .part working file.
         try:
-            with open(out_path + ".broll.json", "w",
+            with open(_final_out + ".broll.json", "w",
                       encoding="utf-8") as f:
                 json.dump(broll_meta, f)
         except OSError:
             pass
+    # Publish: the file at the real name is now the complete,
+    # post-passed encode, atomically renamed into place.
+    os.replace(out_path, _final_out)
     if progress_cb:
         progress_cb(100, "Render complete")
-    return out_path
+    return _final_out
 
 
 # Backwards-compatible alias (old positional-arg callers).
@@ -5152,6 +5311,14 @@ LAMA_MODEL_URL = ("https://huggingface.co/Carve/LaMa-ONNX/resolve/main/"
                   "lama_fp32.onnx")
 LAMA_MODEL_FILE = "lama_fp32.onnx"
 LAMA_MODEL_SIZE = 208_044_816  # bytes, per the HuggingFace blob listing
+# SHA-256 of the canonical Carve/LaMa-ONNX lama_fp32.onnx blob
+# (HuggingFace LFS oid, cross-checked against a known-good local
+# copy). The model used to be accepted on SIZE ONLY - a same-size
+# corrupted or substituted file passed forever and produced
+# garbage inpainting with no self-heal. The OCR model below has
+# always been pinned this way; LaMa now is too.
+LAMA_MODEL_SHA256 = ("1faef5301d78db7dda502fe59966957ec4b79dd6"
+                     "4e16f03ed96913c7a4eb68d6")
 
 
 def _remover_band(region, height):
@@ -5200,11 +5367,22 @@ def lama_ready():
 
 def ensure_lama(progress_cb=None):
     """Download the LaMa ONNX model once (~198 MB), like the other
-    brains. Returns the model path; RuntimeError on failure."""
+    brains. Verified by size AND sha256 (mirrors the OCR model):
+    a same-size corrupted file is deleted and re-downloaded rather
+    than trusted forever. Returns the model path; RuntimeError on
+    failure. A failed attempt removes its .part - the old code left
+    it behind on every failure path."""
     import urllib.request
     path = lama_model_path()
     if lama_ready():
-        return path
+        if _sha256_file(path) == LAMA_MODEL_SHA256:
+            return path
+        # Right size, wrong bytes: corrupt or substituted. Remove
+        # it so the download below starts clean (self-heal).
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     tmp = path + ".part"
     try:
         req = urllib.request.Request(
@@ -5224,18 +5402,37 @@ def ensure_lama(progress_cb=None):
                     progress_cb(2 + int(13 * got / total),
                                 "Downloading AI inpainting model "
                                 "(one-time, ~198 MB)")
-        if got != LAMA_MODEL_SIZE:
+        if got != LAMA_MODEL_SIZE \
+                or _sha256_file(tmp) != LAMA_MODEL_SHA256:
             raise RuntimeError(
-                f"AI model download incomplete ({got} of "
+                f"AI model download did not verify ({got} of "
                 f"{LAMA_MODEL_SIZE} bytes) - check your connection "
                 "and retry.")
         os.replace(tmp, path)
     except RuntimeError:
+        _remove_quietly(tmp)
         raise
     except Exception as e:
+        _remove_quietly(tmp)
         raise RuntimeError(f"Could not download the AI inpainting "
                            f"model: {e}")
     return path
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _part_sibling(path):
+    """The in-progress sibling of an output path: clip_01.mp4 ->
+    clip_01.part.mp4. Encoders write here and the finished file is
+    os.replace()d onto the real name, so a file at the real name is
+    always a complete, verified encode."""
+    root, ext = os.path.splitext(path)
+    return root + ".part" + ext
 
 
 # ---------------------------------------------------------------------------
@@ -5311,8 +5508,10 @@ def ensure_text_detector(progress_cb=None):
                 f"({got} bytes) - check your connection and retry.")
         os.replace(tmp, path)
     except RuntimeError:
+        _remove_quietly(tmp)
         raise
     except Exception as e:
+        _remove_quietly(tmp)
         raise RuntimeError(f"Could not download the text-detection "
                            f"model: {e}")
     return path
@@ -5378,23 +5577,33 @@ class _TextDetector:
         return boxes
 
 
-_OCR_SINGLETON = {"det": None, "failed": False}
+_OCR_SINGLETON = {"det": None, "failed_at": 0.0}
+_OCR_RETRY_S = 300.0  # a failed load is retried after 5 minutes
 
 
 def _get_text_detector(progress_cb=None):
     """Lazy singleton; raises RuntimeError when the OCR model cannot
-    be downloaded/loaded (callers fall back honestly)."""
+    be downloaded/loaded (callers fall back honestly).
+
+    Failures used to latch for the LIFE OF THE PROCESS: one
+    transient network failure during the one-time model download
+    degraded Caption Remover to its fallbacks until the app was
+    restarted. The failure is now remembered for _OCR_RETRY_S only -
+    long enough that an offline machine doesn't pay a download
+    attempt per job, short enough that a recovered connection
+    heals the feature on its own."""
     if _OCR_SINGLETON["det"] is not None:
         return _OCR_SINGLETON["det"]
-    if _OCR_SINGLETON["failed"]:
+    if time.time() - _OCR_SINGLETON["failed_at"] < _OCR_RETRY_S:
         raise RuntimeError("Text detection unavailable (earlier load "
                            "failed).")
     try:
         det = _TextDetector(ensure_text_detector(progress_cb))
     except Exception:
-        _OCR_SINGLETON["failed"] = True
+        _OCR_SINGLETON["failed_at"] = time.time()
         raise
     _OCR_SINGLETON["det"] = det
+    _OCR_SINGLETON["failed_at"] = 0.0
     return det
 
 
@@ -5611,6 +5820,8 @@ def _run_ffmpeg_progress(cmd, duration, progress_cb, lo, hi, stage):
     try:
         for line in proc.stdout:
             tail.append(line.rstrip())
+            if len(tail) > 60:
+                del tail[:30]  # only the last lines are ever read
             if line.startswith("out_time_ms=") and duration:
                 try:
                     t = int(line.split("=", 1)[1]) / 1e6
@@ -5620,7 +5831,15 @@ def _run_ffmpeg_progress(cmd, duration, progress_cb, lo, hi, stage):
                 if progress_cb:
                     progress_cb(lo + int((hi - lo) * frac), stage)
     finally:
-        proc.wait()
+        # Never wait forever: if the loop above exited early (a
+        # progress callback raised) ffmpeg can be wedged on a full
+        # pipe with nobody draining it, and a bare wait() would hang
+        # the worker thread - and the job's render lock - for good.
+        try:
+            proc.wait(timeout=30)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+            proc.wait()
     if proc.returncode != 0:
         raise RuntimeError("ffmpeg failed: "
                            + " | ".join(tail[-6:])[:400])

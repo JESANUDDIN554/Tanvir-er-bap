@@ -22,24 +22,46 @@ class FaceTracker:
 
     def __init__(self):
         self.backend = "none"
+        self.init_error = None  # why no backend, when none loaded
         self._det = None
         self._haar = None
+        self._cv2 = None
         try:
             import cv2
             self._cv2 = cv2
-            if os.path.exists(MODEL_PATH):
+        except Exception:  # noqa: BLE001 - cv2 missing, no tracking
+            return
+        # YuNet first, Haar as a REAL fallback: the two used to share
+        # one try, so a corrupt/mismatched bundled YuNet model made
+        # the except poison _cv2 itself and every render silently
+        # centre-cropped even though cv2 and Haar were perfectly fine.
+        if os.path.exists(MODEL_PATH):
+            try:
                 self._det = cv2.FaceDetectorYN.create(
                     MODEL_PATH, "", (320, 320), 0.55, 0.3, 5000)
                 self.backend = "yunet"
-            else:
-                cascade = os.path.join(
-                    cv2.data.haarcascades,
-                    "haarcascade_frontalface_default.xml")
-                if os.path.exists(cascade):
-                    self._haar = cv2.CascadeClassifier(cascade)
+                return
+            except Exception as e:  # noqa: BLE001 - fall to Haar
+                self._det = None
+                self.init_error = f"yunet: {e}"
+        # NOTE: OpenCV 5 REMOVED CascadeClassifier and the bundled
+        # haarcascade data, so on cv2 >= 5 this fallback does not
+        # exist and a YuNet failure lands on the designed final
+        # fallback (centre crop). The getattr keeps that honest -
+        # no pretending a dead API is a live safety net.
+        cascade_cls = getattr(cv2, "CascadeClassifier", None)
+        if cascade_cls is None:
+            return
+        try:
+            cascade = os.path.join(
+                cv2.data.haarcascades,
+                "haarcascade_frontalface_default.xml")
+            if os.path.exists(cascade):
+                self._haar = cascade_cls(cascade)
+                if self._haar is not None and not self._haar.empty():
                     self.backend = "haar"
-        except Exception:  # noqa: BLE001 - cv2 missing, fall back
-            self._cv2 = None
+        except Exception:  # noqa: BLE001 - no backend available
+            self._haar = None
 
     def detect_faces(self, frame_bgr):
         """Return list of (cx, area) for all detected faces."""
