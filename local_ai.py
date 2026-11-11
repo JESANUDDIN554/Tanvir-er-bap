@@ -192,8 +192,8 @@ def _expected_model_size():
         return None
 
 
-def engine_path():
-    """Path of the extracted llama-server binary, or None."""
+def cpu_engine_path():
+    """Path of the extracted CPU llama-server binary, or None."""
     if not os.path.isdir(LLAMA_DIR):
         return None
     want = "llama-server.exe" if sys.platform.startswith("win") \
@@ -202,6 +202,197 @@ def engine_path():
         if want in files:
             return os.path.join(root, want)
     return None
+
+
+# ---------------------------------------------------------------------------
+# GPU engine (Windows + NVIDIA): the CUDA build of the SAME pinned
+# llama.cpp tag, kept in its own folder (llama-gpu/) so the CPU
+# engine is always intact to fall back to. The CUDA assets verifiably
+# exist in the pinned b11803 release: llama-b11803-bin-win-cuda-
+# 12.4-x64.zip (272,315,003 B) and cudart-llama-bin-win-cuda-12.4-
+# x64.zip (391,443,627 B). CUDA 12.4 is the variant chosen: it runs
+# on the widest range of NVIDIA drivers. The GPU engine is only
+# ever an accelerator - any failure at download or launch falls
+# back to the CPU engine (see ensure_server), never to a dead AI.
+# ---------------------------------------------------------------------------
+
+LLAMA_GPU_DIR = os.path.join(DATA_DIR, "llama-gpu")
+_GPU_CUDA_VARIANT = "12.4"
+_GPU_ENGINE_SIZE = 272315003
+_GPU_CUDART_SIZE = 391443627
+
+# SHA-256 of the pinned release archives, computed from the official
+# b11803 assets themselves. Downloads of these files are verified
+# against the pin before extraction (the same hash-gate rule as the
+# model: the hash decides, never the host).
+_ENGINE_ARCHIVE_SHA256 = {
+    "llama-b11803-bin-win-cpu-x64.zip":
+        "68a11f1f0ab78587bfc42071d2dbd4aa1b621357ddc375c1ee25a2"
+        "4e76d27954",
+    "llama-b11803-bin-ubuntu-x64.tar.gz":
+        "2c718373086c9eda54d1e994cd5197aa079a4247e3dc4ec9edee82"
+        "54cee08746",
+    "llama-b11803-bin-win-cuda-12.4-x64.zip":
+        "3a9724665d7b1036d2e7f9e1cd2ef869f534bd3a1f7c11972e1eae"
+        "b223d9ec07",
+    "cudart-llama-bin-win-cuda-12.4-x64.zip":
+        "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e"
+        "32ae1d6",
+}
+
+_AI_CONFIG_PATH = os.path.join(DATA_DIR, "ai_config.json")
+
+
+def _ai_config():
+    try:
+        with open(_AI_CONFIG_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_ai_config(cfg):
+    try:
+        with open(_AI_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+    except OSError:
+        pass  # a preference that cannot persist is not fatal
+
+
+def engine_preference():
+    """The recorded engine preference: "auto" (default - GPU when
+    its engine is installed), "cpu" or "gpu"."""
+    return _ai_config().get("engine") or "auto"
+
+
+def set_engine_preference(pref):
+    cfg = _ai_config()
+    cfg["engine"] = pref if pref in ("cpu", "gpu") else "auto"
+    _save_ai_config(cfg)
+
+
+# Session-scoped GPU launch failure: once the GPU engine has failed
+# to start in this process, the session runs on CPU and the AI
+# Manager can say so honestly (gpu_fallback_note) instead of
+# retrying a broken engine on every detection.
+_gpu_fallback = {"failed": False, "reason": ""}
+
+
+def gpu_fallback_note():
+    return dict(_gpu_fallback) if _gpu_fallback["failed"] else None
+
+
+def _mark_gpu_fallback(reason):
+    _gpu_fallback.update(failed=True, reason=str(reason)[:200])
+
+
+def gpu_engine_path():
+    """Path of the extracted GPU (CUDA) llama-server binary, or
+    None. Accepts either binary name on any platform so test rigs
+    can stage a Windows layout on a Linux box."""
+    if not os.path.isdir(LLAMA_GPU_DIR):
+        return None
+    for root, _dirs, files in os.walk(LLAMA_GPU_DIR):
+        for want in ("llama-server.exe", "llama-server"):
+            if want in files:
+                return os.path.join(root, want)
+    return None
+
+
+def engine_flavor():
+    """"gpu" when the GPU engine is installed and usable as far as
+    this process knows, else "cpu"."""
+    if _gpu_fallback["failed"]:
+        return "cpu"
+    if engine_preference() == "cpu":
+        return "cpu"
+    return "gpu" if gpu_engine_path() else "cpu"
+
+
+def engine_path():
+    """Path of the llama-server binary the app should run: the GPU
+    build when it is the active flavour, else the CPU build."""
+    if engine_flavor() == "gpu":
+        got = gpu_engine_path()
+        if got:
+            return got
+    return cpu_engine_path()
+
+
+def _gpu_engine_asset():
+    return f"llama-{_LLAMA_TAG}-bin-win-cuda-{_GPU_CUDA_VARIANT}-x64.zip"
+
+
+def _gpu_cudart_asset():
+    return f"cudart-llama-bin-win-cuda-{_GPU_CUDA_VARIANT}-x64.zip"
+
+
+def _place_cudart_beside_server():
+    """The CUDA runtime DLLs must sit in the same folder as
+    llama-server.exe (that is how Windows resolves them, and how
+    llama.cpp's own install notes lay the cudart zip out). If the
+    extraction left them in a subfolder, copy them beside the exe."""
+    exe = gpu_engine_path()
+    if not exe:
+        return
+    exe_dir = os.path.dirname(exe)
+    wanted = ("cudart64_", "cublas64_", "cublasLt64_")
+    for root, _dirs, files in os.walk(LLAMA_GPU_DIR):
+        if os.path.abspath(root) == os.path.abspath(exe_dir):
+            continue
+        for name in files:
+            if name.lower().endswith(".dll") and \
+                    name.lower().startswith(wanted):
+                dst = os.path.join(exe_dir, name)
+                if not os.path.exists(dst):
+                    import shutil
+                    shutil.copyfile(os.path.join(root, name), dst)
+
+
+def ensure_gpu_engine():
+    """Download + extract the CUDA engine build. Returns the binary
+    path. Raises RuntimeError with a plain reason on any failure -
+    callers fall back to the CPU engine, never to a dead AI. The
+    archives are size- AND SHA-256-verified by _download_file
+    before anything is extracted (never execute a download blind)."""
+    if not sys.platform.startswith("win") and \
+            not os.environ.get("ITRAJI_LLAMA_GPU_URL"):
+        raise RuntimeError("the GPU (CUDA) engine build is "
+                           "Windows-only - this system uses the "
+                           "CPU engine")
+    got = gpu_engine_path()
+    if got:
+        return got
+    os.makedirs(LLAMA_GPU_DIR, exist_ok=True)
+    base = f"{_LLAMA_BASE}/{_LLAMA_TAG}"
+    override = os.environ.get("ITRAJI_LLAMA_GPU_URL")
+    if override:
+        pairs = [(override, None, None)]
+    else:
+        eng, cud = _gpu_engine_asset(), _gpu_cudart_asset()
+        pairs = [(f"{base}/{eng}", _GPU_ENGINE_SIZE,
+                  _ENGINE_ARCHIVE_SHA256.get(eng)),
+                 (f"{base}/{cud}", _GPU_CUDART_SIZE,
+                  _ENGINE_ARCHIVE_SHA256.get(cud))]
+    for url, size, sha in pairs:
+        archive = os.path.join(LLAMA_GPU_DIR,
+                               "_gpu_" + url.rsplit("/", 1)[-1])
+        _download_file(url, archive, "Downloading GPU AI engine (CUDA)"
+                       if url == pairs[0][0] else
+                       "Downloading CUDA runtime",
+                       expected_size=size, expected_sha256=sha)
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(LLAMA_GPU_DIR)
+        _remove_quietly(archive)
+        if override:
+            break
+    _place_cudart_beside_server()
+    got = gpu_engine_path()
+    if not got:
+        raise RuntimeError("GPU engine download finished but no "
+                           "llama-server binary was found inside it")
+    return got
 
 
 def model_ready():
@@ -326,9 +517,74 @@ def start_model_move(new_data_dir, on_done=None):
 # ---------------------------------------------------------------------------
 
 _download_state = {"active": False, "pct": 0, "error": None,
-                   "done": False, "stage": ""}
+                   "done": False, "stage": "",
+                   "paused": False, "downloaded": 0, "total": 0,
+                   "rate_bps": 0, "eta_seconds": None}
 _state_lock = threading.Lock()
 _download_thread = None
+
+
+class _PausedError(RuntimeError):
+    """The user paused the download: the worker stops now, the
+    .part keeps every downloaded byte, and the stop is neither a
+    failure nor a retryable error - it must not burn attempts,
+    switch servers, or surface as an error message."""
+
+
+_pause_requested = False
+
+
+def pause_download():
+    """Ask the download worker to stop at the next chunk boundary
+    (the in-flight response is also force-closed, the same way the
+    stall watchdog interrupts a blocked read, so a trickling
+    connection cannot keep the worker parked). Idempotent: pausing
+    an idle download just returns the current state. The pause is
+    per-session: the state it leaves behind (inactive, no error)
+    means a later relaunch treats the leftover .part exactly like
+    any other interrupted download - the boot auto-resume."""
+    global _pause_requested
+    with _state_lock:
+        active = _download_state["active"]
+        if active:
+            _pause_requested = True
+            _download_state.update(stage="Pausing...")
+    if active:
+        with _progress_lock:
+            resp = _progress["response"]
+        if resp is not None:
+            _force_close(resp)
+    return download_state()
+
+
+# Rolling throughput for the UI's speed + ETA readouts. Samples are
+# (monotonic_ts, file_absolute_bytes) for the CURRENT .part; the
+# tracker resets when a different file starts, so the engine's rate
+# never bleeds into the model's.
+_rate = {"tmp": None, "samples": deque()}
+_rate_lock = threading.Lock()
+
+
+def _note_progress(tmp, done, total):
+    """Record one written chunk: refresh downloaded/total plus a
+    trailing-window bytes/sec and the ETA it implies."""
+    now = time.monotonic()
+    with _rate_lock:
+        if _rate["tmp"] != tmp:
+            _rate["tmp"] = tmp
+            _rate["samples"].clear()
+        samples = _rate["samples"]
+        samples.append((now, done))
+        while len(samples) > 1 and now - samples[0][0] > 12:
+            samples.popleft()
+        rate = 0.0
+        if len(samples) >= 2 and now - samples[0][0] >= 1.0:
+            rate = (done - samples[0][1]) / (now - samples[0][0])
+    eta = None
+    if total and rate > 0 and done < total:
+        eta = int((total - done) / rate)
+    _set_state(downloaded=done, total=total or 0,
+               rate_bps=int(rate), eta_seconds=eta)
 
 
 def _heal_state_locked():
@@ -743,6 +999,8 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
     _set_state(stage=stage, error=None)
     restarts = 0
     while True:
+        if _pause_requested:
+            raise _PausedError("download paused")
         headers = {"Range": f"bytes={have}-"} if have > 0 else {}
         with requests.get(url, headers=headers, stream=True,
                           timeout=(15, 120)) as r:
@@ -844,15 +1102,22 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
                         if total:
                             _set_state(
                                 pct=min(99, int(done / total * 100)))
+                        _note_progress(tmp, done, total)
                         samples.append((time.monotonic(), done))
                         _raise_if_too_slow(samples, stream_t0,
                                            total, done)
+                        if _pause_requested:
+                            raise _PausedError("download paused")
             except OSError as e:
                 if e.errno in (errno.ENOSPC, errno.EDQUOT):
                     raise _PermanentDownloadError(
                         f"not enough free disk space ({e})")
                 raise
             if stream_error is not None:
+                # A pause force-closes the response, which surfaces
+                # here as a stream error - it is not one.
+                if _pause_requested:
+                    raise _PausedError("download paused")
                 # The stream broke. If the .part nevertheless holds
                 # exactly the expected byte count (the classic case:
                 # Content-Length lied long, the true body arrived in
@@ -863,6 +1128,8 @@ def _download_once(url, tmp, stage, expected_size, expected_sha256):
                 if not (expected_size and done == expected_size):
                     raise stream_error
             break
+    if _pause_requested:
+        raise _PausedError("download paused")
     _verify_part(tmp, total, expected_sha256, stage=stage)
 
 
@@ -955,6 +1222,11 @@ def _download_file(url, dest, stage, expected_size=None,
         except _PermanentDownloadError:
             raise
         except Exception as e:  # noqa: BLE001 - classified below
+            if _pause_requested:
+                # A pause is not a failure: no retries, no server
+                # switch, no error state - the worker reports the
+                # paused state itself.
+                raise _PausedError("download paused") from e
             if attempt >= _DOWNLOAD_ATTEMPTS:
                 if len(urls) > 1 and which > 0:
                     names = " or ".join(
@@ -979,7 +1251,7 @@ def _download_file(url, dest, stage, expected_size=None,
                     server_errors = 0
             time.sleep(min(2 ** attempt, 16))
     os.replace(tmp, dest)
-    _set_state(pct=100)
+    _set_state(pct=100, rate_bps=0, eta_seconds=None)
     return dest
 
 
@@ -1016,7 +1288,9 @@ def ensure_engine():
         archive = os.path.join(LLAMA_DIR,
                                "_engine_" + url.rsplit("/", 1)[-1])
         try:
-            _download_file(url, archive, "Downloading Built-in AI engine")
+            _download_file(url, archive, "Downloading Built-in AI engine",
+                           expected_sha256=_ENGINE_ARCHIVE_SHA256.get(
+                               url.rsplit("/", 1)[-1]))
             got = _extract_engine(archive, LLAMA_DIR)
             try:
                 os.remove(archive)
@@ -1054,7 +1328,18 @@ def _download_worker():
         ensure_engine()
         ensure_model()
         _set_state(active=False, done=True, pct=100, error=None,
-                   stage="Built-in AI ready")
+                   paused=False, stage="Built-in AI ready")
+    except _PausedError:
+        # The .part keeps every downloaded byte; Resume continues
+        # from it. Not an error, and the stage must not claim the
+        # download is still running.
+        with _state_lock:
+            pct = _download_state["pct"]
+        _set_state(active=False, done=False, paused=True, error=None,
+                   rate_bps=0, eta_seconds=None,
+                   stage=("Paused at %d%% - click Resume to continue"
+                          % pct if pct else
+                          "Paused - click Resume to continue"))
     except Exception as e:  # noqa: BLE001 - surfaced to the UI
         with _state_lock:
             pct = _download_state["pct"]
@@ -1065,7 +1350,7 @@ def _download_worker():
         stage = ("Download stopped at %d%% - click Download to resume"
                  % pct if pct else
                  "Download stopped - click Download to resume")
-        _set_state(active=False, done=False,
+        _set_state(active=False, done=False, paused=False,
                    error=str(e)[:300], stage=stage)
 
 
@@ -1074,7 +1359,7 @@ def start_download():
 
     Idempotent: while a download is running (or everything is already
     present) this just returns the current state."""
-    global _download_thread
+    global _download_thread, _pause_requested
     with _state_lock:
         _heal_state_locked()
         if _download_state["active"]:
@@ -1082,7 +1367,10 @@ def start_download():
         if model_ready():
             _download_state.update(done=True, pct=100, error=None)
             return dict(_download_state)
+        _pause_requested = False
         _download_state.update(active=True, done=False, error=None, pct=0,
+                               paused=False, downloaded=0, total=0,
+                               rate_bps=0, eta_seconds=None,
                                stage="Starting download")
         _download_thread = threading.Thread(target=_download_worker,
                                             daemon=True)
@@ -1146,11 +1434,58 @@ def _server_log_tail(n=1500):
         return ""
 
 
+def _launch_server(binary, progress_cb=None):
+    """Launch llama-server on `binary` and wait until it answers
+    health checks. Returns the base URL; raises RuntimeError with
+    the server's log tail when it cannot start. The GPU build gets
+    all layers offloaded (-ngl 99); the CPU build's command line is
+    exactly what it has always been."""
+    port = _free_port()
+    log = open(os.path.join(LLAMA_DIR, "server.log"), "ab")
+    cmd = [binary, "-m", model_path(),
+           "--host", "127.0.0.1", "--port", str(port),
+           "-c", "32768", "-t", str(os.cpu_count() or 4)]
+    gpu = gpu_engine_path()
+    if gpu and os.path.abspath(binary) == os.path.abspath(gpu):
+        cmd += ["-ngl", "99"]
+    proc = subprocess.Popen(cmd, stdout=log, stderr=log)
+    _server.update(proc=proc, port=port, log=log)
+    base = f"http://127.0.0.1:{port}"
+    deadline = time.time() + 300
+    tick = 0
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            tail = _server_log_tail()
+            _stop_server()
+            raise RuntimeError(
+                "Built-in AI engine exited while loading the model. "
+                + tail[-400:])
+        try:
+            r = requests.get(base + "/health", timeout=2)
+            if r.status_code == 200:
+                if progress_cb:
+                    progress_cb(8, "Built-in AI ready")
+                return base
+        except requests.RequestException:
+            pass
+        tick += 1
+        if progress_cb and tick % 5 == 0:
+            progress_cb(5, "Starting Built-in AI "
+                           "(loading the model into memory)")
+        time.sleep(1)
+    _stop_server()
+    raise RuntimeError("Built-in AI engine did not become ready in "
+                       "5 minutes. " + _server_log_tail()[-400:])
+
+
 def ensure_server(progress_cb=None):
     """Start llama-server (once) and wait until it answers health checks.
 
     Returns the base URL. Raises RuntimeError with a plain message when
-    the model is missing or the server cannot start."""
+    the model is missing or the server cannot start. When the GPU
+    engine is the active flavour but fails to launch, the session
+    falls back to the CPU engine (recorded in gpu_fallback_note())
+    instead of leaving the user with a dead AI."""
     if not model_ready():
         raise RuntimeError(
             "Built-in AI model is not downloaded yet. In Step 2 pick "
@@ -1160,39 +1495,17 @@ def ensure_server(progress_cb=None):
         if _server_alive():
             return f"http://127.0.0.1:{_server['port']}"
         binary = ensure_engine()
-        port = _free_port()
-        log = open(os.path.join(LLAMA_DIR, "server.log"), "ab")
-        cmd = [binary, "-m", model_path(),
-               "--host", "127.0.0.1", "--port", str(port),
-               "-c", "32768", "-t", str(os.cpu_count() or 4)]
-        proc = subprocess.Popen(cmd, stdout=log, stderr=log)
-        _server.update(proc=proc, port=port, log=log)
-        base = f"http://127.0.0.1:{port}"
-        deadline = time.time() + 300
-        tick = 0
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                tail = _server_log_tail()
-                _stop_server()
-                raise RuntimeError(
-                    "Built-in AI engine exited while loading the model. "
-                    + tail[-400:])
-            try:
-                r = requests.get(base + "/health", timeout=2)
-                if r.status_code == 200:
-                    if progress_cb:
-                        progress_cb(8, "Built-in AI ready")
-                    return base
-            except requests.RequestException:
-                pass
-            tick += 1
-            if progress_cb and tick % 5 == 0:
-                progress_cb(5, "Starting Built-in AI "
-                               "(loading the model into memory)")
-            time.sleep(1)
-        _stop_server()
-        raise RuntimeError("Built-in AI engine did not become ready in "
-                           "5 minutes. " + _server_log_tail()[-400:])
+        try:
+            return _launch_server(binary, progress_cb)
+        except RuntimeError:
+            gpu = gpu_engine_path()
+            if not gpu or os.path.abspath(binary) != \
+                    os.path.abspath(gpu):
+                raise
+            _mark_gpu_fallback(
+                "the GPU engine failed to start - the CPU engine "
+                "is being used instead")
+            return _launch_server(ensure_engine(), progress_cb)
 
 
 # ---------------------------------------------------------------------------

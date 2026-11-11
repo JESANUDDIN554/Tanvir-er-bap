@@ -41,6 +41,7 @@ from pipeline import (  # noqa: E402
 )
 
 import local_ai  # noqa: E402  (built-in local LLM: engine/model/server)
+import ai_components  # noqa: E402  (AI Installation Manager backend)
 import licensing  # noqa: E402  (signed license + core pack + integrity)
 import updater  # noqa: E402  (signed file-replacement update packs)
 from pipeline import load_corepack as _load_corepack  # noqa: E402
@@ -1590,11 +1591,70 @@ class Api:
                 "pct": st.get("pct", 0),
                 "size_gb": info.get("size_gb", 0),
                 "error": st.get("error"),
-                "stage": st.get("stage", "")}
+                "stage": st.get("stage", ""),
+                "paused": bool(st.get("paused")),
+                "downloaded": st.get("downloaded", 0),
+                "total": st.get("total", 0),
+                "rate_bps": st.get("rate_bps", 0),
+                "eta_seconds": st.get("eta_seconds")}
 
     def local_ai_download(self):
         local_ai.start_download()
         return self.local_ai_status()
+
+    # -- AI Installation Manager -------------------------------------
+    # One status payload drives the whole Manager page; the actions
+    # are thin wrappers over ai_components / local_ai and return
+    # that same payload so the page re-renders from one source.
+    def ai_manager_status(self):
+        return ai_components.manager_state()
+
+    def ai_install(self):
+        started = ai_components.start_install()
+        st = ai_components.manager_state()
+        st["started"] = started
+        return st
+
+    def ai_pause(self):
+        local_ai.pause_download()
+        return ai_components.manager_state()
+
+    def ai_resume(self):
+        local_ai.start_download()
+        return ai_components.manager_state()
+
+    def ai_verify(self):
+        started = ai_components.start_verify()
+        st = ai_components.manager_state()
+        st["started"] = started
+        return st
+
+    def ai_repair(self):
+        started = ai_components.start_repair()
+        st = ai_components.manager_state()
+        st["started"] = started
+        return st
+
+    def ai_reinstall(self):
+        started = ai_components.start_reinstall()
+        st = ai_components.manager_state()
+        st["started"] = started
+        return st
+
+    def ai_update_check(self):
+        return ai_components.check_update()
+
+    def ai_update_apply(self, component_id):
+        started = ai_components.start_update(component_id)
+        st = ai_components.manager_state()
+        st["started"] = started
+        return st
+
+    def ai_diagnostic(self):
+        started = ai_components.start_diagnostic()
+        st = ai_components.manager_state()
+        st["started"] = started
+        return st
 
     # -- licensing -------------------------------------------------------
     def license_status(self):
@@ -4510,6 +4570,11 @@ def main():
         local_ai.set_data_dir(load_settings().get("data_dir") or "")
     except Exception:  # noqa: BLE001 - a bad setting must not brick
         pass              # the boot; defaults apply instead
+
+    # AI health check: cheap file/system probes on a daemon thread,
+    # warming the cache the AI Installation Manager reads. Boot
+    # never blocks on it.
+    ai_components.prime_health()
 
     # Single instance: a repeated launch never starts a second server and
     # never opens anything - no second window, no browser tab, ever. It

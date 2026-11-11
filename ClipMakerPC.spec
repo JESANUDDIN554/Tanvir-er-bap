@@ -50,6 +50,7 @@ a = Analysis(
         "cv2",
         "numpy",
         "local_ai",
+        "ai_components",
         "licensing",
         "updater",
         "ed25519",

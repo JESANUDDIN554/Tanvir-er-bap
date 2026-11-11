@@ -56,9 +56,11 @@
     <button id="navScriptBtn" class="side-item" data-nav="script" title="AI Scriptwriter"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.6 3.6a2.1 2.1 0 0 1 3 3L8 18.2l-4.2 1.1L4.9 15z"/></svg><span>Scriptwriter</span></button>
     <button id="navTranscriptBtn" class="side-item" data-nav="transcript" title="Transcript Tool"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2.5H6.5a2 2 0 0 0-2 2v15a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V8z"/><path d="M14 2.5V8h5.5M9 13h6M9 17h6"/></svg><span>Transcript</span></button>
     <button id="navEnhBtn" class="side-item" data-nav="enhancer" title="Video Enhancer"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 4l1.6 4.4L17 10l-4.4 1.6L11 16l-1.6-4.4L5 10l4.4-1.6z"/><path d="M19 15v4M17 17h4"/></svg><span>Enhancer</span></button>
+    <div class="side-label">System</div>
+    <button id="navAiBtn" class="side-item" data-nav="aimanager" title="AI Engine — install, verify, repair and update the Built-in AI"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 4.6L18.5 9l-4.6 1.9L12 15.5l-1.9-4.6L5.5 9l4.6-1.4z"/><path d="M18.5 15.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9z"/></svg><span>AI Engine</span></button>
   </nav>
   <div class="side-foot">
-    <button id="sideAiCard" class="side-ai" type="button" title="Built-in AI status — click to open Settings">
+    <button id="sideAiCard" class="side-ai" type="button" title="Built-in AI status — click to open the AI Installation Manager">
       <span class="side-ai-dot" id="sideAiDot"></span>
       <span class="side-ai-text"><span class="side-ai-title">Built-in AI</span><span class="side-ai-status" id="sideAiText">Checking…</span></span>
     </button>
@@ -197,6 +199,7 @@
       <div class="bar hidden" id="hubAiBarWrap" style="margin-top:10px"><div id="hubAiBar" class="fill"></div></div>
       <div class="row row-tight" style="margin-top:10px">
         <button id="hubAiDownloadBtn" class="ghost-btn" type="button">Download Built-in AI (~9 GB)</button>
+        <button id="hubAiManageBtn" class="ghost-btn" type="button">Set up the AI Engine</button>
         <span class="hint" id="hubAiPct"></span>
       </div>
     </div>
@@ -932,6 +935,71 @@
       </div>
     </div>
   </section>
+
+  <!-- ============ AI ENGINE (INSTALLATION MANAGER) ============ -->
+  <section id="aiManagerView" class="card step-card hidden">
+    <div class="card-kicker">AI Engine</div>
+    <div class="row-between">
+      <h2>AI Installation Manager</h2>
+      <button class="ghost-btn tool-back" type="button">← Back</button>
+    </div>
+
+    <div id="aiSetupPanel" class="find-box" style="margin-top:12px">
+      <div class="field-label" id="aiSetupTitle">Setting Up Itraji AI Engine</div>
+      <p class="sub" id="aiSetupText" style="margin-top:6px">Checking the AI components on this PC…</p>
+      <div class="bar" id="aiOverallBarWrap" style="margin-top:10px"><div id="aiOverallBar" class="fill"></div></div>
+      <div class="row row-tight" style="margin-top:8px">
+        <span class="hint" id="aiOverallText"></span>
+        <span class="hint" id="aiSpeedText"></span>
+        <span class="hint" id="aiEtaText"></span>
+      </div>
+      <p class="error hidden" id="aiOpError"></p>
+    </div>
+
+    <div id="aiSuccessBanner" class="ai-success hidden" style="margin-top:12px">
+      <div class="ai-success-title">ITRAJI AI ENGINE SUCCESSFULLY INSTALLED</div>
+      <p class="sub" id="aiSuccessText" style="margin-top:4px">Every component is installed and verified. You can start clipping videos right away — the AI works fully offline.</p>
+    </div>
+
+    <div class="field" style="margin-top:14px">
+      <label class="field-label">Components</label>
+      <table class="ai-comp-table">
+        <thead><tr><th>Component</th><th>Version</th><th>Size</th><th>Status</th></tr></thead>
+        <tbody id="aiCompBody"></tbody>
+      </table>
+      <p class="hint" id="aiStorageText" style="margin-top:8px"></p>
+      <p class="hint" id="aiHwText"></p>
+      <p class="hint" id="aiUpdateText"></p>
+    </div>
+
+    <div class="field">
+      <label class="field-label">Actions</label>
+      <div class="row row-tight" style="margin-top:6px">
+        <button id="aiInstallBtn" class="primary" type="button">Install AI</button>
+        <button id="aiPauseBtn" class="ghost-btn hidden" type="button">Pause</button>
+        <button id="aiResumeBtn" class="ghost-btn hidden" type="button">Resume</button>
+        <button id="aiRetryBtn" class="ghost-btn hidden" type="button">Retry</button>
+      </div>
+      <div class="row row-tight" style="margin-top:8px">
+        <button id="aiVerifyBtn" class="ghost-btn" type="button">Verify AI files</button>
+        <button id="aiRepairBtn" class="ghost-btn" type="button">Repair AI</button>
+        <button id="aiUpdateBtn" class="ghost-btn" type="button">Check for AI updates</button>
+        <button id="aiDiagBtn" class="ghost-btn" type="button">Run diagnostic</button>
+        <button id="aiReinstallBtn" class="ghost-btn" type="button">Reinstall AI</button>
+      </div>
+      <p class="hint" id="aiActionText" style="margin-top:8px"></p>
+    </div>
+
+    <div class="field hidden" id="aiVerifyWrap">
+      <label class="field-label">Verification</label>
+      <div id="aiVerifyList"></div>
+    </div>
+
+    <div class="field hidden" id="aiDiagWrap">
+      <label class="field-label">Diagnostic</label>
+      <div id="aiDiagList"></div>
+    </div>
+  </section>
 </main>
 </div><!-- /content-col -->
 </div><!-- /app-shell -->
@@ -1110,6 +1178,7 @@
       <div class="bar hidden" id="settingsAiBarWrap" style="margin-top:10px"><div id="settingsAiBar" class="fill"></div></div>
       <div class="row row-tight" style="margin-top:10px">
         <button id="settingsAiDownloadBtn" class="ghost-btn" type="button">Download Built-in AI (~9 GB)</button>
+        <button id="settingsAiManagerBtn" class="ghost-btn" type="button">Open AI Manager</button>
         <span class="hint" id="settingsAiPct"></span>
       </div>
     </div>

@@ -38,7 +38,7 @@ let toolOpen = null;
 const TOOL_VIEWS = {
   generator: "generatorView", titles: "titlesView", script: "scriptView",
   transcript: "transcriptView", enhancer: "enhancerView",
-  hookmaker: "hookmakerView",
+  hookmaker: "hookmakerView", aimanager: "aiManagerView",
 };
 
 /* Opus-style shell: the sidebar active pill + topbar title follow the
@@ -49,6 +49,7 @@ const VIEW_TITLES = {
   titles: "Title & Hook Generator", script: "AI Scriptwriter",
   transcript: "Transcript Tool", enhancer: "Video Enhancer",
   hookmaker: "Hook Maker", captionstudio: "Caption Studio",
+  aimanager: "AI Engine",
 };
 function syncSidebar(view) {
   document.querySelectorAll(".side-item").forEach((b) =>
@@ -2227,6 +2228,7 @@ function closeStudioViews() {
   stopGenPoll();
   stopEnhancerPoll();
   stopHookPoll();
+  stopAiPoll();
   const sb = $("studioBtn");
   if (sb) sb.classList.remove("on");
 }
@@ -2248,6 +2250,7 @@ function showHub() {
   stopGenPoll();
   stopEnhancerPoll();
   stopHookPoll();
+  stopAiPoll();
   stopPoll();
   hubOpen = true;
   hide($("step1")); hide($("step2")); hide($("step3"));
@@ -2278,6 +2281,7 @@ function showTool(name) {
   stopGenPoll();
   stopEnhancerPoll();
   stopHookPoll();
+  stopAiPoll();
   toolOpen = name;
   hide($("step1")); hide($("step2")); hide($("step3"));
   show($(TOOL_VIEWS[name]));
@@ -2294,8 +2298,278 @@ function showTool(name) {
       if (jobId) $("hookProject").value = jobId;
     });
   }
+  else if (name === "aimanager") initAiManager();
   syncSidebar(name);
 }
+
+/* ---------------- AI Installation Manager ----------------
+   One page over ai_components.manager_state(): component table,
+   overall progress with speed + ETA, and the real actions -
+   Install / Pause / Resume / Retry / Verify / Repair / Update /
+   Diagnostic / Reinstall. The poll lives only while the page is
+   open (stopAiPoll is called by every view switch). */
+let aiPollTimer = null;
+
+function stopAiPoll() {
+  if (aiPollTimer) { clearInterval(aiPollTimer); aiPollTimer = null; }
+}
+function startAiPoll() {
+  if (aiPollTimer) return;
+  aiPollTimer = setInterval(refreshAiManager, 1500);
+}
+function initAiManager() {
+  refreshAiManager();
+  startAiPoll();
+}
+
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + " GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + " KB";
+  return n + " B";
+}
+function fmtEta(sec) {
+  if (sec == null) return "";
+  sec = Math.round(sec);
+  if (sec < 60) return "about " + sec + "s left";
+  if (sec < 3600) return "about " + Math.round(sec / 60) + " min left";
+  return "about " + (sec / 3600).toFixed(1) + " h left";
+}
+const AI_STATUS_LABEL = {
+  installed: "Installed ✓", missing: "Missing",
+  downloading: "Downloading…", verifying: "Verifying…",
+  corrupt: "Damaged", update_available: "Update available",
+};
+const AI_STATUS_CLASS = {
+  installed: "b-ok", missing: "b-bad", downloading: "b-info",
+  verifying: "b-info", corrupt: "b-bad", update_available: "b-warn",
+};
+
+async function refreshAiManager() {
+  if (toolOpen !== "aimanager") { stopAiPoll(); return; }
+  let st;
+  try { st = await api.ai_manager_status(); } catch (e) { return; }
+  if (!st || !st.components) return;
+  renderAiManager(st);
+}
+
+function renderAiManager(st) {
+  const dl = st.download || {}, op = st.install || {},
+    health = st.health || {}, hw = st.hardware || {},
+    eng = st.engine || {};
+  const comps = st.components.filter((c) => c.applicable);
+  const allOk = comps.every((c) => c.healthy);
+
+  /* component table */
+  const body = $("aiCompBody");
+  body.innerHTML = "";
+  st.components.forEach((c) => {
+    const tr = document.createElement("tr");
+    if (!c.applicable) tr.className = "ai-comp-na";
+    const ver = c.installed_version
+      ? c.installed_version + (c.installed_version !== c.version
+          ? " → " + c.version : "")
+      : c.version;
+    tr.innerHTML =
+      "<td><div>" + c.name + "</div><div class='hint'>" + c.detail +
+      (c.note ? " — " + c.note : "") + "</div></td>" +
+      "<td>" + ver + "</td><td>" + fmtBytes(c.size) + "</td>" +
+      "<td><span class='badge " + (AI_STATUS_CLASS[c.status] || "") +
+      "'>" + (AI_STATUS_LABEL[c.status] || c.status) + "</span></td>";
+    body.appendChild(tr);
+  });
+
+  /* storage + hardware lines */
+  const needed = health.disk_needed_bytes || 0;
+  $("aiStorageText").textContent = needed > 0
+    ? "Storage: " + fmtBytes(needed) + " to download · " +
+      fmtBytes(health.disk_free_bytes || 0) + " free on this PC"
+    : "Storage: everything is installed · " +
+      fmtBytes(health.disk_free_bytes || 0) + " free on this PC";
+  const gpu = hw.gpu;
+  $("aiHwText").textContent =
+    (gpu ? "Graphics: " + gpu.name + " (" +
+      fmtBytes(gpu.vram_bytes) + ")"
+         : "Graphics: no NVIDIA card detected") +
+    " · Memory: " + fmtBytes(hw.ram_bytes) +
+    " · CPU cores: " + (hw.cpu_cores || "?") +
+    " · Engine mode: " +
+    (eng.flavor === "gpu" ? "GPU (CUDA)" : "CPU") +
+    (eng.fallback ? " — " + eng.fallback : "");
+
+  /* setup panel: stage, overall progress, speed, ETA */
+  const busy = op.active || dl.active;
+  let stage = "";
+  if (op.active) stage = op.stage || "Setting up…";
+  else if (dl.active) stage = (dl.stage || "Downloading…") +
+    " — " + Math.round(dl.pct || 0) + "%";
+  else if (allOk) stage = "The AI Engine is fully installed on this PC.";
+  else if (dl.paused) stage = dl.stage ||
+    "Paused — the partial download is kept.";
+  else if (op.error) stage = "Setup stopped: " + op.error;
+  else stage = "Some AI components are missing or damaged — " +
+    "Install AI sets everything up.";
+  $("aiSetupText").textContent = stage;
+  $("aiOverallBar").style.width = (st.overall.pct || 0) + "%";
+  $("aiOverallText").textContent = fmtBytes(st.overall.downloaded) +
+    " of " + fmtBytes(st.overall.total) + " · " +
+    (st.overall.pct || 0) + "%";
+  $("aiSpeedText").textContent = dl.active && dl.rate_bps > 0
+    ? "↓ " + (dl.rate_bps / 1e6).toFixed(1) + " MB/s" : "";
+  $("aiEtaText").textContent = dl.active ? fmtEta(dl.eta_seconds) : "";
+  const opErr = $("aiOpError");
+  if (op.error) { opErr.textContent = op.error; show(opErr); }
+  else if (dl.error && !dl.active) {
+    opErr.textContent = "Download stopped: " + dl.error;
+    show(opErr);
+  } else hide(opErr);
+
+  /* success banner - a real state: everything healthy AND an
+     install finished this session or the diagnostic passed */
+  const banner = $("aiSuccessBanner");
+  if (st.success) {
+    const diag = st.diagnostic || {};
+    $("aiSuccessText").textContent = diag.done && diag.passed
+      ? "Every component is installed, verified, and the diagnostic passed — the engine launches, the brain answers, and the speech model loads. You can start clipping right away."
+      : "Every component is installed and verified. You can start clipping videos right away — the AI works fully offline.";
+    show(banner);
+  } else hide(banner);
+
+  /* action buttons follow the state - no dead buttons */
+  const btn = (id, on2, vis2) => {
+    const b = $(id);
+    b.disabled = !on2;
+    b.classList.toggle("hidden", !vis2);
+  };
+  btn("aiInstallBtn", !busy && !allOk, true);
+  btn("aiPauseBtn", dl.active, dl.active);
+  btn("aiResumeBtn", !busy, !!dl.paused);
+  btn("aiRetryBtn", !busy, !!(!dl.active && dl.error));
+  btn("aiVerifyBtn", !busy && !st.verify.active, true);
+  btn("aiRepairBtn", !busy && !allOk, true);
+  btn("aiDiagBtn", !st.diagnostic.active, true);
+  btn("aiReinstallBtn", !busy, true);
+  $("aiActionText").textContent = st.verify.active
+    ? "Verifying " + (st.verify.current || "") +
+      " — the full model checksum takes a little while…"
+    : st.diagnostic.active ? "Running the diagnostic…"
+    : op.active ? (op.stage || "") : "";
+
+  /* verify results */
+  const vw = $("aiVerifyWrap"), vl = $("aiVerifyList");
+  if (st.verify.done || st.verify.active) {
+    show(vw);
+    vl.innerHTML = "";
+    Object.keys(st.verify.results || {}).forEach((cid) => {
+      const r = st.verify.results[cid];
+      const row = document.createElement("div");
+      row.className = "ai-check-row";
+      row.innerHTML = "<span class='badge " +
+        (r.ok ? "b-ok" : "b-bad") + "'>" + (r.ok ? "✓" : "✗") +
+        "</span> <b>" + cid + "</b> — " + r.detail;
+      vl.appendChild(row);
+    });
+    if (st.verify.error) {
+      const row = document.createElement("div");
+      row.className = "ai-check-row";
+      row.textContent = "Verification stopped: " + st.verify.error;
+      vl.appendChild(row);
+    }
+  } else hide(vw);
+
+  /* diagnostic results */
+  const dw = $("aiDiagWrap"), dlList = $("aiDiagList");
+  if ((st.diagnostic.items || []).length || st.diagnostic.active) {
+    show(dw);
+    dlList.innerHTML = "";
+    (st.diagnostic.items || []).forEach((it) => {
+      const row = document.createElement("div");
+      row.className = "ai-check-row";
+      const cls = it.status === "pass" ? "b-ok"
+        : it.status === "fail" ? "b-bad" : "b-warn";
+      const mark = it.status === "pass" ? "✓"
+        : it.status === "fail" ? "✗" : "–";
+      row.innerHTML = "<span class='badge " + cls + "'>" + mark +
+        "</span> <b>" + it.label + "</b> — " + it.detail;
+      dlList.appendChild(row);
+    });
+  } else hide(dw);
+
+  /* update line (kept from the last check; refreshes on poll only
+     while an update is actually running) */
+  const upd = st.update || {};
+  if (upd.active) {
+    $("aiUpdateText").textContent = "Updating " + upd.component +
+      " — the new files are verified before they replace the old " +
+      "ones, and the old version is kept until the swap checks out.";
+  } else if (upd.done) {
+    $("aiUpdateText").textContent = "AI update installed for " +
+      upd.component + " ✓";
+  } else if (upd.error) {
+    $("aiUpdateText").textContent = "Update failed: " + upd.error +
+      " — the previous version is still in place.";
+  }
+}
+
+async function aiAct(fn, busyMsg) {
+  if (busyMsg) $("aiActionText").textContent = busyMsg;
+  try { await fn(); } catch (e) { /* the poll re-renders the state */ }
+  refreshAiManager();
+  refreshLocalAiStatus();
+}
+$("aiInstallBtn").addEventListener("click", () =>
+  aiAct(() => api.ai_install(), "Starting the AI installation…"));
+$("aiPauseBtn").addEventListener("click", () =>
+  aiAct(() => api.ai_pause(), "Pausing…"));
+$("aiResumeBtn").addEventListener("click", () =>
+  aiAct(() => api.ai_resume(), "Resuming…"));
+$("aiRetryBtn").addEventListener("click", () =>
+  aiAct(() => api.ai_resume(), "Retrying…"));
+$("aiVerifyBtn").addEventListener("click", () =>
+  aiAct(() => api.ai_verify(), "Verifying the AI files…"));
+$("aiRepairBtn").addEventListener("click", () =>
+  aiAct(() => api.ai_repair(), "Repairing the damaged components…"));
+$("aiDiagBtn").addEventListener("click", () =>
+  aiAct(() => api.ai_diagnostic(), "Running the diagnostic…"));
+$("aiReinstallBtn").addEventListener("click", () => {
+  if (!window.confirm("Reinstall the AI? This deletes the AI Brain " +
+      "(~9 GB), the runtime and the speech model, then downloads " +
+      "everything fresh.")) return;
+  aiAct(() => api.ai_reinstall(), "Reinstalling the AI…");
+});
+$("aiUpdateBtn").addEventListener("click", async () => {
+  let res;
+  try { res = await api.ai_update_check(); } catch (e) { return; }
+  const lines = (res.components || []).map((c) =>
+    c.id + ": installed " + (c.installed_version || "—") +
+    " · available " + c.available_version +
+    (c.update_available ? " — UPDATE AVAILABLE" : " — up to date"));
+  $("aiUpdateText").innerHTML = "";
+  lines.forEach((ln) => {
+    const div = document.createElement("div");
+    div.textContent = ln;
+    $("aiUpdateText").appendChild(div);
+  });
+  (res.components || []).filter((c) => c.update_available)
+    .forEach((c) => {
+      const b = document.createElement("button");
+      b.className = "ghost-btn small";
+      b.type = "button";
+      b.textContent = "Update " + c.id + " to " + c.available_version;
+      b.addEventListener("click", () =>
+        aiAct(() => api.ai_update_apply(c.id), "Updating " + c.id + "…"));
+      $("aiUpdateText").appendChild(b);
+    });
+  if (!res.update_available)
+    toast("The AI is up to date ✓");
+});
+$("hubAiManageBtn").addEventListener("click", () =>
+  showTool("aimanager"));
+$("settingsAiManagerBtn").addEventListener("click", () => {
+  closeSettings();
+  showTool("aimanager");
+});
 
 /* Home: recent projects - same cards as the Library. Opening one is a
    plain navigation; project state lives outside this system. */
@@ -2382,7 +2656,8 @@ $("navTitlesBtn").addEventListener("click", () => showTool("titles"));
 $("navScriptBtn").addEventListener("click", () => showTool("script"));
 $("navTranscriptBtn").addEventListener("click", () => showTool("transcript"));
 $("navEnhBtn").addEventListener("click", () => showTool("enhancer"));
-$("sideAiCard").addEventListener("click", () => $("settingsBtn").click());
+$("navAiBtn").addEventListener("click", () => showTool("aimanager"));
+$("sideAiCard").addEventListener("click", () => showTool("aimanager"));
 $("homeSeeAllBtn").addEventListener("click", showLibrary);
 document.querySelectorAll(".tool-back").forEach((b) =>
   b.addEventListener("click", backToStudio));

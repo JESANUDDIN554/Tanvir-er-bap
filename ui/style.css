@@ -1089,3 +1089,24 @@ button.danger-btn:disabled { background: var(--surface2); color: var(--muted2);
   .view-title { display: none; }
   .content-col .topbar { padding: 10px 14px; }
 }
+
+/* ---- AI Installation Manager ---- */
+.ai-comp-table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+.ai-comp-table th { text-align: left; font-size: 11px; letter-spacing: 0.6px;
+  text-transform: uppercase; color: var(--muted); padding: 6px 8px;
+  border-bottom: 1px solid var(--border); }
+.ai-comp-table td { padding: 9px 8px; border-bottom: 1px solid var(--border);
+  vertical-align: top; font-size: 13.5px; }
+.ai-comp-table tr.ai-comp-na td { opacity: 0.55; }
+.badge.b-ok { color: var(--accent); border-color: rgba(var(--accent-rgb), 0.45);
+  background: var(--accent-dim); }
+.badge.b-bad { color: var(--danger); border-color: rgba(248, 113, 113, 0.45);
+  background: rgba(248, 113, 113, 0.10); }
+.badge.b-warn { color: var(--amber); border-color: rgba(251, 191, 36, 0.45);
+  background: rgba(251, 191, 36, 0.10); }
+.badge.b-info { color: var(--accent); border-color: var(--border-strong); }
+.ai-success { border: 1px solid rgba(var(--accent-rgb), 0.5);
+  background: var(--accent-dim); border-radius: 14px; padding: 14px 16px; }
+.ai-success-title { font-weight: 900; letter-spacing: 0.8px;
+  color: var(--accent); font-size: 15px; }
+.ai-check-row { padding: 5px 0; font-size: 13.5px; }
