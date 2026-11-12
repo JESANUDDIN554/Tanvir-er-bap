@@ -150,12 +150,36 @@ def _record():
         return {}
 
 
+_record_lock = threading.RLock()
+
+
+def _mutate_record(fn):
+    """Locked read-modify-write of the install record: fn(rec)
+    edits in place, the result is saved atomically. Call sites
+    used to read + save unlocked from several worker threads, so
+    two writers could interleave and silently drop each other's
+    fields (a version stamp lost under a gpu_note write)."""
+    with _record_lock:
+        rec = _record()
+        fn(rec)
+        _save_record(rec)
+
+
 def _save_record(rec):
-    try:
-        with open(_RECORD_PATH, "w", encoding="utf-8") as f:
-            json.dump(rec, f)
-    except OSError:
-        pass
+    # Serialized + atomic: this used to be a bare open("w") from
+    # several worker threads (install/update/diag record versions
+    # concurrently). A reader mid-write parsed a truncated file,
+    # _record() swallowed the error and returned {}, and the
+    # manager silently forgot what was installed until the next
+    # write. tmp + os.replace makes every read see a whole file.
+    with _record_lock:
+        try:
+            tmp = _RECORD_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(rec, f)
+            os.replace(tmp, _RECORD_PATH)
+        except OSError:
+            pass
 
 
 def _installed_version(component_id, manifest_version):
@@ -164,12 +188,12 @@ def _installed_version(component_id, manifest_version):
 
 
 def _record_version(component_id, version):
-    rec = _record()
-    versions = rec.get("versions") or {}
-    versions[component_id] = version
-    rec["versions"] = versions
-    rec["updated_at"] = time.time()
-    _save_record(rec)
+    def _fn(rec):
+        versions = rec.get("versions") or {}
+        versions[component_id] = version
+        rec["versions"] = versions
+        rec["updated_at"] = time.time()
+    _mutate_record(_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +792,10 @@ def _diag_worker():
             reply = local_ai.chat(
                 [{"role": "user",
                   "content": "Reply with exactly one word: ready"}])
-            local_ai._stop_server()
+            # Release the engine after the check - but never stop
+            # it under a USER chat that started meanwhile.
+            if not local_ai.ai_busy():
+                local_ai._stop_server()
             if reply and reply.strip():
                 add("brain", "AI Brain answers", "pass",
                     "the model replied: %s"
@@ -968,6 +995,20 @@ def _update_engine_dir(component_id, entry):
 
 def _update_worker(component_id, entry):
     try:
+        if component_id in ("brain", "runtime", "runtime_gpu") \
+                and local_ai.ai_busy():
+            # The update replaces the model/engine the shared
+            # llama-server is serving from, and used to stop that
+            # server unconditionally - killing a live detection or
+            # chat mid-request with a server error. Refuse honestly
+            # instead; the user retries when the AI is idle.
+            _set_update(active=False, done=False,
+                        error="The Built-in AI is busy right now "
+                              "(a detection or chat is running). "
+                              "Run the update again when it "
+                              "finishes.",
+                        component=component_id, at=time.time())
+            return
         if component_id in ("runtime", "runtime_gpu"):
             # The engine files may be in use by a running server.
             local_ai._stop_server()
@@ -977,7 +1018,11 @@ def _update_worker(component_id, entry):
             ok, err = perform_file_update(
                 dest, entry.get("urls") or local_ai._model_urls(),
                 entry.get("size"), entry.get("sha256"))
-            if ok:
+            if ok and not local_ai.ai_busy():
+                # Restart the engine onto the new model - unless a
+                # chat started during the download: that chat keeps
+                # the old model (still mapped in its server) and
+                # the next engine start picks the new one up.
                 local_ai._stop_server()
         elif component_id in ("runtime", "runtime_gpu"):
             ok, err = _update_engine_dir(component_id, entry)
@@ -1142,9 +1187,8 @@ def _install_worker(kind):
                         "the CPU engine is used instead"
                         % str(e)[:160])
                 _set_op(fallback=note)
-                rec = _record()
-                rec["gpu_note"] = note
-                _save_record(rec)
+                _mutate_record(
+                    lambda rec: rec.update(gpu_note=note))
 
         _set_op(stage="Downloading the AI components")
         local_ai.start_download()
@@ -1167,14 +1211,16 @@ def _install_worker(kind):
                             "first use, or use Repair here"
                             % str(e)[:140])
 
-        rec = _record()
-        rec["installed_at"] = time.time()
-        versions = rec.get("versions") or {}
-        for _c in components():
-            if _c["healthy"] and _c["installed_version"]:
+        _healthy = [c for c in components()
+                    if c["healthy"] and c["installed_version"]]
+
+        def _stamp(rec, _h=_healthy):
+            rec["installed_at"] = time.time()
+            versions = rec.get("versions") or {}
+            for _c in _h:
                 versions[_c["id"]] = _c["installed_version"]
-        rec["versions"] = versions
-        _save_record(rec)
+            rec["versions"] = versions
+        _mutate_record(_stamp)
         _set_op(stage="Running the AI diagnostic",
                 warnings=warnings)
         start_diagnostic()

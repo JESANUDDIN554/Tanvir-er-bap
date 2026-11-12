@@ -383,7 +383,7 @@ def ensure_gpu_engine():
                        "Downloading CUDA runtime",
                        expected_size=size, expected_sha256=sha)
         with zipfile.ZipFile(archive) as z:
-            z.extractall(LLAMA_GPU_DIR)
+            _extract_zip_safely(z, LLAMA_GPU_DIR)
         _remove_quietly(archive)
         if override:
             break
@@ -447,9 +447,6 @@ def start_model_move(new_data_dir, on_done=None):
     already running, there is no complete model to move, or the
     model already lives at the target."""
     global _move_thread
-    with _move_lock:
-        if _move_state["active"]:
-            return False
     src = existing_model_path()
     if not src:
         return False
@@ -457,8 +454,16 @@ def start_model_move(new_data_dir, on_done=None):
     dst = os.path.join(dst_dir, MODEL_FILE)
     if os.path.abspath(src) == os.path.abspath(dst):
         return False
-    _set_move_state(active=True, pct=0, error=None, done=False,
-                    target=dst)
+    # Claim the move INSIDE the lock: the check and the claim used
+    # to be separated by the filesystem probes above, so two
+    # concurrent calls (a double-submitted set_data_dir) could both
+    # pass the check and run two copy workers over the same source -
+    # one deleting the original while the other still copied it.
+    with _move_lock:
+        if _move_state["active"]:
+            return False
+        _move_state.update(active=True, pct=0, error=None, done=False,
+                           target=dst)
 
     def _work():
         tmp = dst + ".moving"
@@ -661,6 +666,23 @@ def _maybe_auto_resume(state):
 
 
 def download_state():
+    """Pure read of the download state. This used to call
+    _maybe_auto_resume() as a side effect, so purely observational
+    callers - the Admin stats payload, the close guard asking
+    "is anything running?", ai_components - could START the ~9 GB
+    download just by looking. (The close-confirmation check could
+    resurrect the very download it was asking about.) Auto-resume
+    now fires only from maybe_auto_resume(), which the app's
+    dedicated local-ai status endpoint calls - the one place whose
+    whole job is the download's state."""
+    with _state_lock:
+        _heal_state_locked()
+        return dict(_download_state)
+
+
+def maybe_auto_resume():
+    """The one sanctioned auto-resume trigger (see download_state).
+    Returns the current state after any resume it fired."""
     with _state_lock:
         _heal_state_locked()
         state = dict(_download_state)
@@ -1255,10 +1277,29 @@ def _download_file(url, dest, stage, expected_size=None,
     return dest
 
 
+def _extract_zip_safely(z, dest_dir):
+    """Extract a zip member-by-member, refusing any member whose
+    resolved path would land outside dest_dir. (extractall does
+    sanitize '..' on modern Python, but the tar branch of this
+    same function already validates explicitly via filter="data";
+    and for env-override engine URLs there is no SHA-256 pin
+    upstream, so the zip path must not be the trusting one.)
+    Raises RuntimeError on a hostile member, before writing it."""
+    dest_root = os.path.abspath(dest_dir)
+    for info in z.infolist():
+        target = os.path.abspath(os.path.join(dest_root, info.filename))
+        if target != dest_root and \
+                not target.startswith(dest_root + os.sep):
+            raise RuntimeError(
+                f"engine archive contains an unsafe path "
+                f"({info.filename!r}) - refused")
+        z.extract(info, dest_root)
+
+
 def _extract_engine(archive, dest_dir):
     if archive.endswith(".zip"):
         with zipfile.ZipFile(archive) as z:
-            z.extractall(dest_dir)
+            _extract_zip_safely(z, dest_dir)
     elif archive.endswith((".tar.gz", ".tgz")):
         with tarfile.open(archive, "r:gz") as t:
             t.extractall(dest_dir, filter="data")
@@ -1385,7 +1426,7 @@ def start_download():
 # ---------------------------------------------------------------------------
 
 _server = {"proc": None, "port": None, "log": None}
-_server_lock = threading.Lock()
+_server_lock = threading.RLock()
 
 
 def _free_port():
@@ -1397,29 +1438,38 @@ def _free_port():
 
 
 def _server_alive():
-    proc = _server["proc"]
-    return proc is not None and proc.poll() is None
+    # Takes the lock: this used to read the shared _server dict
+    # lock-free while _stop_server (called from ai_components, from
+    # atexit, from launch failure paths) mutated it - a stop racing
+    # a launch could orphan a live llama-server or double-close the
+    # log handle. The lock is an RLock because ensure_server holds
+    # it across _launch_server, whose failure paths call
+    # _stop_server on the same thread.
+    with _server_lock:
+        proc = _server["proc"]
+        return proc is not None and proc.poll() is None
 
 
 def _stop_server():
-    proc = _server["proc"]
-    if proc is not None and proc.poll() is None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except Exception:  # noqa: BLE001
+    with _server_lock:
+        proc = _server["proc"]
+        if proc is not None and proc.poll() is None:
             try:
-                proc.kill()
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        _server["proc"] = None
+        _server["port"] = None
+        if _server["log"] is not None:
+            try:
+                _server["log"].close()
             except Exception:  # noqa: BLE001
                 pass
-    _server["proc"] = None
-    _server["port"] = None
-    if _server["log"] is not None:
-        try:
-            _server["log"].close()
-        except Exception:  # noqa: BLE001
-            pass
-        _server["log"] = None
+            _server["log"] = None
 
 
 atexit.register(_stop_server)
@@ -1441,7 +1491,16 @@ def _launch_server(binary, progress_cb=None):
     all layers offloaded (-ngl 99); the CPU build's command line is
     exactly what it has always been."""
     port = _free_port()
-    log = open(os.path.join(LLAMA_DIR, "server.log"), "ab")
+    # Rotate the engine log: it was append-only forever, growing by
+    # one model-load transcript per launch for the life of the
+    # install. Keep one previous generation, cap ~2 MB each.
+    log_path = os.path.join(LLAMA_DIR, "server.log")
+    try:
+        if os.path.getsize(log_path) > 2_000_000:
+            os.replace(log_path, log_path + ".old")
+    except OSError:
+        pass
+    log = open(log_path, "ab")
     cmd = [binary, "-m", model_path(),
            "--host", "127.0.0.1", "--port", str(port),
            "-c", "32768", "-t", str(os.cpu_count() or 4)]
@@ -1526,11 +1585,35 @@ def _admin_log(status, t0, error=None):
         pass
 
 
+_chat_inflight = 0
+_chat_inflight_lock = threading.Lock()
+
+
+def ai_busy():
+    """True while a chat completion is in flight. ai_components
+    checks this before stopping the shared llama-server for a
+    diagnostic or an engine update - stopping it mid-request used
+    to kill a live detection with a server error."""
+    with _chat_inflight_lock:
+        return _chat_inflight > 0
+
+
 def chat(messages, progress_cb=None):
     """One chat-completion round-trip against the local server.
 
     Returns the assistant's reply text. Raises RuntimeError on any
     failure - callers must surface it, never invent a fallback."""
+    global _chat_inflight
+    with _chat_inflight_lock:
+        _chat_inflight += 1
+    try:
+        return _chat_once(messages, progress_cb)
+    finally:
+        with _chat_inflight_lock:
+            _chat_inflight -= 1
+
+
+def _chat_once(messages, progress_cb=None):
     base = ensure_server(progress_cb)
     t0 = time.time()
     try:
