@@ -1408,6 +1408,14 @@
     </div>
 
     <div class="field" style="margin-top:18px">
+      <div class="find-box">
+        <div class="field-label">Super Admin</div>
+        <dl class="admin-dl" id="adSaList"></dl>
+        <p class="hint">Local connection state only — manage the connection itself in Settings → Super Admin.</p>
+      </div>
+    </div>
+
+    <div class="field" style="margin-top:18px">
       <label class="field-label">AI &amp; API providers</label>
       <div id="adProviders" class="admin-providers"></div>
       <p class="hint">Request history below covers calls made since the Admin Panel shipped. Credits are shown only when the provider itself reports them.</p>
@@ -1699,6 +1707,33 @@
         <button id="oldCopiesDeleteBtn" class="primary" type="button">Delete selected</button>
         <span class="hint" id="oldCopiesResult"></span>
       </div>
+    </div>
+    <div class="field">
+      <label class="field-label">Super Admin <span class="hint">— optional, off by default</span></label>
+      <p class="sub" style="margin:6px 0 0">Connect this PC to your Itraji Super Admin server so the server can manage this install's license and see how the app is used. <strong>What is collected, only while connected:</strong> usage and processing activity — when the app starts, videos imported, clipping and enhancement runs (with counts and durations), exports, downloads, publishing outcomes, and error types. <strong>Never collected:</strong> your videos, transcripts, captions, file contents or file names. Your license key is sent once, to the server address you enter below, to activate this device. Disconnect any time — disconnecting wipes the device credential from this PC and stops all reporting.</p>
+      <label class="field-label" for="saServerUrl" style="margin-top:10px">Server URL</label>
+      <div class="row row-tight">
+        <input id="saServerUrl" type="text" placeholder="https://admin.your-domain.com" spellcheck="false" autocomplete="off" style="flex:1">
+      </div>
+      <label class="field-label" for="saLicenseKey" style="margin-top:8px">Server license key <span class="hint">— only if it differs from the key this PC is already activated with</span></label>
+      <div class="row row-tight">
+        <input id="saLicenseKey" type="password" placeholder="Leave empty to use your active key" spellcheck="false" autocomplete="off" style="flex:1">
+      </div>
+      <div class="row row-tight" style="margin-top:10px">
+        <button id="saConnectBtn" class="ghost-btn" type="button">Connect…</button>
+        <button id="saVerifyBtn" class="ghost-btn hidden" type="button">Check license status now</button>
+        <button id="saDisconnectBtn" class="ghost-btn hidden" type="button">Disconnect</button>
+      </div>
+      <div id="saPinBox" class="find-box hidden" style="margin-top:10px">
+        <div class="field-label">Confirm this is your server</div>
+        <p class="sub" style="margin:6px 0 0">The server <span id="saPinServer"></span> reports this license-key fingerprint. Cliper will trust license keys signed by this key only. Connect only if this matches the fingerprint your Super Admin shows you:</p>
+        <p id="saPinFingerprint" style="font-family:monospace;font-size:11px;word-break:break-all;margin:8px 0"></p>
+        <div class="row row-tight">
+          <button id="saConfirmBtn" class="primary" type="button">Trust this server &amp; connect</button>
+          <button id="saCancelPinBtn" class="ghost-btn" type="button">Cancel</button>
+        </div>
+      </div>
+      <p class="hint" id="saState">Not connected.</p>
     </div>
     <div class="field">
       <label class="field-label">Admin Panel</label>

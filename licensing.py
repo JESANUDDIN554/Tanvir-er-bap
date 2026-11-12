@@ -396,3 +396,201 @@ def verify_integrity(base_dir):
         if hashlib.sha256(data).hexdigest() != want:
             return (False, rel)
     return (True, None)
+
+
+# ---------------------------------------------------------------------------
+# Super Admin server issuer (ADDITIVE - the legacy path above is
+# untouched and remains the default for every existing key)
+#
+# Itraji Super Admin (a separate application) mints keys in the same
+# ITRAJI1 wire format, signed with the SERVER's own Ed25519 keypair.
+# This build verifies those keys ONLY against a server public key the
+# user explicitly pinned in Settings (fetched from the server's
+# /api/v1/licenses/public-key at Connect time and confirmed by its
+# fingerprint). No server key is trusted by default, the legacy
+# PUBLIC_KEY_HEX path is never consulted for them, and legacy keys
+# never touch the network.
+#
+# The AI core pack is sealed per issuer: legacy keys unwrap the pack
+# key for corepack.enc; server keys unwrap the (different) pack key
+# for corepack_server.enc, sealed with the server's pack key. Each
+# license therefore only ever opens its own issuer's pack.
+# ---------------------------------------------------------------------------
+
+SERVER_PACK_FILE = "corepack_server.enc"
+ENTITLEMENT_PREFIX = "ENT1"
+
+
+def _server_pub(server_pub_hex):
+    """Parse a pinned server public key (hex). Raises LicenseError
+    for anything that is not a 32-byte Ed25519 public key."""
+    try:
+        pub = bytes.fromhex((server_pub_hex or "").strip())
+    except Exception:  # noqa: BLE001
+        raise LicenseError(
+            "The pinned Super Admin server key is damaged.")
+    if len(pub) != 32:
+        raise LicenseError(
+            "The pinned Super Admin server key is damaged.")
+    return pub
+
+
+def pubkey_fingerprint(server_pub_hex):
+    """Human-comparable fingerprint of a server public key: the
+    SHA-256 of the raw key bytes, grouped for display. The Connect
+    flow shows this so the user confirms the key they pin is the
+    key their server reports."""
+    pub = _server_pub(server_pub_hex)
+    digest = hashlib.sha256(pub).hexdigest().upper()
+    return "-".join(digest[i:i + 4] for i in range(0, len(digest), 4))
+
+
+def verify_license_server(key_str, server_pub_hex):
+    """Verify a Super Admin server-issued license key end to end.
+
+    Mirrors verify_license() step for step, but every signature is
+    checked against the PINNED server public key instead of the
+    embedded legacy key. Returns (payload, pack_key_bytes) with
+    payload["issuer"] == "server". Raises LicenseError with a plain
+    reason for every failure mode."""
+    pub = _server_pub(server_pub_hex)
+    parts = (key_str or "").strip().split(".")
+    if len(parts) != 3 or parts[0] != KEY_PREFIX:
+        raise LicenseError(
+            "That doesn't look like an Itraji Cliper license key.")
+    try:
+        payload_bytes = _b64d(parts[1])
+        sig = _b64d(parts[2])
+    except Exception:  # noqa: BLE001
+        raise LicenseError("That license key is damaged or incomplete.")
+    if not ed25519.verify(pub, parts[1].encode("ascii"), sig):
+        raise LicenseError(
+            "This license key is not genuine - its signature "
+            "doesn't check out.")
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        raise LicenseError("That license key is damaged or incomplete.")
+    payload["issuer"] = "server"
+    lic_machine = str(payload.get("machine") or "")
+    if lic_machine != "ANY" and lic_machine != machine_code():
+        raise LicenseError(
+            "This key was issued for a different computer. Keys are "
+            "tied to one machine - ask the seller for a key for this "
+            "machine code.")
+    import datetime
+    exp = str(payload.get("exp") or "never")
+    if exp != "never" and exp < datetime.date.today().isoformat():
+        raise LicenseError(
+            "This license key expired on " + exp + ". Ask the seller "
+            "for a renewal key.")
+    try:
+        core_sig = _b64d(str(payload["core_sig"]))
+        wrapped = _b64d(str(payload["pk"]))
+    except Exception:  # noqa: BLE001
+        raise LicenseError("That license key is damaged or incomplete.")
+    if not ed25519.verify(pub, COREPACK_CONTEXT, core_sig):
+        raise LicenseError(
+            "This license key is not genuine - its core signature "
+            "doesn't check out.")
+    wrap_machine = "ANY" if lic_machine == "ANY" else machine_code()
+    wrap_key = hashlib.sha256(
+        core_sig + wrap_machine.encode("ascii")).digest()
+    try:
+        pack_key = open_sealed(wrap_key, wrapped, aad=b"itraji-pack-key")
+    except ValueError:
+        raise LicenseError(
+            "This license key could not unlock the app's core pack "
+            "(it doesn't belong to this computer).")
+    if len(pack_key) != 32:
+        raise LicenseError("That license key is damaged or incomplete.")
+    return payload, pack_key
+
+
+def load_corepack_server(base_dir, pack_key):
+    """Decrypt corepack_server.enc (the server issuer's sealed core
+    pack) with a server license's pack key. Same construction as
+    load_corepack(); only the file differs."""
+    path = os.path.join(base_dir, SERVER_PACK_FILE)
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+    except OSError:
+        raise LicenseError(
+            "The app's server core pack file (corepack_server.enc) "
+            "is missing - reinstall the app, then activate again.")
+    try:
+        data = open_sealed(pack_key, blob, aad=b"itraji-corepack-v1")
+        return json.loads(data.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        raise LicenseError(
+            "The app's server core pack could not be unlocked with "
+            "this key - the copy may be damaged or mismatched.")
+
+
+def key_issuer():
+    """Which issuer the currently-unlocked key belongs to:
+    "server", "legacy", or None when locked."""
+    payload = _state.get("payload") or {}
+    if not _state.get("unlocked"):
+        return None
+    return "server" if payload.get("issuer") == "server" else "legacy"
+
+
+def try_unlock_trusted(key_str, base_dir, load_pack, server_pub_hex=""):
+    """try_unlock() plus the server issuer path.
+
+    The legacy path runs FIRST and its behaviour is exactly
+    try_unlock()'s. Only when the legacy path leaves the app locked
+    AND a server public key is pinned does the server path run; its
+    success marks the shared license state unlocked (so
+    require_unlocked(), usage limits and the Admin Panel all see the
+    server license like any other). With no pin - the default for
+    every existing install - this function IS try_unlock()."""
+    st = try_unlock(key_str, base_dir, load_pack)
+    if st.get("unlocked") or not (server_pub_hex or "").strip():
+        return st
+    if not (key_str or "").strip():
+        return st
+    import hashlib as _h
+    fp = _h.sha256(key_str.encode()).hexdigest()[:16]
+    try:
+        payload, pack_key = verify_license_server(key_str,
+                                                  server_pub_hex)
+        load_pack(load_corepack_server(base_dir, pack_key))
+    except LicenseError as e:
+        # A genuine server key whose PACK failed deserves the
+        # specific reason; a key that is simply not genuine under
+        # either issuer keeps the legacy verdict.
+        if "not genuine" not in str(e):
+            _state.update(unlocked=False, payload=None,
+                          reason=str(e), key_fp=fp)
+        return state()
+    _state.update(unlocked=True, payload=payload, reason="", key_fp=fp)
+    return state()
+
+
+def verify_entitlement(token, server_pub_hex):
+    """Verify a signed online entitlement (ENT1.<payload>.<sig>)
+    issued by the Super Admin server's verify/activate endpoints.
+    Returns the entitlement payload dict; raises LicenseError for
+    any forgery or damage. The caller checks machine + grace_until;
+    this function authenticates the token itself."""
+    pub = _server_pub(server_pub_hex)
+    parts = (token or "").strip().split(".")
+    if len(parts) != 3 or parts[0] != ENTITLEMENT_PREFIX:
+        raise LicenseError("That entitlement token is not genuine.")
+    try:
+        payload_bytes = _b64d(parts[1])
+        sig = _b64d(parts[2])
+    except Exception:  # noqa: BLE001
+        raise LicenseError("That entitlement token is damaged.")
+    if not ed25519.verify(pub, parts[1].encode("ascii"), sig):
+        raise LicenseError("That entitlement token is not genuine.")
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        raise LicenseError("That entitlement token is damaged.")
+    if payload.get("kind") != "itraji-entitlement":
+        raise LicenseError("That entitlement token is not genuine.")
+    return payload

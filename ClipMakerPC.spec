@@ -37,6 +37,7 @@ a = Analysis(
         ("ui", "ui"),
         ("models", "models"),  # YuNet face-detection model for face tracking
         ("corepack.enc", "."),  # license-sealed core pack (prompts/styles)
+        ("corepack_server.enc", "."),  # same pack, sealed for the Super Admin server issuer
         ("fonts", "fonts"),  # bundled OFL caption fonts (Caption Studio)
     ],
     hiddenimports=[
@@ -53,6 +54,7 @@ a = Analysis(
         "admin",
         "usage",
         "publishing",
+        "superadmin",
         "channels",
         "ai_components",
         "licensing",

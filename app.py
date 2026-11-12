@@ -47,6 +47,7 @@ import admin  # noqa: E402  (Owner Admin Panel: sessions/log/stats)
 import usage  # noqa: E402  (per-key clip limits: signed max_clips)
 import publishing  # noqa: E402  (Auto Publishing: accounts/queue/scheduler)
 import channels  # noqa: E402  (Phase 2: YouTube Channel Monitor client)
+import superadmin  # noqa: E402  (opt-in Super Admin connection + SDK)
 import ai_components  # noqa: E402  (AI Installation Manager backend)
 import licensing  # noqa: E402  (signed license + core pack + integrity)
 import updater  # noqa: E402  (signed file-replacement update packs)
@@ -56,6 +57,7 @@ import pipeline as _pipeline  # noqa: E402
 _pipeline.FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 
 JOBS = {}
+_SA_RENDER_T0 = {}  # Super Admin: render start times (real durations)
 BATCHES = {}
 _REMOVER_JOBS = {}  # Caption Remover runs (session-only, not Library)
 _GEN_JOBS = {}      # fal.ai generator runs (session-only)
@@ -552,6 +554,30 @@ DEFAULT_SETTINGS = {
     "data_dir": "",                # Settings -> Storage: folder for
                                    # the AI model + new projects;
                                    # "" = the app folder (default)
+    # --- Super Admin connection (Settings -> "Super Admin") --------
+    # OPT-IN and off by default: nothing is collected or sent until
+    # the user connects a server and confirms its public-key
+    # fingerprint. Owned end-to-end by superadmin.py + the dedicated
+    # Api endpoints below; the wholesale settings save can never
+    # write these keys. Secrets (device credential + entitlement)
+    # are masked in get_settings like fal_key.
+    "sa_server_url": "",           # the user's Super Admin server
+    "sa_device_id": "",            # server-issued device id
+    "sa_device_credential": "",    # SECRET - shown once by the
+                                   # server at activation; stored
+                                   # here, masked in every response
+    "sa_pinned_pubkey": "",        # server license public key (hex),
+                                   # pinned after fingerprint confirm
+    "sa_entitlement": "",          # SECRET - signed ENT1 token
+    "sa_grace_until": "",          # ISO; offline grace deadline
+    "sa_status": "",               # last known license status
+    "sa_last_verify": 0,           # epoch of last verify attempt
+    "sa_last_verify_ok": 0,        # epoch of last verify success
+    "sa_connected_at": 0,
+    "sa_server_name": "",
+    "sa_server_version": "",
+    "sa_pub_seen": [],             # publishing job ids already
+                                   # reported to Super Admin
 }
 
 # Clip-length presets -> (min_s, max_s) for moment detection.
@@ -653,6 +679,25 @@ def _ensure_pub():
         publishing.bind_settings(load_settings, _pub_save_settings_patch)
         _PUB_BOUND["done"] = True
     publishing.ensure_worker()
+
+
+# ---------------------------------------------------------------------------
+# Super Admin glue: superadmin.py reads/writes app settings through
+# the same injected-callable pattern as publishing. The tracker only
+# ever starts when the user has connected a server (sa_* settings);
+# for every unconnected install this whole block is inert.
+# ---------------------------------------------------------------------------
+
+def _sa_save_settings_patch(patch):
+    with _SETTINGS_LOCK:
+        s = load_settings()
+        s.update(patch or {})
+        save_settings(s)
+
+
+superadmin.bind_settings(load_settings, _sa_save_settings_patch,
+                         APP_VERSION, lambda: local_ai.DATA_DIR)
+superadmin.start_if_connected()
 
 
 # ---------------------------------------------------------------------------
@@ -1369,6 +1414,15 @@ class Api:
             for a in (s.get("pub_accounts") or [])
             if isinstance(a, dict)]
         s.pop("pub_account_status", None)
+        # Super Admin secrets: the device credential and the signed
+        # entitlement never leave the backend (same treatment as the
+        # publishing secrets). The Settings section reads connection
+        # state via superadmin_state() instead.
+        s["sa_connected"] = bool(
+            s.get("sa_server_url") and s.get("sa_device_id")
+            and s.get("sa_device_credential"))
+        s.pop("sa_device_credential", None)
+        s.pop("sa_entitlement", None)
         # Speed pass: the Settings Performance section shows which
         # encoder will actually be used (the pipeline probes NVENC
         # for real; the result is cached per session).
@@ -1405,6 +1459,13 @@ class Api:
                         "pub_account_status"):
                 settings.pop(key, None)
                 settings.pop(key + "_set", None)
+            settings.pop("sa_connected", None)
+            # Super Admin keys are owned by the dedicated endpoints
+            # (superadmin_connect / superadmin_disconnect /
+            # superadmin_verify) - a wholesale UI save must never
+            # create, alter or wipe a connection.
+            for key in superadmin.SA_SETTING_KEYS:
+                settings.pop(key, None)
             if "pub_accounts" in settings:
                 stored = {a.get("id"): a for a in
                           (current.get("pub_accounts") or [])
@@ -1426,6 +1487,84 @@ class Api:
             save_settings(current)
         _apply_perf_settings()
         return {"ok": True}
+
+    # -- Super Admin connection (opt-in; see superadmin.py) ----------
+    # These endpoints own every sa_* settings key. The device
+    # credential + entitlement are stored by superadmin.connect and
+    # never returned here or by get_settings.
+
+    def superadmin_state(self):
+        """Connection state for the Settings section (no secrets)."""
+        try:
+            st = superadmin.status()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)[:200]}
+        return {"ok": True, "state": st}
+
+    def superadmin_prepare(self, server_url):
+        """Connect step 1: fetch the server's license public key.
+        Returns its fingerprint for the user to confirm. NOTHING is
+        pinned or stored by this call."""
+        try:
+            info = superadmin.fetch_public_key(server_url)
+        except superadmin.ServerError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)[:200]}
+        return {"ok": True, "server_url": info["server_url"],
+                "fingerprint": info["fingerprint"],
+                "public_key_hex": info["public_key_hex"],
+                "server_name": info["server_name"],
+                "server_version": info["server_version"]}
+
+    def superadmin_connect(self, server_url, public_key_hex,
+                           license_key="", server_name="",
+                           server_version=""):
+        """Connect step 2 (after the user confirmed the fingerprint):
+        pin the key, activate this device on the server, start the
+        tracker. The key used is the one the user activated with,
+        unless they pasted a server-issued key in the section (the
+        migration path for a first server key)."""
+        settings = load_settings()
+        key = (license_key or "").strip() \
+            or _current_license_key()
+        if not key:
+            return {"ok": False, "error": "Activate Cliper with a "
+                                          "license key first, then "
+                                          "connect."}
+        ok, result = superadmin.connect(
+            server_url, public_key_hex, key, licensing.machine_code(),
+            device_name=os.environ.get("COMPUTERNAME", ""))
+        if not ok:
+            return {"ok": False, "error": result}
+        # Persist the server identity the prepare step reported.
+        _sa_save_settings_patch({
+            "sa_server_name": str(server_name or "")[:80],
+            "sa_server_version": str(server_version or "")[:40]})
+        if (license_key or "").strip():
+            # A pasted server key becomes the active key: re-unlock
+            # through the (now pinned) trusted path and store it.
+            st = _try_unlock(key)
+            if st.get("unlocked"):
+                with _SETTINGS_LOCK:
+                    current = load_settings()
+                    current["license_key"] = key
+                    save_settings(current)
+        else:
+            _ensure_license()
+        return {"ok": True, "state": superadmin.status()}
+
+    def superadmin_disconnect(self):
+        """Kill switch: wipe the credential + pin, stop the SDK."""
+        return {"ok": True, "state": superadmin.disconnect()}
+
+    def superadmin_verify(self):
+        """'Check license status now': verify with the server; a
+        suspension lands here, an unreachable server is reported
+        honestly (grace keeps the app working meanwhile)."""
+        ok, detail = superadmin.verify_now()
+        return {"ok": ok, "detail": detail,
+                "state": superadmin.status()}
 
     # -- in-app updates (signed file-replacement packs) ---------------
     def update_info(self):
@@ -1627,6 +1766,8 @@ class Api:
                                    language or "auto"),
                              daemon=True)
         t.start()
+        superadmin.emit("video.uploaded", {"source": "url"},
+                        job_id=job_id)
         return {"ok": True, "job_id": job_id}
 
     def import_file(self, path, language="auto"):
@@ -1654,6 +1795,8 @@ class Api:
         t = threading.Thread(target=self._run_transcribe_only,
                              args=(job_id, language or "auto"), daemon=True)
         t.start()
+        superadmin.emit("video.uploaded", {"source": "file"},
+                        job_id=job_id)
         return {"ok": True, "job_id": job_id}
 
     def import_batch(self, urls, use_cookies=False, language="auto"):
@@ -1779,6 +1922,10 @@ class Api:
             job["error"] = self._friendly_error(e)
             job["stage"] = "Failed"
             _job_log(job_id, "ERROR: " + job["error"])
+            superadmin.emit("processing.failed",
+                            {"kind": "import",
+                             "error": type(e).__name__},
+                            job_id=job_id)
 
     def _run_transcribe_only(self, job_id, language):
         job = JOBS[job_id]
@@ -1803,6 +1950,10 @@ class Api:
             job["error"] = self._friendly_error(e)
             job["stage"] = "Failed"
             _job_log(job_id, "ERROR: " + job["error"])
+            superadmin.emit("processing.failed",
+                            {"kind": "transcription",
+                             "error": type(e).__name__},
+                            job_id=job_id)
 
     def import_srt_transcript(self, job_id, srt_path):
         """Replace the job's transcript with words parsed from an SRT file."""
@@ -2184,13 +2335,14 @@ class Api:
                 "remaining": u["remaining"], "state": u["state"]}
 
     def activate_license(self, key):
-        st = licensing.try_unlock((key or "").strip(), BASE_DIR,
-                                  _load_corepack)
+        st = _try_unlock(key)
         if st.get("unlocked"):
             with _SETTINGS_LOCK:
                 current = load_settings()
                 current["license_key"] = (key or "").strip()
                 save_settings(current)
+            superadmin.emit("license.activated",
+                            {"issuer": licensing.key_issuer() or ""})
             return {"ok": True,
                     "licensee": (st.get("payload") or {}).get("name", "")}
         return {"ok": False, "error": st.get("reason")
@@ -3722,6 +3874,8 @@ class Api:
         except Exception as e:  # noqa: BLE001
             return {"ok": False,
                     "error": "Export failed: " + str(e)[:160]}
+        superadmin.emit("video.exported", {"kind": "transcript_" + fmt},
+                        job_id=job_id)
         return {"ok": True, "path": path,
                 "url": self._download_url(job_id, path)}
 
@@ -4456,6 +4610,7 @@ class Api:
                               "source_path": apath,
                               "source_name": os.path.basename(path)}
         admin.bump_counter("enhancer")
+        superadmin.emit("enhancement.started", {}, job_id=eid)
         t = threading.Thread(target=self._run_enhance,
                              args=(eid, path), daemon=True)
         t.start()
@@ -4481,9 +4636,19 @@ class Api:
             st["stage"] = "Done"
             st["url"] = "/files/enhance-" + eid + "/enhanced.mp4"
             st["folder"] = folder
+            superadmin.emit(
+                "enhancement.completed",
+                {"duration_ms": int((time.time()
+                                     - st.get("created", time.time()))
+                                    * 1000)},
+                job_id=eid)
         except Exception as e:  # noqa: BLE001 - surfaced to the UI
             st["status"] = "error"
             st["error"] = str(e)[:300]
+            superadmin.emit("processing.failed",
+                            {"kind": "enhancement",
+                             "error": type(e).__name__},
+                            job_id=eid)
 
     def enhance_status(self, eid):
         st = _ENHANCE_JOBS.get(eid or "")
@@ -4646,6 +4811,9 @@ class Api:
                  "created": time.time()}
         _BENHANCE_BATCHES[bid] = batch
         self._benhance_kick(batch)
+        superadmin.emit("enhancement.started",
+                        {"batch": True, "items": len(items)},
+                        job_id=bid)
         return {"ok": True, "batch_id": bid, "count": len(items)}
 
     def _benhance_kick(self, batch):
@@ -4674,6 +4842,15 @@ class Api:
             if not any(it["state"] in ("queued", "running")
                        for it in batch["items"]):
                 batch["state"] = "done"
+                _done_n = sum(1 for it in batch["items"]
+                              if it["state"] == "done")
+                superadmin.emit(
+                    "enhancement.completed",
+                    {"batch": True, "items": _done_n,
+                     "duration_ms": int(
+                         (time.time()
+                          - batch.get("created", time.time())) * 1000)},
+                    job_id=batch.get("id"))
 
     def _run_benhance_item(self, batch, item):
         item["state"] = "running"
@@ -5073,6 +5250,9 @@ class Api:
         job["status"] = "working"
         job.pop("render_error", None)  # don't ship a stale failure
         job.pop("limit_note", None)  # ...or a stale cap notice
+        superadmin.emit("clipping.started",
+                        {"clips_requested": len(indices)},
+                        job_id=job_id)
         t = threading.Thread(
             target=self._run_render,
             args=(job_id, list(indices), opts),
@@ -5083,6 +5263,7 @@ class Api:
     def _run_render(self, job_id, indices, opts):
         job = JOBS[job_id]
         lock = job.get("_render_lock")
+        _SA_RENDER_T0[job_id] = time.time()
         try:
             with _capped_render_slot():
                 self._render_clips(job_id, indices, opts)
@@ -5313,6 +5494,16 @@ class Api:
                 if made:
                     fresh_pub = list(range(len(renders) - made,
                                            len(renders)))
+                _sa_dur = int((time.time()
+                               - _SA_RENDER_T0.pop(job_id,
+                                                   time.time())) * 1000)
+                superadmin.emit(
+                    "clipping.completed",
+                    {"clips_generated": made, "duration_ms": _sa_dur},
+                    job_id=job_id)
+                if made:
+                    superadmin.emit("clips.generated",
+                                    {"count": made}, job_id=job_id)
                 # A batch that lands exactly on the cap is a full
                 # success - but say the key is now used up, so the
                 # next refusal is never a surprise.
@@ -5323,6 +5514,18 @@ class Api:
                         f"{u['max_clips']} clips and all are now "
                         "used. Please contact your provider to "
                         "top up.")
+            if tamper_hit or limit_hit:
+                _sa_dur = int((time.time()
+                               - _SA_RENDER_T0.pop(job_id,
+                                                   time.time())) * 1000)
+                superadmin.emit(
+                    "clipping.completed",
+                    {"clips_generated": made, "duration_ms": _sa_dur,
+                     "partial": True},
+                    job_id=job_id)
+                if made:
+                    superadmin.emit("clips.generated",
+                                    {"count": made}, job_id=job_id)
         except Exception as e:  # noqa: BLE001
             _release_render_lock(job)
             job["status"] = "moments"
@@ -5331,6 +5534,11 @@ class Api:
             _job_log(job_id, "ERROR: " + job["render_error"])
             # keep any clips that finished before the failure
             job["renders"] = renders
+            _SA_RENDER_T0.pop(job_id, None)
+            superadmin.emit("processing.failed",
+                            {"kind": "clipping",
+                             "error": type(e).__name__},
+                            job_id=job_id)
         _save_job(job_id)
         if fresh_pub:
             self._pub_auto_queue(job_id, fresh_pub)
@@ -5369,6 +5577,8 @@ class Api:
             write_srt(words, m["start"], m["end"], srt_path)
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": "SRT failed: " + str(e)[:160]}
+        superadmin.emit("video.exported", {"kind": "srt"},
+                        job_id=job_id)
         return {"ok": True, "path": srt_path,
                 "url": self._download_url(job_id, srt_path)}
 
@@ -5382,6 +5592,8 @@ class Api:
             write_vtt(words, m["start"], m["end"], vtt_path)
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": "VTT failed: " + str(e)[:160]}
+        superadmin.emit("video.exported", {"kind": "vtt"},
+                        job_id=job_id)
         return {"ok": True, "path": vtt_path,
                 "url": self._download_url(job_id, vtt_path)}
 
@@ -5477,6 +5689,8 @@ class Api:
             write_xml_timeline(clips, out)
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": "XML failed: " + str(e)[:160]}
+        superadmin.emit("video.exported", {"kind": "xml"},
+                        job_id=job_id)
         return {"ok": True, "path": out,
                 "url": self._download_url(job_id, out)}
 
@@ -5668,6 +5882,9 @@ class Api:
                     pass
         _job_log(job_id, f"ZIP built - {len(renders)} clips "
                          "(clips.zip)")
+        superadmin.emit("video.exported",
+                        {"kind": "zip", "clips": len(renders)},
+                        job_id=job_id)
         resp = {"ok": True, "path": zpath,
                 "url": self._download_url(job_id, zpath),
                 "filename": "clips.zip", "clips": len(renders)}
@@ -5961,11 +6178,29 @@ def _current_license_key():
         return ""
 
 
+def _pinned_server_pub():
+    """The Super Admin server public key the user pinned at Connect
+    time ("" when never connected - the common case, in which the
+    unlock below is exactly the legacy path)."""
+    try:
+        return (load_settings().get("sa_pinned_pubkey") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _try_unlock(key):
+    """Unlock with the active key: legacy verification first, the
+    pinned-server path second (licensing.try_unlock_trusted). With
+    no pinned server key this IS licensing.try_unlock."""
+    return licensing.try_unlock_trusted(
+        (key or "").strip(), BASE_DIR, _load_corepack,
+        server_pub_hex=_pinned_server_pub())
+
+
 def _ensure_license():
     """Verify the stored/env license and load the core pack (the
     verification is memoized per key inside licensing)."""
-    return licensing.try_unlock(_current_license_key(), BASE_DIR,
-                                _load_corepack)
+    return _try_unlock(_current_license_key())
 
 
 def _license_locked():
@@ -5981,6 +6216,12 @@ def _license_gate():
     if reason is None and not _COREPACK_READY():
         reason = ("This copy is locked - activate it with your "
                   "license key first.")
+    if reason is None:
+        # Super Admin online layer: applies ONLY to server-issued
+        # keys while connected (suspension learned at verify time,
+        # or the signed entitlement's grace window lapsing). Legacy
+        # keys never reach a block here.
+        reason = superadmin.gate_block(licensing.key_issuer())
     if reason is None:
         return None
     return {"ok": False, "error": "locked", "message": reason}
@@ -6280,7 +6521,8 @@ def _admin_stats_payload():
             "license": license_panel,
             "system": admin.system_info(disk_path=_work_root()),
             "providers": admin.provider_summaries(entries),
-            "publishing": publishing.admin_stats()}
+            "publishing": publishing.admin_stats(),
+            "superadmin": superadmin.status()}
 
 
 _MAX_API_BODY = 16 * 1024 * 1024  # no endpoint takes a bigger body
@@ -6655,6 +6897,10 @@ def make_wsgi_app(api):
                 # app's real "user saved a file" events (inline
                 # media previews are not downloads).
                 admin.bump_counter("downloads")
+                # Super Admin: a real file download (same
+                # attachment-only definition; never for previews).
+                superadmin.emit("video.downloaded", {"ext": ext},
+                                job_id=job_id)
             start_response("200 OK", headers)
 
             def _stream():

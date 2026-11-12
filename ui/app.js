@@ -4398,6 +4398,7 @@ $("settingsBtn").addEventListener("click", async () => {
   openSettings();
   refreshStorage();
   refreshUpdateInfo();
+  refreshSaState();
 });
 $("closeSettingsBtn").addEventListener("click", closeSettings);
 
@@ -4453,6 +4454,115 @@ $("falKeyClearBtn").addEventListener("click", async () => {
   $("falKeyInput").value = "";
   $("falKeyState").textContent = "No key saved.";
   toast("fal.ai key removed");
+});
+
+/* ---------------- Super Admin connection (opt-in) ---------------
+   Two-step connect: prepare fetches the server's license public
+   key and shows its fingerprint; only the explicit confirm pins
+   it and activates this device. State always comes from the
+   backend (superadmin_state) - the page never sees the device
+   credential or the signed entitlement. */
+let saPendingPin = null;
+
+function renderSaState(st) {
+  const el = $("saState");
+  if (!st || !st.connected) {
+    el.textContent = "Not connected.";
+    $("saConnectBtn").classList.remove("hidden");
+    $("saVerifyBtn").classList.add("hidden");
+    $("saDisconnectBtn").classList.add("hidden");
+    $("saServerUrl").disabled = false;
+    return;
+  }
+  $("saConnectBtn").classList.add("hidden");
+  $("saVerifyBtn").classList.remove("hidden");
+  $("saDisconnectBtn").classList.remove("hidden");
+  $("saServerUrl").disabled = true;
+  if (!$("saServerUrl").value) $("saServerUrl").value = st.server_url || "";
+  const bits = ["Connected to " + (st.server_url || "server")];
+  if (st.server_name)
+    bits.push(st.server_name
+      + (st.server_version ? " v" + st.server_version : ""));
+  if (st.status) bits.push("license status: " + st.status);
+  if (st.device_id) bits.push("device " + st.device_id.slice(0, 8) + "…");
+  bits.push("last sync " + (st.last_sync
+    ? new Date(st.last_sync * 1000).toLocaleString() : "not yet"));
+  bits.push((st.queued || 0) + " event(s) queued");
+  if (st.grace_until)
+    bits.push("offline grace until "
+      + new Date(st.grace_until).toLocaleString());
+  el.textContent = bits.join(" · ");
+}
+
+async function refreshSaState() {
+  try {
+    const res = await api.superadmin_state();
+    if (res && res.ok) renderSaState(res.state);
+  } catch (e) { /* the section simply keeps its last state */ }
+}
+
+$("saConnectBtn").addEventListener("click", async () => {
+  const url = $("saServerUrl").value.trim();
+  if (!url) {
+    toast("Enter your Super Admin server URL first", true);
+    return;
+  }
+  $("saConnectBtn").disabled = true;
+  $("saState").textContent = "Contacting the server…";
+  const res = await api.superadmin_prepare(url);
+  $("saConnectBtn").disabled = false;
+  if (!res.ok) {
+    $("saState").textContent = "✗ "
+      + (res.error || "Could not reach that server.");
+    return;
+  }
+  saPendingPin = { server_url: res.server_url,
+    public_key_hex: res.public_key_hex,
+    server_name: res.server_name || "",
+    server_version: res.server_version || "" };
+  $("saPinServer").textContent = res.server_url
+    + (res.server_name ? " (" + res.server_name + ")" : "");
+  $("saPinFingerprint").textContent = res.fingerprint;
+  show($("saPinBox"));
+});
+$("saCancelPinBtn").addEventListener("click", () => {
+  saPendingPin = null;
+  hide($("saPinBox"));
+  refreshSaState();
+});
+$("saConfirmBtn").addEventListener("click", async () => {
+  if (!saPendingPin) return;
+  $("saConfirmBtn").disabled = true;
+  const res = await api.superadmin_connect(
+    saPendingPin.server_url, saPendingPin.public_key_hex,
+    $("saLicenseKey").value.trim(), saPendingPin.server_name,
+    saPendingPin.server_version);
+  $("saConfirmBtn").disabled = false;
+  if (!res.ok) {
+    $("saState").textContent = "✗ "
+      + (res.error || "Connection failed.");
+    toast(res.error || "Connection failed", true);
+    return;
+  }
+  saPendingPin = null;
+  $("saLicenseKey").value = "";
+  hide($("saPinBox"));
+  renderSaState(res.state);
+  toast("Connected to Super Admin");
+});
+$("saDisconnectBtn").addEventListener("click", async () => {
+  const res = await api.superadmin_disconnect();
+  if (res && res.ok) renderSaState(res.state);
+  toast("Disconnected from Super Admin — reporting stopped");
+});
+$("saVerifyBtn").addEventListener("click", async () => {
+  $("saVerifyBtn").disabled = true;
+  const res = await api.superadmin_verify();
+  $("saVerifyBtn").disabled = false;
+  if (res && res.state) renderSaState(res.state);
+  if (res && res.ok) toast("License status checked: active");
+  else toast((res && res.detail && res.detail.error)
+    || "Could not verify with the server", true);
 });
 
 /* ---------------- storage location + update packs ---------------
@@ -5588,6 +5698,16 @@ function renderAdminStats(d) {
     ? (pub.recent_errors || []).map((e) =>
       `<div class="prov-row"><span class="prov-name">${escapeHtml(e.platform || "")} — ${escapeHtml(e.title || "")}</span><span class="prov-note">${escapeHtml(e.error || "")}</span></div>`).join("")
     : '<p class="hint">No publishing errors recorded.</p>';
+  const sa = d.superadmin || {};
+  $("adSaList").innerHTML = dlRows([
+    ["Connected", sa.connected ? "Yes" : "No"],
+    ["Server", sa.server_url || "—"],
+    ["License status", sa.status || "—"],
+    ["Last sync", sa.last_sync
+      ? new Date(sa.last_sync * 1000).toLocaleString() : "—"],
+    ["Queued events", String(sa.queued ?? 0)],
+    ["Device", sa.device_id ? sa.device_id.slice(0, 8) + "…" : "—"],
+  ]);
   const ram = (sys.ram_total
     ? fmtBytes(sys.ram_free || 0) + " free of "
       + fmtBytes(sys.ram_total) : "—");
