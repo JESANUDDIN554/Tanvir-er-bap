@@ -421,6 +421,12 @@ DEFAULT_SETTINGS = {
     "broll": False,                # stock cutaway on long stretches
     "enhance_clarity": False,      # sharpen + denoise ("enhance", not "AI upscale")
     "quality_tier": "maximum",     # encode tier: maximum/balanced/fast
+    # -- Performance (Speed pass) --------------------------------------
+    "gpu_accel": "auto",           # auto | gpu (only-if-proven) | cpu
+    "responsive_render": True,     # ffmpeg renders below normal
+                                   # priority so the PC stays usable
+    "render_threads": 0,           # ffmpeg -threads cap; 0 = automatic
+                                   # (logical cores - 2)
     "logo_path": "",               # brand-kit corner logo PNG
     "brand_kits": [],              # [{name, caption_style, primary, secondary,
                                    #   outline, logo_path, intro_path, outro_path}]
@@ -519,6 +525,25 @@ def save_settings(data):
         _SETTINGS_LOAD_WARNING["active"] = False
     except OSError:
         pass
+
+
+def _apply_perf_settings():
+    """Push the Performance settings into the pipeline's encoder
+    selection (GPU mode, responsive priority, thread cap). Called at
+    boot and after every settings save; the defaults are the smart
+    ones, so a user who never opens Settings gets GPU Auto +
+    responsive rendering out of the box."""
+    try:
+        s = load_settings()
+        _pipeline.configure_performance(
+            gpu_mode=s.get("gpu_accel", "auto"),
+            responsive=bool(s.get("responsive_render", True)),
+            threads=int(s.get("render_threads") or 0))
+    except Exception:  # noqa: BLE001 - defaults in pipeline still apply
+        pass
+
+
+_apply_perf_settings()
 
 
 # ---------------------------------------------------------------------------
@@ -1257,6 +1282,13 @@ class Api:
             for a in (s.get("pub_accounts") or [])
             if isinstance(a, dict)]
         s.pop("pub_account_status", None)
+        # Speed pass: the Settings Performance section shows which
+        # encoder will actually be used (the pipeline probes NVENC
+        # for real; the result is cached per session).
+        try:
+            s["encoder_status"] = _pipeline.encoder_status()
+        except Exception:  # noqa: BLE001 - status is informational
+            s["encoder_status"] = None
         if _SETTINGS_LOAD_WARNING["active"]:
             s["load_warning"] = (
                 "Your settings file couldn't be read (it may be "
@@ -1305,6 +1337,7 @@ class Api:
                 settings["pub_accounts"] = merged_accounts
             current.update(settings)
             save_settings(current)
+        _apply_perf_settings()
         return {"ok": True}
 
     # -- in-app updates (signed file-replacement packs) ---------------
@@ -3182,18 +3215,24 @@ class Api:
                   "hook": hook_text, "virality": score}
         self._call_render_clip(job_id, job, moment, out,
                                self._hook_opts())
+        _enc = _pipeline.last_render_encoder()
         rebased = [{"start": round(max(0.0, w["start"] - start), 3),
                     "end": round(max(0.0, w["end"] - start), 3),
                     "word": w["word"]}
                    for w in job["words"]
                    if w["end"] > start and w["start"] < end]
-        job.setdefault("renders", []).append({
+        _hrd = {
             "path": out, "title": "Hook clip",
             "virality": score, "moment_index": -1,
             "words": rebased, "merged_duration": round(end - start, 2),
             "hook_clip": True, "hook_text": hook_text,
-            "url": self._download_url(job_id, out)})
-        _job_log(job_id, "Render finished - " + os.path.basename(out))
+            "url": self._download_url(job_id, out)}
+        if _enc.get("encoder"):
+            _hrd["encoder"] = _enc["encoder"]
+        job.setdefault("renders", []).append(_hrd)
+        _job_log(job_id, "Render finished - " + os.path.basename(out)
+                 + (f" [{_enc['encoder']}]" if _enc.get("encoder")
+                    else ""))
         return len(job["renders"]) - 1
 
     def hook_render(self, job_id, hook_text, start, end):
@@ -4574,10 +4613,19 @@ class Api:
                 # two batches can never overwrite each other's files
                 out = os.path.join(outdir, f"{i + 1:02d}_{safe}{tag}.mp4")
                 self._call_render_clip(job_id, job, m, out, opts)
+                # Speed pass: record which encoder actually produced
+                # this clip (GPU/CPU) so the job is honest about it.
+                _enc = _pipeline.last_render_encoder()
                 _rd = {"path": out, "title": m["title"],
                        "virality": m["virality"],
                        "moment_index": i,
                        "url": self._download_url(job_id, out)}
+                if _enc.get("encoder"):
+                    _rd["encoder"] = _enc["encoder"]
+                if _enc.get("fell_back"):
+                    _job_log(job_id, "GPU encode failed mid-render "
+                                     "- this clip was finished on "
+                                     "CPU")
                 # Phase 1: aspect + how the frame was reframed +
                 # whether the audio was polished - labelled on the
                 # record so the UI (and exports) can say it plainly.
@@ -4613,7 +4661,9 @@ class Api:
                 # Analysis rail fills one by one during polling
                 job["renders"] = renders
                 _job_log(job_id, "Render finished - "
-                         + os.path.basename(out))
+                         + os.path.basename(out)
+                         + (f" [{_rd['encoder']}]"
+                            if _rd.get("encoder") else ""))
                 # count the finished clip against the key's
                 # allowance (no-op for unlimited keys)
                 made += 1

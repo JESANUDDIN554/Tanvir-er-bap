@@ -387,7 +387,7 @@ function renderLiveRail(st) {
     div.innerHTML = `${thumb ? `<img src="${thumb}" alt="">` : ""}
       <div class="rc-text">
         <div class="rc-title">${escapeHtml(r.title || "Clip")}</div>
-        <div class="rc-meta">${dur ? dur + " · " : ""}virality ${r.virality ?? "—"}${r.aspect ? " · " + escapeHtml(r.aspect) : ""}${r.reframe ? " · " + escapeHtml(r.reframe) : ""}${r.audio_polish ? " · 🔊 −14 LUFS" : ""}${r.broll ? ` · 🎞 B-roll: ${escapeHtml(r.broll.keyword || "stock")}` : ""}</div>
+        <div class="rc-meta">${dur ? dur + " · " : ""}virality ${r.virality ?? "—"}${r.aspect ? " · " + escapeHtml(r.aspect) : ""}${r.reframe ? " · " + escapeHtml(r.reframe) : ""}${r.audio_polish ? " · 🔊 −14 LUFS" : ""}${r.encoder ? " · ⚙ " + escapeHtml(r.encoder) : ""}${r.broll ? ` · 🎞 B-roll: ${escapeHtml(r.broll.keyword || "stock")}` : ""}</div>
         <div class="rc-translate">
           <select class="rc-lang" aria-label="Caption language">${translateLangs.map(([c, l]) => `<option value="${c}">${l}</option>`).join("")}</select>
           <button class="ghost-btn small rc-tr" type="button" ${trBusy ? "disabled" : ""}>${trBusy ? "Translating…" : "🌐 Translate"}</button>
@@ -3841,6 +3841,16 @@ $("settingsBtn").addEventListener("click", async () => {
   } catch (e) { settings = settings || {}; }
   segSet("themeSeg", settings.theme === "light" ? "light" : "dark");
   segSet("windowSeg", settings.window_mode === "chrome" ? "chrome" : "own");
+  // Performance (Speed pass): GPU mode, responsive toggle, thread
+  // cap, and the server's honest encoder status line.
+  segSet("gpuSeg", ["auto", "gpu", "cpu"].includes(settings.gpu_accel)
+    ? settings.gpu_accel : "auto");
+  segSet("responsiveSeg", settings.responsive_render === false
+    ? "off" : "on");
+  $("renderThreadsInput").value = settings.render_threads || 0;
+  $("encoderStatus").textContent = settings.encoder_status
+    ? settings.encoder_status.label
+    : "Encoder status unavailable.";
   $("accentPick").value = settings.accent || "#2effc8";
   // fal.ai key: the field always starts EMPTY (the key is never sent
   // back to the page) - the state line says whether one is saved.
@@ -4195,6 +4205,32 @@ document.querySelectorAll("#windowSeg .seg").forEach((b) =>
     settings.window_mode = b.dataset.value;
     try { await api.save_settings({ window_mode: settings.window_mode }); } catch (e) { /* offline */ }
   }));
+document.querySelectorAll("#gpuSeg .seg").forEach((b) =>
+  b.addEventListener("click", async () => {
+    segSet("gpuSeg", b.dataset.value);
+    settings.gpu_accel = b.dataset.value;
+    try {
+      await api.save_settings({ gpu_accel: settings.gpu_accel });
+      // the mode change re-probes server-side; show the fresh truth
+      const s = await api.get_settings();
+      if (s && s.encoder_status)
+        $("encoderStatus").textContent = s.encoder_status.label;
+    } catch (e) { /* offline */ }
+  }));
+document.querySelectorAll("#responsiveSeg .seg").forEach((b) =>
+  b.addEventListener("click", async () => {
+    segSet("responsiveSeg", b.dataset.value);
+    settings.responsive_render = b.dataset.value === "on";
+    try { await api.save_settings({ responsive_render: settings.responsive_render }); } catch (e) { /* offline */ }
+  }));
+$("renderThreadsInput").addEventListener("change", async () => {
+  let n = parseInt($("renderThreadsInput").value, 10);
+  if (isNaN(n) || n < 0) n = 0;
+  if (n > 64) n = 64;
+  $("renderThreadsInput").value = n;
+  settings.render_threads = n;
+  try { await api.save_settings({ render_threads: n }); } catch (e) { /* offline */ }
+});
 $("accentPick").addEventListener("input", async () => {
   settings.accent = $("accentPick").value;
   applyTheme();

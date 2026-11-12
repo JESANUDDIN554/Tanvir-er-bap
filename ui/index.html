@@ -1535,6 +1535,26 @@
       </div>
     </div>
     <div class="field">
+      <label class="field-label">Performance <span class="hint">— rendering speed, and keeping your PC usable while a render runs</span></label>
+      <div class="segmented" id="gpuSeg">
+        <button type="button" data-value="auto" class="seg on">GPU Auto</button>
+        <button type="button" data-value="gpu" class="seg">GPU</button>
+        <button type="button" data-value="cpu" class="seg">CPU</button>
+      </div>
+      <p class="hint" id="encoderStatus">Checking encoder…</p>
+      <div class="row row-tight" style="margin-top:10px">
+        <span class="hint" style="flex:1">Keep my PC responsive while rendering — renders run at lower priority, so your other apps stay smooth even mid-render.</span>
+        <div class="segmented" id="responsiveSeg">
+          <button type="button" data-value="on" class="seg on">On</button>
+          <button type="button" data-value="off" class="seg">Off</button>
+        </div>
+      </div>
+      <div class="row row-tight" style="margin-top:10px">
+        <label class="hint" for="renderThreadsInput" style="flex:1">Render threads — 0 is automatic (your CPU cores minus 2, so the PC keeps breathing room)</label>
+        <input id="renderThreadsInput" type="number" min="0" max="64" step="1" value="0" style="width:80px">
+      </div>
+    </div>
+    <div class="field">
       <label class="field-label" for="falKeyInput">fal.ai API key <span class="hint">— for the AI Video Generator. Stored only on this PC, never shown back.</span></label>
       <div class="row row-tight">
         <input id="falKeyInput" type="password" placeholder="Paste your fal.ai API key" spellcheck="false" autocomplete="off" style="flex:1">

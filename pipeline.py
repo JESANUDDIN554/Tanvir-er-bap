@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 
 import requests
@@ -27,23 +28,32 @@ import requests
 # ---------------------------------------------------------------------------
 if os.name == "nt":
     _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    _BELOW_NORMAL = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS",
+                            0x00004000)
     _sp_run = subprocess.run
     _sp_popen = subprocess.Popen
 
-    def _force_no_window(kwargs):
+    def _force_no_window(kwargs, cmd=None):
         # OR the flag in - never just a default. A caller (or a library
         # like yt-dlp) that passes its OWN creationflags must not be able
         # to lose the no-window bit, or a console flashes on Windows.
-        kwargs["creationflags"] = \
-            int(kwargs.get("creationflags") or 0) | _CREATE_NO_WINDOW
+        flags = int(kwargs.get("creationflags") or 0) | _CREATE_NO_WINDOW
+        # Speed pass: a rendering ffmpeg must not starve the desktop.
+        # With "Keep my PC responsive" on (the default), ffmpeg
+        # children run BELOW_NORMAL so Windows always schedules the
+        # user's apps first. Downloads (yt-dlp) are NOT touched.
+        if _responsive_render() and _is_ffmpeg_cmd(cmd):
+            flags |= _BELOW_NORMAL
+        kwargs["creationflags"] = flags
 
     def _run_no_window(*args, **kwargs):
-        _force_no_window(kwargs)
+        _force_no_window(kwargs, args[0] if args else kwargs.get("args"))
         return _sp_run(*args, **kwargs)
 
     class _PopenNoWindow(_sp_popen):
         def __init__(self, *args, **kwargs):
-            _force_no_window(kwargs)
+            _force_no_window(kwargs,
+                             args[0] if args else kwargs.get("args"))
             super().__init__(*args, **kwargs)
 
     subprocess.run = _run_no_window
@@ -102,14 +112,26 @@ if os.name == "posix":
             env["FONTCONFIG_FILE"] = conf
             kwargs["env"] = env
 
+    def _nice_args(args):
+        # POSIX twin of the Windows below-normal flag: run ffmpeg
+        # under nice(5) when "Keep my PC responsive" is on, so a
+        # render never starves the desktop. Only ffmpeg is wrapped -
+        # downloads and probes keep normal priority.
+        if not args or not _responsive_render():
+            return args
+        cmd = args[0]
+        if not _is_ffmpeg_cmd(cmd) or isinstance(cmd, (str, bytes)):
+            return args
+        return (["nice", "-n", "5"] + list(cmd),) + tuple(args[1:])
+
     def _run_fontconfig(*args, **kwargs):
         _fontconfig_env(kwargs)
-        return _sp_run_posix(*args, **kwargs)
+        return _sp_run_posix(*_nice_args(args), **kwargs)
 
     class _PopenFontconfig(_sp_popen_posix):
         def __init__(self, *args, **kwargs):
             _fontconfig_env(kwargs)
-            super().__init__(*args, **kwargs)
+            super().__init__(*_nice_args(args), **kwargs)
 
     subprocess.run = _run_fontconfig
     subprocess.Popen = _PopenFontconfig
@@ -125,6 +147,306 @@ _ENCODE_TIERS = {
     "balanced": ("medium", "20"),
     "fast": ("veryfast", "23"),
 }
+
+# ---------------------------------------------------------------------------
+# Encoder selection + PC responsiveness (Speed pass)
+#
+# The user's render complaint: "when I give render, PC got lagged so
+# much" - on a machine WITH an RTX 5060. Two causes, two fixes:
+#
+# 1. Encodes ran on the CPU (libx264) while the GPU's dedicated NVENC
+#    block sat idle. When a REAL NVENC probe passes (encoder listed
+#    AND a one-frame test encode succeeds - the list alone lies:
+#    ffmpeg builds ship the encoder on GPU-less machines, where the
+#    test encode fails), final-clip encodes use h264_nvenc at
+#    quality-mapped settings. Any probe failure or mid-render NVENC
+#    failure falls back to the exact historical x264 path - a GPU
+#    hiccup must never become a dead render.
+# 2. ffmpeg children grabbed every core at normal priority, starving
+#    the desktop. Encodes now carry a -threads cap (cores - 2 by
+#    default) and, while "Keep my PC responsive" is on (default),
+#    ffmpeg children launch below normal priority (see the subprocess
+#    wrappers at the top of this module).
+#
+# Settings reach this module via configure_performance() (app.py
+# wires it at boot and on every settings save). Defaults are the
+# smart ones: GPU Auto + responsive ON, nothing to configure.
+# ---------------------------------------------------------------------------
+_PERF = {
+    "gpu_mode": "auto",   # auto | gpu (only-if-proven) | cpu
+    "responsive": True,   # below-normal priority for ffmpeg children
+    "threads": 0,         # 0 = app decides: max(1, cores - 2)
+}
+_NVENC_PROBE = {"done": False, "available": False, "reason": "not probed"}
+
+# x264 tier -> NVENC (preset, cq). CQ is NVENC's constant-quality
+# scale; the values keep Maximum visibly lossless-class (cq 18 with
+# the slowest p7 preset + VBR) while the lower tiers trade quality
+# for speed exactly like their x264 namesakes do.
+_NVENC_TIERS = {
+    "maximum": ("p7", "18"),
+    "balanced": ("p6", "23"),
+    "fast": ("p4", "27"),
+}
+# Exact (x264 pair) -> (NVENC pair) for the fixed-quality post-passes
+# (logo / zoom / B-roll / crossfade all encode at slow/17).
+_NVENC_PAIRS = {
+    ("slow", "16"): ("p7", "18"),
+    ("medium", "20"): ("p6", "23"),
+    ("veryfast", "23"): ("p4", "27"),
+    ("slow", "17"): ("p7", "19"),
+}
+_NVENC_PAIRS_INV = {v: k for k, v in _NVENC_PAIRS.items()}
+_NVENC_PRESET_BY_X264 = {
+    "slow": "p7", "medium": "p6", "fast": "p5", "faster": "p4",
+    "veryfast": "p4", "superfast": "p3", "ultrafast": "p2",
+}
+_X264_PRESET_BY_NVENC = {
+    "p7": "slow", "p6": "medium", "p5": "fast", "p4": "veryfast",
+    "p3": "superfast", "p2": "ultrafast", "p1": "ultrafast",
+}
+
+_ENC_TLS = threading.local()
+
+
+def configure_performance(gpu_mode=None, responsive=None, threads=None):
+    """Wire Settings -> encoder behaviour. A GPU-mode change
+    invalidates the cached NVENC probe (re-probed lazily)."""
+    if gpu_mode is not None:
+        mode = str(gpu_mode).lower()
+        if mode not in ("auto", "gpu", "cpu"):
+            mode = "auto"
+        if mode != _PERF["gpu_mode"]:
+            _PERF["gpu_mode"] = mode
+            _NVENC_PROBE["done"] = False
+    if responsive is not None:
+        _PERF["responsive"] = bool(responsive)
+    if threads is not None:
+        try:
+            _PERF["threads"] = max(0, min(256, int(threads)))
+        except (TypeError, ValueError):
+            _PERF["threads"] = 0
+
+
+def _responsive_render():
+    return bool(_PERF.get("responsive", True))
+
+
+def _is_ffmpeg_cmd(cmd):
+    """True when a subprocess argv launches ffmpeg itself (NOT
+    ffprobe, NOT yt-dlp downloads)."""
+    try:
+        if not cmd or isinstance(cmd, (str, bytes)):
+            return False
+        # split on both separators: a Windows path must parse even
+        # when this code runs (and is unit-tested) off Windows
+        base = str(cmd[0]).replace("\\", "/").rsplit("/", 1)[-1].lower()
+        return base in ("ffmpeg", "ffmpeg.exe")
+    except Exception:  # noqa: BLE001 - a probe must never break a spawn
+        return False
+
+
+def render_thread_cap():
+    """Effective ffmpeg -threads value: the user's override when set,
+    else cores - 2 (never below 1) so the OS keeps breathing room."""
+    t = int(_PERF.get("threads") or 0)
+    if t > 0:
+        return t
+    return max(1, (os.cpu_count() or 4) - 2)
+
+
+def _probe_nvenc():
+    """(available, reason). Cached per session; configure_performance
+    invalidates on mode change. Available requires BOTH the encoder
+    in ffmpeg's list AND a real one-frame test encode to succeed -
+    ffmpeg builds carry h264_nvenc on machines with no NVIDIA GPU,
+    where only the test encode tells the truth."""
+    if _NVENC_PROBE["done"]:
+        return _NVENC_PROBE["available"], _NVENC_PROBE["reason"]
+    avail, reason = False, ""
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           text=True, timeout=30)
+        if "h264_nvenc" not in (r.stdout or ""):
+            reason = "this ffmpeg has no h264_nvenc encoder"
+        else:
+            t = subprocess.run(
+                ["ffmpeg", "-v", "error", "-f", "lavfi",
+                 "-i", "color=black:s=256x256", "-frames:v", "1",
+                 "-c:v", "h264_nvenc", "-preset", "p7", "-f", "null", "-"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                text=True, timeout=30)
+            if t.returncode == 0:
+                avail, reason = True, "NVENC test encode passed"
+            else:
+                err = [ln.strip() for ln in
+                       (t.stderr or "").strip().splitlines() if ln.strip()]
+                # the informative line names CUDA/NVENC; the muxer's
+                # trailing "nothing was written" line does not
+                named = [ln for ln in err if "nvenc" in ln.lower()
+                         or "cuda" in ln.lower()]
+                tail = (named[0] if named else
+                        err[-1] if err else "unknown error")[:140]
+                if "libcuda" in (t.stderr or "") or \
+                        "CUDA" in (t.stderr or ""):
+                    reason = ("no working NVIDIA GPU/driver found ("
+                              + tail + ")")
+                else:
+                    reason = "NVENC test encode failed (" + tail + ")"
+    except Exception as e:  # noqa: BLE001 - probe failure = CPU path
+        reason = "NVENC probe failed (" + str(e)[:120] + ")"
+    _NVENC_PROBE.update(done=True, available=avail, reason=reason)
+    return avail, reason
+
+
+def encoder_status():
+    """Settings status line data: which encoder the next render will
+    use, and why. Probes lazily (cached) unless the mode is CPU."""
+    mode = _PERF["gpu_mode"]
+    cap = render_thread_cap()
+    if mode == "cpu":
+        return {"mode": mode, "encoder": "CPU", "gpu_available": False,
+                "threads": cap, "responsive": _responsive_render(),
+                "label": "CPU encoding (GPU acceleration set to CPU)"}
+    avail, reason = _probe_nvenc()
+    if avail:
+        return {"mode": mode, "encoder": "GPU", "gpu_available": True,
+                "threads": cap, "responsive": _responsive_render(),
+                "label": "NVIDIA NVENC — available (GPU encoding)"}
+    return {"mode": mode, "encoder": "CPU", "gpu_available": False,
+            "threads": cap, "responsive": _responsive_render(),
+            "label": "CPU encoding (" + reason + ")"}
+
+
+def _encoder_choice(force_cpu=False):
+    """'gpu' when the configured mode allows it AND the probe proved
+    NVENC works on this machine; 'cpu' otherwise. A thread-local
+    force (set by the caption-remover retry) wins over everything."""
+    if force_cpu or getattr(_ENC_TLS, "force_cpu", False):
+        return "cpu"
+    if _PERF["gpu_mode"] == "cpu":
+        return "cpu"
+    avail, _reason = _probe_nvenc()
+    return "gpu" if avail else "cpu"
+
+
+def _nvenc_for_pair(preset, crf):
+    pair = _NVENC_PAIRS.get((preset, str(crf)))
+    if pair:
+        return pair
+    # Generic mapping for any other x264 pair: NVENC preset by the
+    # x264 speed name, CQ = CRF + 2 (the scales are close cousins;
+    # +2 keeps NVENC from overshooting on the fixed post-passes).
+    try:
+        cq = int(crf) + 2
+    except (TypeError, ValueError):
+        cq = 20
+    return (_NVENC_PRESET_BY_X264.get(preset, "p6"),
+            str(max(10, min(40, cq))))
+
+
+def encode_args_for(preset, crf, force_cpu=False):
+    """The `-c:v ...` segment for one encode. GPU form when NVENC is
+    proven + allowed; otherwise the historical x264 segment. BOTH
+    forms carry the -threads cap (the one sanctioned difference from
+    the pre-speed-pass argv - it is the lag fix, and the quality
+    parameters themselves are untouched)."""
+    th = str(render_thread_cap())
+    if _encoder_choice(force_cpu) == "gpu":
+        _ENC_TLS.attempted_gpu = True
+        p, cq = _nvenc_for_pair(preset, crf)
+        return ["-c:v", "h264_nvenc", "-preset", p, "-rc", "vbr",
+                "-cq", cq, "-b:v", "0", "-threads", th,
+                "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+            "-threads", th, "-pix_fmt", "yuv420p"]
+
+
+def _cmd_encoder(cmd):
+    if "h264_nvenc" in cmd:
+        return "gpu"
+    if "libx264" in cmd:
+        return "cpu"
+    return None
+
+
+def cpu_version_of(cmd):
+    """Rewrite an NVENC encode command as its x264 twin (same
+    inputs, filters and output - only the contiguous encoder segment
+    our builders emit is swapped). None when the command has no
+    NVENC segment. Used by the mid-render fallback."""
+    try:
+        i = cmd.index("-c:v")
+        if cmd[i + 1] != "h264_nvenc":
+            return None
+        j = cmd.index("-pix_fmt", i)  # our segment ends at -pix_fmt
+        seg = cmd[i:j + 2]
+        nv_p = seg[seg.index("-preset") + 1]
+        nv_cq = seg[seg.index("-cq") + 1]
+        pair = _NVENC_PAIRS_INV.get((nv_p, nv_cq))
+        if pair is None:
+            try:
+                crf = str(max(1, min(51, int(nv_cq) - 2)))
+            except ValueError:
+                crf = "18"
+            pair = (_X264_PRESET_BY_NVENC.get(nv_p, "medium"), crf)
+        th = seg[seg.index("-threads") + 1] if "-threads" in seg else \
+            str(render_thread_cap())
+        x264 = ["-c:v", "libx264", "-preset", pair[0], "-crf", pair[1],
+                "-threads", th, "-pix_fmt", "yuv420p"]
+        return list(cmd[:i]) + x264 + list(cmd[j + 2:])
+    except (ValueError, IndexError):
+        return None
+
+
+# -- per-thread record of what actually encoded (job-status badge) --
+def _note_encoder(encoder, fell_back=False):
+    st = getattr(_ENC_TLS, "state", None)
+    if st is None:
+        st = _ENC_TLS.state = {"used": [], "fell_back": False}
+    if encoder:
+        st["used"].append(encoder)
+    st["fell_back"] = st["fell_back"] or bool(fell_back)
+
+
+def reset_encoder_tracking():
+    _ENC_TLS.state = {"used": [], "fell_back": False}
+    _ENC_TLS.attempted_gpu = False
+    _ENC_TLS.force_cpu = False
+
+
+def last_render_encoder():
+    """Consume this thread's encode record since the last reset:
+    {"encoder": "GPU"|"CPU"|None, "fell_back": bool}. The primary
+    encoder is the FIRST encode's (the main render); fell_back marks
+    any encode that had to be finished by the other encoder."""
+    st = getattr(_ENC_TLS, "state", None)
+    _ENC_TLS.state = {"used": [], "fell_back": False}
+    if not st or not st["used"]:
+        return {"encoder": None, "fell_back": False}
+    primary = st["used"][0]
+    fell = bool(st["fell_back"]) or any(u != primary for u in st["used"])
+    return {"encoder": "GPU" if primary == "gpu" else "CPU",
+            "fell_back": fell}
+
+
+def _run_encode(cmd, **kwargs):
+    """subprocess.run for a one-shot video encode, with the speed
+    pass's mid-render fallback: an NVENC failure retries the SAME
+    command once on CPU (the returned result is the CPU attempt's,
+    so error text stays honest). Records the encoder that ran."""
+    enc = _cmd_encoder(cmd)
+    r = subprocess.run(cmd, **kwargs)
+    if r.returncode != 0 and enc == "gpu":
+        cpu_cmd = cpu_version_of(cmd)
+        if cpu_cmd is not None:
+            r = subprocess.run(cpu_cmd, **kwargs)
+            _note_encoder("cpu", fell_back=True)
+            return r
+    if enc:
+        _note_encoder(enc)
+    return r
 
 # ---------------------------------------------------------------------------
 # yt-dlp download (with YouTube bot-check retry chain)
@@ -293,6 +615,33 @@ def _whisper_cache_dir(model_name):
         return os.path.join(home, ".cache", "huggingface", "hub", folder)
 
 
+_WHISPER_DEVICE = {"used": None, "cuda_ok": None}
+
+
+def _whisper_cuda_available():
+    """True when ctranslate2 sees a CUDA device that can run the
+    speech model in float16. Cached; any doubt means False - the
+    CPU path is the proven default, CUDA is pure opportunism."""
+    if _WHISPER_DEVICE["cuda_ok"] is not None:
+        return _WHISPER_DEVICE["cuda_ok"]
+    ok = False
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            types = ctranslate2.get_supported_compute_types("cuda")
+            ok = "float16" in types or "int8_float16" in types
+    except Exception:  # noqa: BLE001 - no CUDA stack, no problem
+        ok = False
+    _WHISPER_DEVICE["cuda_ok"] = ok
+    return ok
+
+
+def whisper_device_used():
+    """Which device the last transcription model load landed on
+    ("cuda" / "cpu" / None before the first load)."""
+    return _WHISPER_DEVICE["used"]
+
+
 def _load_whisper_model(model_name, progress_cb=None):
     """Load the faster-whisper model, self-healing a broken download.
 
@@ -301,22 +650,40 @@ def _load_whisper_model(model_name, progress_cb=None):
     every later load then dies with "Unable to open file 'model.bin'".
     If the first load fails, wipe the cached model and download it
     fresh, exactly once, then load again.
+
+    Speed pass: when CUDA is genuinely available the model loads on
+    the GPU (float16; the base model is tiny next to a modern card's
+    VRAM). A CUDA load failure is NOT a broken download, so it falls
+    back to the CPU load WITHOUT wiping the cache; only when the
+    CPU load also fails does the repair path above run.
     """
     # Real files instead of symlinks in the HF cache: symlink entries
     # are the classic Windows failure behind the model.bin error.
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
     from faster_whisper import WhisperModel
-    try:
-        return WhisperModel(model_name, device="cpu", compute_type="int8")
-    except Exception:  # noqa: BLE001 - fall through to the repair path
-        pass
+    attempts = []
+    if _whisper_cuda_available():
+        attempts.append(("cuda", "float16"))
+    attempts.append(("cpu", "int8"))
+    for device, compute in attempts:
+        try:
+            model = WhisperModel(model_name, device=device,
+                                 compute_type=compute)
+            _WHISPER_DEVICE["used"] = device
+            if progress_cb and device == "cuda":
+                progress_cb(6, "Transcription model ready (GPU)")
+            return model
+        except Exception:  # noqa: BLE001 - next attempt / repair path
+            continue
     cache_dir = _whisper_cache_dir(model_name)
     if cache_dir and os.path.isdir(cache_dir):
         if progress_cb:
             progress_cb(6, "Repairing transcription model download")
         import shutil
         shutil.rmtree(cache_dir, ignore_errors=True)
-    return WhisperModel(model_name, device="cpu", compute_type="int8")
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    _WHISPER_DEVICE["used"] = "cpu"
+    return model
 
 
 def transcribe(video_path, model_name="base", progress_cb=None,
@@ -2340,6 +2707,7 @@ def enhance_video(video_path, out_path, progress_cb=None,
     upscale - NOT an AI upscaler. Returns out_path."""
     if not os.path.isfile(video_path):
         raise RuntimeError("Video file not found: " + str(video_path))
+    reset_encoder_tracking()
     W, H, _fps = probe_video(video_path)
     if not W or not H:
         raise RuntimeError("Could not read the video's dimensions.")
@@ -2714,6 +3082,28 @@ def _resume_process(pid):
 
 def run_ffmpeg_controlled(cmd, duration, progress_cb, lo, hi, stage,
                           control):
+    """_run_ffmpeg_progress with a control channel (see
+    _run_ffmpeg_controlled_once). Speed pass: an NVENC failure
+    restarts the encode once on CPU under the same control channel;
+    a cancel is never retried."""
+    try:
+        _run_ffmpeg_controlled_once(cmd, duration, progress_cb, lo, hi,
+                                    stage, control)
+    except RuntimeError:
+        cpu_cmd = cpu_version_of(cmd)
+        if cpu_cmd is None or control.get("cancel"):
+            raise
+        _run_ffmpeg_controlled_once(cpu_cmd, duration, progress_cb, lo,
+                                    hi, stage, control)
+        _note_encoder("cpu", fell_back=True)
+        return
+    enc = _cmd_encoder(cmd)
+    if enc:
+        _note_encoder(enc)
+
+
+def _run_ffmpeg_controlled_once(cmd, duration, progress_cb, lo, hi,
+                                stage, control):
     """_run_ffmpeg_progress with a control channel: control is a
     dict the caller mutates - {"cancel": True} terminates the run
     (FfmpegCancelled), {"pause": True} suspends the ffmpeg process
@@ -4049,13 +4439,13 @@ def _merge_xfade(paths, out_path, d=0.5):
     cmd = ["ffmpeg", "-y", "-v", "error"]
     for p in paths:
         cmd += ["-i", p]
-    cmd += ["-filter_complex", expr,
-            "-map", f"[{last_v}]", "-map", f"[{last_a}]",
-            "-c:v", "libx264", "-preset", "slow", "-crf", "17",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart", out_path]
-    r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.PIPE, text=True)
+    cmd += (["-filter_complex", expr,
+             "-map", f"[{last_v}]", "-map", f"[{last_a}]"]
+            + encode_args_for("slow", "17")
+            + ["-c:a", "aac", "-b:a", "192k",
+               "-movflags", "+faststart", out_path])
+    r = _run_encode(cmd, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, text=True)
     if r.returncode != 0 or not os.path.exists(out_path):
         raise RuntimeError("crossfade merge failed: " + r.stderr[-1200:])
     return out_path
@@ -4259,7 +4649,7 @@ def _apply_audio_polish(clip_path, denoise=False):
 def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
                     W, H, ratio, out_path, progress_cb=None,
                     punch_zoom=False, enc_preset="slow", enc_crf="16",
-                    face_center=None):
+                    face_center=None, force_cpu=False):
     """Face-tracked render: per-frame crop follows the smoothed face
     trajectory (or stays centered), frames piped to ffmpeg."""
     try:
@@ -4336,15 +4726,16 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
             f":d=1:s={W}x{H}:fps={fps:.3f}")
     vf_parts.append(f"subtitles={_ffmpeg_ass_path(ass_path)}"
                          f"{_fontsdir_opt()}")
-    enc = ["ffmpeg", "-y", "-v", "error",
-           "-f", "rawvideo", "-pix_fmt", "bgr24",
-           "-s", f"{W}x{H}", "-framerate", f"{fps:.3f}",
-           "-i", "pipe:0",
-           "-i", audio_tmp,
-           "-vf", ",".join(vf_parts),
-           "-c:v", "libx264", "-preset", enc_preset, "-crf", enc_crf,
-           "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-           "-movflags", "+faststart", "-shortest", out_path]
+    enc = (["ffmpeg", "-y", "-v", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{W}x{H}", "-framerate", f"{fps:.3f}",
+            "-i", "pipe:0",
+            "-i", audio_tmp,
+            "-vf", ",".join(vf_parts)]
+           + encode_args_for(enc_preset, enc_crf, force_cpu)
+           + ["-c:a", "aac", "-b:a", "192k",
+              "-movflags", "+faststart", "-shortest", out_path])
+    _enc_used_gpu = "h264_nvenc" in enc
     proc = subprocess.Popen(enc, stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE)
@@ -4399,7 +4790,28 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
     except OSError:
         pass
     if failed or proc.returncode != 0 or not os.path.exists(out_path):
+        if _enc_used_gpu and not force_cpu:
+            # Speed pass: the GPU encode died mid-render (driver
+            # hiccup, NVENC session loss). Restart the render on the
+            # plain CPU path - never a dead render over a GPU fault.
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            if progress_cb:
+                progress_cb(10, "GPU encode failed - rendering on "
+                                "CPU instead")
+            _res = _render_plain(video_path, start, end, keep_segs,
+                                 ass_path, W, H, ratio, out_path,
+                                 progress_cb, punch_zoom=punch_zoom,
+                                 enc_preset=enc_preset, enc_crf=enc_crf,
+                                 face_center=face_center, force_cpu=True)
+            _st = getattr(_ENC_TLS, "state", None)
+            if _st is not None:
+                _st["fell_back"] = True
+            return _res
         raise RuntimeError("ffmpeg encode failed: " + err[-2000:])
+    _note_encoder("gpu" if _enc_used_gpu else "cpu")
     # A "successful" encode can still be a stub: when OpenCV's bundled
     # FFmpeg cannot decode the source codec (AV1 is the common case -
     # YouTube serves it at 1080p), cap.read() fails on frame 0, the
@@ -4420,14 +4832,15 @@ def _render_tracked(video_path, start, end, keep_segs, removed, ass_path,
                              ass_path, W, H, ratio, out_path,
                              progress_cb, punch_zoom=punch_zoom,
                              enc_preset=enc_preset, enc_crf=enc_crf,
-                             face_center=face_center)
+                             face_center=face_center, force_cpu=force_cpu)
     return out_path
 
 
 def _render_plain(video_path, start, end, keep_segs, ass_path,
                   W, H, ratio, out_path, progress_cb=None,
                   punch_zoom=False, enhance_clarity=False,
-                  enc_preset="slow", enc_crf="16", face_center=None):
+                  enc_preset="slow", enc_crf="16", face_center=None,
+                  force_cpu=False):
     """ffmpeg-only render: crop/scale/captions, optional silence/filler
     cuts via filter_complex segment concat.
 
@@ -4481,14 +4894,13 @@ def _render_plain(video_path, start, end, keep_segs, ass_path,
               and abs(keep_segs[0][1] - end) < 0.01)
     if single:
         # fast path: one straight cut
-        cmd = ["ffmpeg", "-y", "-v", "error",
-               "-ss", str(start), "-to", str(end),
-               "-i", video_path,
-               "-vf", vf_tail,
-               "-c:v", "libx264", "-preset", enc_preset, "-crf", enc_crf,
-               "-pix_fmt", "yuv420p",
-               "-c:a", "aac", "-b:a", "192k",
-               "-movflags", "+faststart", out_path]
+        cmd = (["ffmpeg", "-y", "-v", "error",
+                "-ss", str(start), "-to", str(end),
+                "-i", video_path,
+                "-vf", vf_tail]
+               + encode_args_for(enc_preset, enc_crf, force_cpu)
+               + ["-c:a", "aac", "-b:a", "192k",
+                  "-movflags", "+faststart", out_path])
     else:
         vparts, aparts, vl, al = [], [], [], []
         for i, (s, e) in enumerate(keep_segs):
@@ -4503,17 +4915,16 @@ def _render_plain(video_path, start, end, keep_segs, ass_path,
                       + vf_tail + "[vout]")
         aparts.append("".join(al) + f"concat=n={n}:v=0:a=1[aout]")
         fc = ";".join(vparts + aparts)
-        cmd = ["ffmpeg", "-y", "-v", "error", "-i", video_path,
-               "-filter_complex", fc,
-               "-map", "[vout]", "-map", "[aout]",
-               "-c:v", "libx264", "-preset", enc_preset, "-crf", enc_crf,
-               "-pix_fmt", "yuv420p",
-               "-c:a", "aac", "-b:a", "192k",
-               "-movflags", "+faststart", out_path]
+        cmd = (["ffmpeg", "-y", "-v", "error", "-i", video_path,
+                "-filter_complex", fc,
+                "-map", "[vout]", "-map", "[aout]"]
+               + encode_args_for(enc_preset, enc_crf, force_cpu)
+               + ["-c:a", "aac", "-b:a", "192k",
+                  "-movflags", "+faststart", out_path])
     if progress_cb:
         progress_cb(5, "Rendering clip")
-    r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.PIPE, text=True)
+    r = _run_encode(cmd, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, text=True)
     if r.returncode != 0 or not os.path.exists(out_path):
         raise RuntimeError("ffmpeg failed: " + r.stderr[-2000:])
     return out_path
@@ -4532,13 +4943,14 @@ def _overlay_logo(clip_path, logo_path):
     tmp = clip_path + ".logo.mp4"
     fc = (f"[1:v]scale={lw}:-2:flags=lanczos[logo];"
           f"[0:v][logo]overlay=28:28:format=auto[vout]")
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", clip_path, "-i", logo_path,
-           "-filter_complex", fc, "-map", "[vout]", "-map", "0:a?",
-           "-c:v", "libx264", "-preset", "slow", "-crf", "17",
-           "-pix_fmt", "yuv420p", "-c:a", "copy",
-           "-movflags", "+faststart", "-shortest", tmp]
-    r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.PIPE, text=True)
+    cmd = (["ffmpeg", "-y", "-v", "error", "-i", clip_path,
+            "-i", logo_path, "-filter_complex", fc,
+            "-map", "[vout]", "-map", "0:a?"]
+           + encode_args_for("slow", "17")
+           + ["-c:a", "copy", "-movflags", "+faststart",
+              "-shortest", tmp])
+    r = _run_encode(cmd, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, text=True)
     if r.returncode != 0 or not os.path.exists(tmp):
         try:
             os.remove(tmp)
@@ -4636,12 +5048,12 @@ def _apply_emphasis_zoom(clip_path, beats, peak, progress_cb=None):
           f":y='max(0,min(ih-ih/zoom,{cy:.3f}*ih-(ih/zoom)/2))'"
           f":d=1:s={W}x{H}:fps={fps or 30},setsar=1")
     tmp = clip_path + ".zoom.mp4"
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", clip_path,
-           "-vf", vf, "-c:v", "libx264", "-preset", "slow",
-           "-crf", "17", "-pix_fmt", "yuv420p", "-c:a", "copy",
-           "-movflags", "+faststart", tmp]
-    r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.PIPE, text=True)
+    cmd = (["ffmpeg", "-y", "-v", "error", "-i", clip_path,
+            "-vf", vf]
+           + encode_args_for("slow", "17")
+           + ["-c:a", "copy", "-movflags", "+faststart", tmp])
+    r = _run_encode(cmd, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, text=True)
     if r.returncode != 0 or not os.path.exists(tmp):
         try:
             os.remove(tmp)
@@ -4850,14 +5262,13 @@ def _apply_broll(clip_path, broll_path, w0, w1, W, H):
           f"[0:v][b]overlay=0:0:enable='between(t,{w0:.3f},{w1:.3f})'"
           "[v]")
     tmp = clip_path + ".broll.mp4"
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", clip_path,
-           "-i", broll_path, "-filter_complex", fc,
-           "-map", "[v]", "-map", "0:a",
-           "-c:v", "libx264", "-preset", "slow", "-crf", "17",
-           "-pix_fmt", "yuv420p", "-c:a", "copy",
-           "-movflags", "+faststart", tmp]
-    r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.PIPE, text=True)
+    cmd = (["ffmpeg", "-y", "-v", "error", "-i", clip_path,
+            "-i", broll_path, "-filter_complex", fc,
+            "-map", "[v]", "-map", "0:a"]
+           + encode_args_for("slow", "17")
+           + ["-c:a", "copy", "-movflags", "+faststart", tmp])
+    r = _run_encode(cmd, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, text=True)
     if r.returncode != 0 or not os.path.exists(tmp):
         try:
             os.remove(tmp)
@@ -5055,6 +5466,7 @@ def render_clip(video_path, moment, words, style_name, out_path,
         never "AI upscale").
     logo_path -> corner logo PNG watermarked top-left (brand kit).
     """
+    reset_encoder_tracking()
     start, end = float(moment["start"]), float(moment["end"])
     W, H = ratio_dims(ratio, quality)
     enc_preset, enc_crf = _ENCODE_TIERS.get(
@@ -5348,8 +5760,7 @@ def _remover_band(region, height):
 def _encode_args(quality_tier):
     preset, crf = _ENCODE_TIERS.get(quality_tier or "maximum",
                                     _ENCODE_TIERS["maximum"])
-    return ["-c:v", "libx264", "-preset", preset, "-crf", crf,
-            "-pix_fmt", "yuv420p"]
+    return encode_args_for(preset, crf)
 
 
 def lama_model_path():
@@ -5811,6 +6222,26 @@ def _crop_text_mask(det, crop_bgr, band_y0, band_y1):
 
 
 def _run_ffmpeg_progress(cmd, duration, progress_cb, lo, hi, stage):
+    """Run ffmpeg, mapping its -progress output onto [lo, hi]
+    percent. Speed pass: an NVENC failure restarts the SAME encode
+    once on CPU - a GPU hiccup never becomes a dead job."""
+    try:
+        _run_ffmpeg_progress_once(cmd, duration, progress_cb, lo, hi,
+                                  stage)
+    except RuntimeError:
+        cpu_cmd = cpu_version_of(cmd)
+        if cpu_cmd is None:
+            raise
+        _run_ffmpeg_progress_once(cpu_cmd, duration, progress_cb, lo,
+                                  hi, stage)
+        _note_encoder("cpu", fell_back=True)
+        return
+    enc = _cmd_encoder(cmd)
+    if enc:
+        _note_encoder(enc)
+
+
+def _run_ffmpeg_progress_once(cmd, duration, progress_cb, lo, hi, stage):
     """Run ffmpeg, mapping its -progress output onto [lo, hi] percent."""
     full = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
     proc = subprocess.Popen(full, stdout=subprocess.PIPE,
@@ -5930,18 +6361,45 @@ def remove_captions(video_path, region, mode, out_path,
                 exist_ok=True)
     if progress_cb:
         progress_cb(2, "Preparing")
-    if mode == "crop":
-        _remove_captions_crop(video_path, out_path, W, H, y0, y1,
-                              duration, progress_cb, quality_tier)
-    elif mode == "fill":
-        _remove_captions_fill(video_path, out_path, W, H, y0, y1,
-                              duration, progress_cb, quality_tier)
-    elif mode == "temporal":
-        _remove_captions_temporal(video_path, out_path, W, H, y0, y1,
-                                  duration, progress_cb, quality_tier)
-    else:
-        _remove_captions_ai(video_path, out_path, W, H, y0, y1,
-                            duration, progress_cb, quality_tier)
+    # Speed pass safety net: the temporal/AI engines pipe frames
+    # into their encode, so a mid-render NVENC failure cannot be
+    # swapped segment-by-segment like the one-shot encodes. If a
+    # GPU encode was attempted and the run died, retry the whole
+    # removal ONCE with this thread pinned to CPU.
+    _attempts = 0
+    while True:
+        _attempts += 1
+        _ENC_TLS.attempted_gpu = False
+        try:
+            if mode == "crop":
+                _remove_captions_crop(video_path, out_path, W, H, y0,
+                                      y1, duration, progress_cb,
+                                      quality_tier)
+            elif mode == "fill":
+                _remove_captions_fill(video_path, out_path, W, H, y0,
+                                      y1, duration, progress_cb,
+                                      quality_tier)
+            elif mode == "temporal":
+                _remove_captions_temporal(video_path, out_path, W, H,
+                                          y0, y1, duration,
+                                          progress_cb, quality_tier)
+            else:
+                _remove_captions_ai(video_path, out_path, W, H, y0,
+                                    y1, duration, progress_cb,
+                                    quality_tier)
+            break
+        except Exception:
+            if _attempts == 1 and getattr(_ENC_TLS, "attempted_gpu",
+                                          False):
+                _ENC_TLS.force_cpu = True
+                _note_encoder("cpu", fell_back=True)
+                if progress_cb:
+                    progress_cb(4, "GPU encode failed - retrying on "
+                                   "CPU")
+                continue
+            _ENC_TLS.force_cpu = False
+            raise
+    _ENC_TLS.force_cpu = False
     if not os.path.isfile(out_path) \
             or os.path.getsize(out_path) < 1024:
         raise RuntimeError("Caption removal produced no output file.")
@@ -6947,8 +7405,8 @@ def preview_caption_removal(video_path, region, mode, out_path,
                 video_path, "-t", f"{max(0.5, end - start):.2f}"]
                + _encode_args(quality_tier)
                + ["-c:a", "aac", "-b:a", "192k", seg])
-        r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.PIPE, text=True)
+        r = _run_encode(cmd, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE, text=True)
         if r.returncode != 0 or not os.path.isfile(seg):
             raise RuntimeError("Could not cut the preview segment: "
                                + (r.stderr or "")[-200:])
