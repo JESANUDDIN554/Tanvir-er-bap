@@ -269,6 +269,10 @@
       <input id="srtPathInput" type="text" placeholder="…or use an SRT file as the transcript (paste .srt path)" spellcheck="false">
       <button id="srtBtn" class="ghost-btn small">Use SRT transcript</button>
     </div>
+    <div class="row" style="margin-top:10px">
+      <span class="hint">📺 Following channels for source videos?</span>
+      <button id="openChannelsBtn" class="ghost-btn small" type="button">Open Channel Monitor</button>
+    </div>
   </section>
 
   <!-- ============ LIVE ANALYSIS (during-processing view) ============ -->
@@ -383,20 +387,34 @@
     </div>
 
     <div class="field">
-      <label class="field-label">Resolution <span class="hint">— 1080p is sharpest, 720p renders faster</span></label>
+      <label class="field-label">Resolution <span class="hint">— 1080p is sharpest, 720p renders faster. 1440p / 4K are for 16:9 and 1:1 exports; picking one above your source upscales it (labelled on the clip).</span></label>
       <div class="quality-picker" id="qualityPicker">
         <button type="button" class="quality-card" data-value="720p"><span class="quality-name">720p</span><span class="quality-sub">HD · faster render</span></button>
         <button type="button" class="quality-card on" data-value="1080p"><span class="quality-name">1080p</span><span class="quality-sub">Full HD · best quality</span></button>
+        <button type="button" class="quality-card q-high" data-value="1440p"><span class="quality-name">1440p</span><span class="quality-sub">QHD · 16:9 / 1:1</span></button>
+        <button type="button" class="quality-card q-high" data-value="2160p"><span class="quality-name">2160p</span><span class="quality-sub">4K · 16:9 / 1:1</span></button>
       </div>
     </div>
 
     <div class="field">
-      <label class="field-label">Render quality <span class="hint">— how hard the encoder works; Maximum is sharpest</span></label>
+      <label class="field-label">Render quality <span class="hint">— how hard the encoder works; Quality is sharpest</span></label>
       <div class="quality-picker trio" id="encodePicker">
-        <button type="button" class="quality-card on" data-value="maximum"><span class="quality-name">Maximum</span><span class="quality-sub">Best picture · slower</span></button>
+        <button type="button" class="quality-card on" data-value="maximum"><span class="quality-name">Quality</span><span class="quality-sub">Best picture · slower</span></button>
         <button type="button" class="quality-card" data-value="balanced"><span class="quality-name">Balanced</span><span class="quality-sub">Great picture · normal</span></button>
-        <button type="button" class="quality-card" data-value="fast"><span class="quality-name">Fast</span><span class="quality-sub">Good picture · quickest</span></button>
+        <button type="button" class="quality-card" data-value="fast"><span class="quality-name">Performance</span><span class="quality-sub">Good picture · quickest</span></button>
       </div>
+    </div>
+
+    <div class="field">
+      <label class="field-label">Export preset <span class="hint">— save this aspect + resolution + render quality + audio polish + caption style as one reusable preset</span></label>
+      <div class="row row-tight">
+        <select id="exportPresetSel" class="select" style="max-width:230px"><option value="">No preset</option></select>
+        <input id="exportPresetName" type="text" placeholder="Preset name…" spellcheck="false" style="max-width:180px">
+        <button id="exportPresetSaveBtn" class="ghost-btn small" type="button">Save current as preset</button>
+        <button id="exportPresetDefaultBtn" class="ghost-btn small" type="button">Set as default</button>
+        <button id="exportPresetDeleteBtn" class="ghost-btn small" type="button">Delete</button>
+      </div>
+      <p class="hint" id="exportPresetMsg"></p>
     </div>
 
     <div class="field">
@@ -531,6 +549,39 @@
       <button id="sortBtn" class="ghost-btn small">Sort: virality ↓</button>
     </div>
     <div id="moments"></div>
+    <div id="timelineWrap" class="hidden" style="margin-top:18px">
+      <div class="field-label">Timeline editor <span class="hint">— the whole video on one strip. Click a moment to select it, drag on the strip to mark a new one, nudge the edges, then Generate as usual.</span></div>
+      <div id="tlTrack" class="tl-track">
+        <canvas id="tlWave" class="tl-wave" width="960" height="46"></canvas>
+        <div id="tlBlocks"></div>
+        <div id="tlDrag" class="tl-drag hidden"></div>
+      </div>
+      <div class="row row-tight" style="margin-top:10px">
+        <span class="stage" id="tlSelLabel">No moment selected</span>
+        <label class="hint">Start <input id="tlStartInput" type="number" step="0.1" min="0" style="width:84px"></label>
+        <label class="hint">End <input id="tlEndInput" type="number" step="0.1" min="0" style="width:84px"></label>
+        <button id="tlApplyBtn" class="ghost-btn small" type="button">Apply</button>
+        <span class="hint">Start</span>
+        <button class="ghost-btn small tl-nudge" type="button" data-t="start" data-d="-5">−5s</button>
+        <button class="ghost-btn small tl-nudge" type="button" data-t="start" data-d="-1">−1s</button>
+        <button class="ghost-btn small tl-nudge" type="button" data-t="start" data-d="1">+1s</button>
+        <button class="ghost-btn small tl-nudge" type="button" data-t="start" data-d="5">+5s</button>
+        <span class="hint">End</span>
+        <button class="ghost-btn small tl-nudge" type="button" data-t="end" data-d="-5">−5s</button>
+        <button class="ghost-btn small tl-nudge" type="button" data-t="end" data-d="-1">−1s</button>
+        <button class="ghost-btn small tl-nudge" type="button" data-t="end" data-d="1">+1s</button>
+        <button class="ghost-btn small tl-nudge" type="button" data-t="end" data-d="5">+5s</button>
+        <button id="tlDeleteBtn" class="ghost-btn small" type="button">Delete moment</button>
+      </div>
+      <div class="row row-tight" style="margin-top:6px">
+        <span class="hint">New moment:</span>
+        <input id="tlAddStart" type="number" step="0.1" min="0" placeholder="Start s" style="width:84px">
+        <input id="tlAddEnd" type="number" step="0.1" min="0" placeholder="End s" style="width:84px">
+        <input id="tlAddTitle" type="text" placeholder="Title (optional)" spellcheck="false" style="max-width:200px">
+        <button id="tlAddBtn" class="ghost-btn small" type="button">Add moment</button>
+        <span class="hint" id="tlMsg"></span>
+      </div>
+    </div>
     <div id="renderRow" class="row hidden">
       <button id="renderSelBtn" class="primary">Generate selected</button>
       <button id="renderAllBtn" class="ghost-btn">Generate all</button>
@@ -653,6 +704,9 @@
       <div class="empty-sub">Import a video and it will live here permanently.</div>
     </div>
     <div id="libraryGrid" class="library-grid"></div>
+    <div class="field-label" style="margin-top:24px">Export history <span class="hint">— every clip you have rendered, newest first</span></div>
+    <div id="exportsEmpty" class="empty-sub">No exports yet — render a clip and it will be listed here.</div>
+    <div id="exportsList"></div>
   </section>
 
   <!-- ============ PUBLISHING ============ -->
@@ -817,6 +871,42 @@
         </div>
         <div id="pubPresetList" class="pub-presets"></div>
       </div>
+    </div>
+  </section>
+
+  <!-- ============ CHANNEL MONITOR ============ -->
+  <section id="channelsView" class="card step-card hidden">
+    <div class="card-kicker">Channel Monitor</div>
+    <div class="row-between">
+      <h2>Channels you follow</h2>
+      <button id="channelsBackBtn" class="ghost-btn">← Back to studio</button>
+    </div>
+    <p class="sub">Watches YouTube channels for new uploads using the official YouTube Data API and your own API key — no scraping. New uploads land here, one click sends them into Clip Maker.</p>
+    <div id="channelsSetup" class="find-box">
+      <div class="field-label">YouTube Data API key <span class="hint">— yours, stored only on this PC and never shown back. Create one free in Google Cloud Console (enable “YouTube Data API v3”).</span></div>
+      <div class="row row-tight" style="margin-top:8px">
+        <input id="channelsKeyInput" type="password" placeholder="Paste your YouTube Data API key" spellcheck="false" autocomplete="off" style="flex:1">
+        <button id="channelsKeySaveBtn" class="ghost-btn" type="button">Save key</button>
+        <button id="channelsKeyClearBtn" class="ghost-btn" type="button">Remove key</button>
+      </div>
+      <p class="hint" id="channelsKeyState">No key saved — the monitor is off until you add one.</p>
+    </div>
+    <div id="channelsMain" class="hidden">
+      <div class="row row-tight" style="margin-top:14px">
+        <input id="channelsUrlInput" type="text" placeholder="Channel URL or @handle, e.g. https://www.youtube.com/@SomeChannel" spellcheck="false" style="flex:1">
+        <button id="channelsAddBtn" class="primary" type="button">Add channel</button>
+      </div>
+      <div class="row row-tight" style="margin-top:10px">
+        <label class="hint" for="channelsIntervalInput">Check every (minutes)</label>
+        <input id="channelsIntervalInput" type="number" min="5" max="1440" step="5" value="60" style="width:90px">
+        <button id="channelsIntervalBtn" class="ghost-btn small" type="button">Save interval</button>
+        <button id="channelsCheckAllBtn" class="ghost-btn small" type="button">Check all now</button>
+        <span class="hint" id="channelsMsg"></span>
+      </div>
+      <div id="channelsList" style="margin-top:14px"></div>
+      <div class="field-label" style="margin-top:20px">New uploads</div>
+      <div id="channelsNewEmpty" class="empty-sub">Nothing new yet — new uploads from your channels will appear here.</div>
+      <div id="channelsNewList"></div>
     </div>
   </section>
 
@@ -1561,6 +1651,11 @@
         <button id="falKeyClearBtn" class="ghost-btn small" type="button">Remove key</button>
       </div>
       <p class="hint" id="falKeyState">No key saved.</p>
+      <div class="row row-tight" style="margin-top:8px">
+        <label class="switch-row" for="falEnabledCheck" style="flex:1"><span class="switch-text">Provider enabled <span class="hint">— when off, the AI Video Generator refuses honestly instead of generating</span></span><span class="switch"><input type="checkbox" id="falEnabledCheck" checked><span class="track"><span class="thumb"></span></span></span></label>
+        <button id="falTestBtn" class="ghost-btn small" type="button">Test connection</button>
+      </div>
+      <p class="hint" id="falTestState"></p>
     </div>
     <div class="field">
       <label class="field-label">Built-in AI <span class="hint">— a professional AI model that runs on your PC. No key, no internet.</span></label>
@@ -1664,6 +1759,26 @@
     </div>
   </div>
 </div>
+
+<!-- keyboard shortcuts overlay (open with ?) -->
+<div id="shortcutsOverlay" class="modal hidden">
+  <div class="modal-box">
+    <h2>Keyboard shortcuts</h2>
+    <div class="sub" style="text-align:left;line-height:2">
+      <div><b>Space</b> or <b>K</b> — play / pause the open preview</div>
+      <div><b>Ctrl + Enter</b> — generate the selected moments (Clip Maker)</div>
+      <div><b>[</b> / <b>]</b> — nudge the selected timeline moment's start by 1s (with <b>Shift</b>: its end)</div>
+      <div><b>?</b> — this list</div>
+    </div>
+    <p class="hint">Shortcuts stay out of the way while you are typing in a field.</p>
+    <div class="row">
+      <button id="shortcutsCloseBtn" class="ghost-btn" type="button">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- drag-and-drop import veil -->
+<div id="dropOverlay" class="drop-overlay hidden"><div class="drop-inner">Drop a video file or a video link to import it into Clip Maker</div></div>
 
 <div id="toasts"></div>
 

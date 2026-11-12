@@ -414,6 +414,22 @@ def reset_encoder_tracking():
     _ENC_TLS.state = {"used": [], "fell_back": False}
     _ENC_TLS.attempted_gpu = False
     _ENC_TLS.force_cpu = False
+    _ENC_TLS.upscale = None
+
+
+def _note_upscale(info):
+    """Record that a render's scale step had to upscale (Phase 2
+    resolution tiers): {"quality", "src": (w, h), "dst": (w, h)}.
+    Consumed via last_render_info() by app.py for the job log."""
+    _ENC_TLS.upscale = info
+
+
+def last_render_info():
+    """The upscale record for the render that just finished on this
+    thread (None when the output was at or below the source size)."""
+    info = getattr(_ENC_TLS, "upscale", None)
+    _ENC_TLS.upscale = None
+    return info
 
 
 def last_render_encoder():
@@ -3863,12 +3879,20 @@ RATIOS = {
     "9:16": {"rw": 9, "rh": 16,
              "1080p": (1080, 1920), "720p": (720, 1280)},
     "16:9": {"rw": 16, "rh": 9,
-             "1080p": (1920, 1080), "720p": (1280, 720)},
+             "1080p": (1920, 1080), "720p": (1280, 720),
+             "1440p": (2560, 1440), "2160p": (3840, 2160)},
     "1:1": {"rw": 1, "rh": 1,
-            "1080p": (1080, 1080), "720p": (720, 720)},
+            "1080p": (1080, 1080), "720p": (720, 720),
+            "1440p": (1440, 1440), "2160p": (2160, 2160)},
     "4:5": {"rw": 4, "rh": 5,
             "1080p": (1080, 1350), "720p": (720, 900)},
 }
+
+# Qualities that exceed a 1080p-class source for the landscape/square
+# aspects (Phase 2 resolution tiers). Picking one for a smaller source
+# is allowed but goes through the Lanczos scale and is LABELLED as an
+# upscale (see render_clip) - never silently faked.
+HIGH_QUALITIES = ("1440p", "2160p")
 
 
 def ratio_dims(ratio, quality):
@@ -3885,6 +3909,13 @@ def crop_filter(ratio):
         return "crop=trunc(iw/2)*2:trunc(iw*9/16/2)*2"
     if rw == 1 and rh == 1:
         return r"crop=trunc(min(iw\,ih)/2)*2:trunc(min(iw\,ih)/2)*2"
+    if rw == 4 and rh == 5:
+        # 4:5 out of a PORTRAIT source: the naive ih*4/5 width would
+        # exceed the frame and ffmpeg would refuse the crop. Clamp:
+        # width-bound sources crop full width and 5/4 of it in height.
+        return (r"crop=w='if(gt(iw\,ih*4/5)\,trunc(ih*4/5/2)*2\,"
+                r"trunc(iw/2)*2)':h='if(gt(iw\,ih*4/5)\,trunc(ih/2)*2\,"
+                r"trunc(iw*5/4/2)*2)'")
     return f"crop=trunc(ih*{rw}/{rh}/2)*2:trunc(ih/2)*2"
 
 
@@ -4011,6 +4042,50 @@ def probe_duration(video_path):
         return float(r.stdout.strip())
     except (TypeError, ValueError):
         return 0.0
+
+
+def audio_peaks(video_path, buckets=240, duration=None):
+    """Per-bucket peak amplitude (0..1) of the audio track, for the
+    Timeline Editor's waveform strip. Decodes mono 8 kHz PCM with
+    ffmpeg and folds it into `buckets` maxima, streaming in chunks so
+    a 2-hour source never lands in memory at once. A silent or
+    audio-less source returns all zeros (an honest flat line)."""
+    import array
+    dur = float(duration or 0) or probe_duration(video_path)
+    if dur <= 0:
+        return {"duration": 0.0, "peaks": []}
+    buckets = max(24, min(960, int(buckets)))
+    rate = 8000
+    per_bucket = max(1, int(dur * rate / buckets))
+    peaks = [0.0] * buckets
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", video_path,
+           "-vn", "-ac", "1", "-ar", str(rate), "-f", "s16le", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+    idx = 0  # running sample index
+    try:
+        while True:
+            chunk = proc.stdout.read(65536 * 2)
+            if not chunk:
+                break
+            samples = array.array("h")
+            samples.frombytes(chunk[:len(chunk) // 2 * 2])
+            for s in samples:
+                b = idx // per_bucket
+                if b >= buckets:
+                    break
+                v = abs(s) / 32768.0
+                if v > peaks[b]:
+                    peaks[b] = v
+                idx += 1
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:  # noqa: BLE001
+            pass
+        proc.wait()
+    return {"duration": round(dur, 2),
+            "peaks": [round(p, 3) for p in peaks]}
 
 
 def apply_censor_beep(clip_path, ranges, out_path, freq=1000):
@@ -4853,7 +4928,7 @@ def _render_plain(video_path, start, end, keep_segs, ass_path,
         the face instead of the frame middle (never a blurred pad).
     """
     crop = crop_filter(ratio)
-    if face_center and ratio in ("16:9", "1:1"):
+    if face_center and ratio in ("16:9", "1:1", "4:5"):
         try:
             _sw, _sh, _sf = probe_video(video_path)
         except Exception:  # noqa: BLE001 - keep the centre crop
@@ -4866,6 +4941,22 @@ def _render_plain(video_path, start, end, keep_segs, ass_path,
                     _y = int(max(0, min(_sh - _ch,
                                         _cy * _sh - _ch / 2)))
                     crop = f"crop={_sw}:{_ch}:0:{_y}"
+            elif ratio == "4:5":
+                # 4:5: from a wider source the crop is a full-height
+                # band centred horizontally on the face; from a
+                # taller source it is a full-width band centred
+                # vertically on the face.
+                if _sh * 4 / 5 <= _sw:
+                    _cw = _even(_sh * 4 / 5)
+                    _x = int(max(0, min(_sw - _cw,
+                                        _cx * _sw - _cw / 2)))
+                    crop = f"crop={_cw}:{_sh}:{_x}:0"
+                else:
+                    _ch = _even(_sw * 5 / 4)
+                    if _ch < _sh:
+                        _y = int(max(0, min(_sh - _ch,
+                                            _cy * _sh - _ch / 2)))
+                        crop = f"crop={_sw}:{_ch}:0:{_y}"
             else:  # 1:1
                 _side = _even(min(_sw, _sh))
                 _x = int(max(0, min(_sw - _side,
@@ -5469,6 +5560,30 @@ def render_clip(video_path, moment, words, style_name, out_path,
     reset_encoder_tracking()
     start, end = float(moment["start"]), float(moment["end"])
     W, H = ratio_dims(ratio, quality)
+    if quality in HIGH_QUALITIES:
+        # Phase 2 resolution tiers: a 1440p/2160p pick above what the
+        # source can natively fill is rendered through the existing
+        # Lanczos scale path - and LABELLED as an upscale (encoder
+        # record + progress note + job log via app.py), never passed
+        # off as native resolution.
+        try:
+            _sw, _sh, _sf = probe_video(video_path)
+        except Exception:  # noqa: BLE001 - labelling is best-effort
+            _sw = _sh = 0
+        if _sw and _sh:
+            _rr = RATIOS.get(ratio, RATIOS["9:16"])
+            _cw = min(_sw, _sh * _rr["rw"] / _rr["rh"])
+            _ch = _cw * _rr["rh"] / _rr["rw"]
+            if _ch > _sh:
+                _ch = float(_sh)
+                _cw = _ch * _rr["rw"] / _rr["rh"]
+            if W > _cw + 2 or H > _ch + 2:
+                _note_upscale({"quality": quality,
+                               "src": (int(_sw), int(_sh)),
+                               "dst": (int(W), int(H))})
+                if progress_cb:
+                    progress_cb(4, f"Upscaling to {quality} (Lanczos)"
+                                   f" - source is {_sw}x{_sh}")
     enc_preset, enc_crf = _ENCODE_TIERS.get(
         quality_tier, _ENCODE_TIERS["maximum"])
     if custom_styles:
@@ -5556,7 +5671,7 @@ def render_clip(video_path, moment, words, style_name, out_path,
     # Face-aware crop placement for the landscape/square exports
     # (sampled once per render; None -> centre crop as before).
     face_center = None
-    if ratio in ("16:9", "1:1"):
+    if ratio in ("16:9", "1:1", "4:5"):
         face_center = _sample_face_center(video_path, start, end)
     # The encode and every post-pass below work on a .part sibling;
     # the finished file is renamed onto the real name at the end.

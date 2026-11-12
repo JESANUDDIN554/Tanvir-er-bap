@@ -46,6 +46,7 @@ import local_ai  # noqa: E402  (built-in local LLM: engine/model/server)
 import admin  # noqa: E402  (Owner Admin Panel: sessions/log/stats)
 import usage  # noqa: E402  (per-key clip limits: signed max_clips)
 import publishing  # noqa: E402  (Auto Publishing: accounts/queue/scheduler)
+import channels  # noqa: E402  (Phase 2: YouTube Channel Monitor client)
 import ai_components  # noqa: E402  (AI Installation Manager backend)
 import licensing  # noqa: E402  (signed license + core pack + integrity)
 import updater  # noqa: E402  (signed file-replacement update packs)
@@ -384,6 +385,71 @@ def _load_library():
     except Exception:  # noqa: BLE001 - housekeeping, never fatal
         pass
 
+
+# ---------------------------------------------------------------------------
+# Phase 2: export history. Every finished clip render appends one
+# record (file, preset used, encoder badge, size, date) to a small
+# JSON store next to the settings file, so the Library's Export
+# History survives restarts and spans projects. Capped at 500 rows.
+# ---------------------------------------------------------------------------
+EXPORT_HISTORY_PATH = os.path.join(os.path.expanduser("~"),
+                                   ".clipmaker_pc_exports.json")
+_EXPORT_HISTORY_LOCK = threading.Lock()
+
+
+def _export_history_load():
+    try:
+        with open(EXPORT_HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _record_export(entry):
+    """Append one export-history record (best-effort, atomic)."""
+    try:
+        with _EXPORT_HISTORY_LOCK:
+            rows = _export_history_load()
+            rows.append(entry)
+            rows = rows[-500:]
+            tmp = EXPORT_HISTORY_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(rows, f)
+            os.replace(tmp, EXPORT_HISTORY_PATH)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: YouTube Channel Monitor state. Channels live in settings
+# (small data); the background poller below checks due channels on
+# their interval and, for channels with auto_import on, imports new
+# uploads into Clip Maker. All Data API work is in channels.py.
+# ---------------------------------------------------------------------------
+def _channels_save(chans):
+    with _SETTINGS_LOCK:
+        s = load_settings()
+        s["channels"] = chans
+        save_settings(s)
+
+
+_CHAN_LAST_POLL = {}  # channel row id -> last background poll (epoch)
+
+
+def _channel_view(c):
+    """A channel row for the UI (no key material exists on rows)."""
+    return {"id": c.get("id"), "channel_id": c.get("channel_id"),
+            "title": c.get("title"), "ref": c.get("ref"),
+            "interval_min": int(c.get("interval_min") or 0),
+            "auto_import": bool(c.get("auto_import")),
+            "min_dur": int(c.get("min_dur") or 0),
+            "max_dur": int(c.get("max_dur") or 0),
+            "last_checked": c.get("last_checked") or "",
+            "last_published": c.get("last_published") or "",
+            "last_new": c.get("last_new") or [],
+            "last_error": c.get("last_error") or ""}
+
 DEFAULT_SETTINGS = {
     "detect_mode": "local",        # "local" (Built-in AI) or "offline"
     "clip_length": "30-60",        # range string "min-max" seconds
@@ -465,6 +531,24 @@ DEFAULT_SETTINGS = {
                                    # posts are SELF_ONLY - surfaced)
     "pub_webhook_url": "",         # completion events; off when ""
     "pub_webhook_secret": "",      # secret - HMAC key for the outbox
+    # -- Phase 2 ---------------------------------------------------
+    "export_presets": [],          # [{id, name, ratio, quality,
+                                   #   quality_tier, audio_polish,
+                                   #   caption_style}]
+    "export_preset_default": "",   # preset id applied on view open
+    "fal_enabled": True,           # AI provider master switch (the
+                                   # generator refuses honestly when
+                                   # off - never a fake success)
+    "fal_last_test": None,         # {ok, message, ts} connectivity
+    "yt_api_key": "",              # user's own YouTube Data API key
+                                   # (Channel Monitor) - secret, masked
+                                   # in get_settings like fal_key
+    "channels": [],                # [{id, channel_id, title, uploads,
+                                   #   ref, interval_min (0 = global),
+                                   #   auto_import, min_dur, max_dur,
+                                   #   seen_ids, last_published,
+                                   #   last_checked, last_new}]
+    "channels_interval_min": 60,   # global monitor poll interval
     "data_dir": "",                # Settings -> Storage: folder for
                                    # the AI model + new projects;
                                    # "" = the app folder (default)
@@ -1270,6 +1354,9 @@ class Api:
         # WHETHER one is saved, never the key itself.
         s["fal_key_set"] = bool((s.get("fal_key") or "").strip())
         s.pop("fal_key", None)
+        # Same treatment for the Channel Monitor's YouTube API key.
+        s["yt_api_key_set"] = bool((s.get("yt_api_key") or "").strip())
+        s.pop("yt_api_key", None)
         # Publishing credentials get the same treatment: app secrets
         # and account tokens are replaced by *_set flags, and account
         # rows go out token-free with a has_token flag.
@@ -3638,6 +3725,479 @@ class Api:
         return {"ok": True, "path": path,
                 "url": self._download_url(job_id, path)}
 
+    # -- Phase 2: export presets --------------------------------------
+    def export_presets(self):
+        s = load_settings()
+        return {"ok": True,
+                "presets": s.get("export_presets") or [],
+                "default": s.get("export_preset_default") or ""}
+
+    def export_preset_save(self, preset):
+        preset = preset or {}
+        name = str(preset.get("name") or "").strip()
+        if not name:
+            return {"ok": False, "error": "Give the preset a name."}
+        row = {"id": str(preset.get("id") or uuid.uuid4().hex[:10]),
+               "name": name,
+               "ratio": str(preset.get("ratio") or "9:16"),
+               "quality": str(preset.get("quality") or "1080p"),
+               "quality_tier": str(preset.get("quality_tier")
+                                   or "maximum"),
+               "audio_polish": bool(preset.get("audio_polish")),
+               "caption_style": str(preset.get("caption_style")
+                                    or "bold-pop")}
+        with _SETTINGS_LOCK:
+            s = load_settings()
+            rows = [r for r in (s.get("export_presets") or [])
+                    if isinstance(r, dict)]
+            rows = [r for r in rows if r.get("id") != row["id"]
+                    and r.get("name") != name]
+            rows.append(row)
+            s["export_presets"] = rows
+            save_settings(s)
+        return {"ok": True, "presets": rows,
+                "default": s.get("export_preset_default") or "",
+                "saved": row}
+
+    def export_preset_delete(self, preset_id):
+        with _SETTINGS_LOCK:
+            s = load_settings()
+            rows = [r for r in (s.get("export_presets") or [])
+                    if isinstance(r, dict)
+                    and r.get("id") != preset_id]
+            s["export_presets"] = rows
+            if s.get("export_preset_default") == preset_id:
+                s["export_preset_default"] = ""
+            save_settings(s)
+        return {"ok": True, "presets": rows,
+                "default": s.get("export_preset_default") or ""}
+
+    def export_preset_set_default(self, preset_id):
+        with _SETTINGS_LOCK:
+            s = load_settings()
+            ids = {r.get("id") for r in (s.get("export_presets") or [])
+                   if isinstance(r, dict)}
+            s["export_preset_default"] = (preset_id
+                                          if preset_id in ids else "")
+            save_settings(s)
+        return {"ok": True,
+                "default": s.get("export_preset_default") or ""}
+
+    # -- Phase 2: export history ---------------------------------------
+    def export_history(self):
+        rows = _export_history_load()
+        out = []
+        for r in reversed(rows):
+            r = dict(r)
+            r["exists"] = os.path.isfile(r.get("path") or "")
+            if r["exists"]:
+                try:
+                    r["size"] = os.path.getsize(r["path"])
+                except OSError:
+                    pass
+            out.append(r)
+        return {"ok": True, "history": out}
+
+    def export_reexport(self, entry_id):
+        """Re-render the clip an export-history row came from, with
+        the row's own aspect/quality/tier (and its preset's caption
+        style + audio polish when the preset still exists)."""
+        row = next((r for r in _export_history_load()
+                    if r.get("id") == entry_id), None)
+        if not row:
+            return {"ok": False, "error": "That export is gone."}
+        _load_library()
+        job = JOBS.get(row.get("job_id") or "")
+        if not job or not job.get("moments"):
+            return {"ok": False,
+                    "error": "The original project is no longer "
+                             "available."}
+        mi = int(row.get("moment_index") or 0)
+        if not (0 <= mi < len(job["moments"])):
+            return {"ok": False,
+                    "error": "The original moment is no longer in "
+                             "the project."}
+        opts = {"ratio": row.get("aspect") or "9:16",
+                "quality": row.get("quality") or "1080p",
+                "quality_tier": row.get("quality_tier") or "maximum"}
+        if row.get("preset"):
+            s = load_settings()
+            preset = next((p for p in (s.get("export_presets") or [])
+                           if isinstance(p, dict)
+                           and p.get("name") == row["preset"]), None)
+            if preset:
+                opts["caption_style"] = preset.get("caption_style")
+                opts["audio_polish"] = bool(preset.get("audio_polish"))
+                opts["export_preset"] = preset.get("name")
+        res = self.render(row["job_id"], [mi], opts)
+        if isinstance(res, dict) and res.get("ok"):
+            return {"ok": True, "job_id": row["job_id"]}
+        return res if isinstance(res, dict) else {
+            "ok": False, "error": "Re-export failed."}
+
+    def export_open_folder(self, entry_id):
+        row = next((r for r in _export_history_load()
+                    if r.get("id") == entry_id), None)
+        folder = (os.path.dirname(row["path"])
+                  if row and row.get("path") else _work_root())
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)  # noqa: S606
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.run(["open", folder])
+            else:
+                import subprocess
+                subprocess.run(["xdg-open", folder])
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True}
+
+    # -- Phase 2: timeline editor --------------------------------------
+    def add_moment(self, job_id, start, end, title=""):
+        """Add a manual moment to a project (Timeline Editor). The
+        moment is the same dict shape detection produces, so the
+        existing render path consumes it unchanged."""
+        job = JOBS.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Project not found."}
+        try:
+            s, e = float(start), float(end)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Enter start/end in seconds."}
+        dur = float(job.get("duration") or 0)
+        s = max(0.0, s)
+        e = min(e, dur) if dur else e
+        if s >= e:
+            return {"ok": False, "error": "Start must be before end."}
+        if e - s < 3:
+            return {"ok": False,
+                    "error": "Clip must be at least 3 seconds."}
+        m = {"start": round(s, 2), "end": round(e, 2),
+             "title": (str(title or "").strip() or "Manual moment"),
+             "hook": "", "virality": 50, "reason": "Added manually",
+             "manual": True}
+        job.setdefault("moments", []).append(m)
+        if job.get("status") == "done":
+            job["status"] = "moments"
+        _save_job(job_id)
+        return {"ok": True, "index": len(job["moments"]) - 1,
+                "moment": m, "moments": job["moments"]}
+
+    def delete_moment(self, job_id, index):
+        job = JOBS.get(job_id)
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            index = -1
+        if not job or not (0 <= index < len(job.get("moments", []))):
+            return {"ok": False, "error": "Moment not found."}
+        job["moments"].pop(index)
+        _save_job(job_id)
+        return {"ok": True, "moments": job["moments"]}
+
+    def timeline_peaks(self, job_id, buckets=240):
+        """Waveform peaks for the Timeline Editor strip, cached per
+        project folder (the decode of a long source happens once)."""
+        job = JOBS.get(job_id)
+        if not job or not job.get("video_path"):
+            return {"ok": False, "error": "Project not found."}
+        cache = os.path.join(_job_folder(job_id), "peaks.json")
+        try:
+            with open(cache, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("peaks"):
+                return {"ok": True, "duration": data.get("duration", 0),
+                        "peaks": data["peaks"]}
+        except (OSError, ValueError):
+            pass
+        try:
+            data = _pipeline.audio_peaks(
+                job["video_path"], buckets=int(buckets or 240),
+                duration=job.get("duration") or None)
+        except Exception as e:  # noqa: BLE001 - flat line, honestly
+            return {"ok": True, "duration": job.get("duration") or 0,
+                    "peaks": [], "error": str(e)[:120]}
+        try:
+            with open(cache, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
+        return {"ok": True, "duration": data.get("duration", 0),
+                "peaks": data.get("peaks", [])}
+
+    # -- Phase 2: AI provider management --------------------------------
+    def providers_state(self):
+        """The external AI providers and their real state. fal.ai is
+        the one provider today; the shape is a list so more slot in.
+        The key itself is never returned - only whether one exists."""
+        s = load_settings()
+        return {"ok": True, "providers": [{
+            "id": "fal", "name": "fal.ai (AI Video Generator)",
+            "enabled": bool(s.get("fal_enabled", True)),
+            "has_key": bool((s.get("fal_key") or "").strip()),
+            "last_test": s.get("fal_last_test"),
+            "fallback": "When off or keyless, the Generator shows its "
+                        "setup state - generations are never faked.",
+        }]}
+
+    def provider_set_enabled(self, provider_id, enabled):
+        if provider_id != "fal":
+            return {"ok": False, "error": "Unknown provider."}
+        with _SETTINGS_LOCK:
+            s = load_settings()
+            s["fal_enabled"] = bool(enabled)
+            save_settings(s)
+        return self.providers_state()
+
+    def provider_test(self, provider_id):
+        """A real connectivity check for fal.ai: an authenticated
+        request to the provider's API host. fal has no ping endpoint,
+        so this reads the queue status URL shape with a dummy id -
+        a 404 means "reachable, key accepted far enough to answer",
+        a 401/403 means the key was rejected. The honest outcome is
+        stored as fal_last_test."""
+        if provider_id != "fal":
+            return {"ok": False, "error": "Unknown provider."}
+        s = load_settings()
+        key = (s.get("fal_key") or "").strip()
+        if not key:
+            result = {"ok": False,
+                      "message": "No fal.ai key saved - add one in "
+                                 "Settings first."}
+        else:
+            t0 = time.time()
+            try:
+                r = requests.get(
+                    "https://queue.fal.run/fal-ai/flux/dev/requests/"
+                    "connectivity-test",
+                    headers={"Authorization": "Key " + key},
+                    timeout=20)
+                ms = (time.time() - t0) * 1000.0
+                if r.status_code == 404:
+                    result = {"ok": True,
+                              "message": f"Connected - fal.ai answered "
+                                         f"in {ms:.0f} ms and accepted "
+                                         f"the key."}
+                elif r.status_code in (401, 403):
+                    result = {"ok": False,
+                              "message": "fal.ai rejected this key "
+                                         f"(HTTP {r.status_code}). "
+                                         "Check the key and try again."}
+                else:
+                    result = {"ok": False,
+                              "message": f"fal.ai answered HTTP "
+                                         f"{r.status_code} - unexpected; "
+                                         "generation may still work, "
+                                         "but this is not a clean pass."}
+            except requests.RequestException as e:
+                result = {"ok": False,
+                          "message": "Couldn't reach fal.ai: "
+                                     + str(e)[:140]}
+            result["ms"] = round((time.time() - t0) * 1000.0, 1)
+        result["ts"] = time.time()
+        with _SETTINGS_LOCK:
+            s2 = load_settings()
+            s2["fal_last_test"] = result
+            save_settings(s2)
+        return {"ok": True, "provider": "fal", "test": result}
+
+    # -- Phase 2: YouTube Channel Monitor -------------------------------
+    def channels_state(self):
+        self._ensure_channel_poller()
+        s = load_settings()
+        return {"ok": True,
+                "has_key": bool((s.get("yt_api_key") or "").strip()),
+                "interval_min": int(s.get("channels_interval_min")
+                                    or 60),
+                "channels": [_channel_view(c)
+                             for c in (s.get("channels") or [])
+                             if isinstance(c, dict)]}
+
+    def channels_save_key(self, key):
+        key = (key or "").strip()
+        if not key:
+            return {"ok": False, "error": "Paste your YouTube Data "
+                                          "API key first."}
+        with _SETTINGS_LOCK:
+            s = load_settings()
+            s["yt_api_key"] = key
+            save_settings(s)
+        return {"ok": True, "has_key": True}
+
+    def channels_clear_key(self):
+        with _SETTINGS_LOCK:
+            s = load_settings()
+            s["yt_api_key"] = ""
+            save_settings(s)
+        return {"ok": True, "has_key": False}
+
+    def channels_set_interval(self, minutes):
+        try:
+            m = max(5, min(1440, int(minutes)))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Enter minutes (5-1440)."}
+        with _SETTINGS_LOCK:
+            s = load_settings()
+            s["channels_interval_min"] = m
+            save_settings(s)
+        return {"ok": True, "interval_min": m}
+
+    def channels_add(self, ref, prefs=None):
+        s = load_settings()
+        key = (s.get("yt_api_key") or "").strip()
+        if not key:
+            return {"ok": False, "error": "no_key",
+                    "message": "Save your YouTube Data API key first."}
+        try:
+            info = channels.resolve_channel(ref, key)
+        except channels.ChannelError as e:
+            return {"ok": False, "error": e.kind, "message": e.message}
+        prefs = prefs or {}
+        row = {"id": uuid.uuid4().hex[:10],
+               "channel_id": info["channel_id"],
+               "title": info["title"], "uploads": info["uploads"],
+               "ref": (ref or "").strip(),
+               "interval_min": int(prefs.get("interval_min") or 0),
+               "auto_import": bool(prefs.get("auto_import")),
+               "min_dur": int(prefs.get("min_dur") or 0),
+               "max_dur": int(prefs.get("max_dur") or 0),
+               "seen_ids": [], "last_published": "",
+               "last_checked": "", "last_new": [], "last_error": ""}
+        chans = [c for c in (s.get("channels") or [])
+                 if isinstance(c, dict)]
+        if any(c.get("channel_id") == row["channel_id"] for c in chans):
+            return {"ok": False,
+                    "error": "That channel is already monitored."}
+        chans.append(row)
+        _channels_save(chans)
+        # Baseline poll right away: establishes the watermark so the
+        # next check reports only genuinely new uploads.
+        self._channel_check_row(row["id"])
+        return self.channels_state()
+
+    def channels_update(self, channel_row_id, prefs):
+        s = load_settings()
+        chans = [c for c in (s.get("channels") or [])
+                 if isinstance(c, dict)]
+        row = next((c for c in chans if c.get("id") == channel_row_id),
+                   None)
+        if not row:
+            return {"ok": False, "error": "Channel not found."}
+        prefs = prefs or {}
+        for k in ("interval_min", "min_dur", "max_dur"):
+            if k in prefs:
+                try:
+                    row[k] = max(0, int(prefs[k]))
+                except (TypeError, ValueError):
+                    pass
+        if "auto_import" in prefs:
+            row["auto_import"] = bool(prefs["auto_import"])
+        _channels_save(chans)
+        return self.channels_state()
+
+    def channels_remove(self, channel_row_id):
+        s = load_settings()
+        chans = [c for c in (s.get("channels") or [])
+                 if isinstance(c, dict)
+                 and c.get("id") != channel_row_id]
+        _channels_save(chans)
+        return self.channels_state()
+
+    def channels_check(self, channel_row_id=None):
+        """Poll now (one channel, or every channel). Returns the
+        per-channel outcome incl. the new uploads found."""
+        s = load_settings()
+        key = (s.get("yt_api_key") or "").strip()
+        if not key:
+            return {"ok": False, "error": "no_key",
+                    "message": "Save your YouTube Data API key first."}
+        ids = [channel_row_id] if channel_row_id else [
+            c.get("id") for c in (s.get("channels") or [])
+            if isinstance(c, dict)]
+        results = [self._channel_check_row(i) for i in ids if i]
+        state = self.channels_state()
+        state["results"] = results
+        return state
+
+    def _channel_check_row(self, channel_row_id):
+        """One channel's poll: fetch, diff against the watermark,
+        persist, and auto-import when the channel asks for it.
+        ChannelError outcomes are stored on the row (honest state),
+        never raised into the UI."""
+        s = load_settings()
+        key = (s.get("yt_api_key") or "").strip()
+        chans = [c for c in (s.get("channels") or [])
+                 if isinstance(c, dict)]
+        row = next((c for c in chans if c.get("id") == channel_row_id),
+                   None)
+        if not row:
+            return {"id": channel_row_id, "ok": False,
+                    "error": "Channel not found."}
+        if not key:
+            return {"id": channel_row_id, "ok": False,
+                    "error": "no_key"}
+        try:
+            res = channels.poll_channel(row, key)
+        except channels.ChannelError as e:
+            row["last_error"] = e.message
+            row["last_checked"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            _channels_save(chans)
+            return {"id": channel_row_id, "ok": False,
+                    "error": e.kind, "message": e.message}
+        row.update(res["watermark"])
+        row["last_new"] = res["new"]
+        row["last_error"] = ""
+        _channels_save(chans)
+        imported = []
+        if row.get("auto_import") and res["new"]:
+            for v in res["new"]:
+                try:
+                    r = self.import_url(v["url"])
+                    if r.get("ok"):
+                        imported.append(v["video_id"])
+                except Exception:  # noqa: BLE001 - import is best-effort
+                    pass
+        return {"id": channel_row_id, "ok": True,
+                "baseline": res["baseline"], "new": res["new"],
+                "imported": imported}
+
+    _CHAN_POLLER = {"started": False}
+
+    def _ensure_channel_poller(self):
+        """Background monitor: every minute, poll the channels whose
+        interval has elapsed. Started lazily (first monitor view /
+        check) so a user who never opens the monitor pays nothing."""
+        if self._CHAN_POLLER["started"]:
+            return
+        self._CHAN_POLLER["started"] = True
+
+        def loop():
+            while True:
+                time.sleep(60)
+                try:
+                    s = load_settings()
+                    if not (s.get("yt_api_key") or "").strip():
+                        continue
+                    now = time.time()
+                    for c in (s.get("channels") or []):
+                        if not isinstance(c, dict):
+                            continue
+                        interval = int(c.get("interval_min") or 0) \
+                            or int(s.get("channels_interval_min")
+                                   or 60)
+                        last = _CHAN_LAST_POLL.get(c.get("id")) or 0
+                        if now - last < interval * 60:
+                            continue
+                        _CHAN_LAST_POLL[c.get("id")] = now
+                        self._channel_check_row(c.get("id"))
+                except Exception:  # noqa: BLE001 - the loop never dies
+                    pass
+
+        threading.Thread(target=loop, daemon=True,
+                         name="channel-monitor").start()
+
     # -- Studio: AI Generator (fal.ai, user's own key) -------------------
     def gen_models(self):
         """The fal.ai model catalog + whether a key is saved. The key
@@ -3645,6 +4205,7 @@ class Api:
         settings = load_settings()
         return {"ok": True,
                 "has_key": bool((settings.get("fal_key") or "").strip()),
+                "enabled": bool(settings.get("fal_enabled", True)),
                 "models": FAL_MODELS}
 
     def gen_video_start(self, model_id="", prompt="",
@@ -3655,6 +4216,11 @@ class Api:
         if gate:
             return gate
         settings = load_settings()
+        if not settings.get("fal_enabled", True):
+            return {"ok": False, "error": "provider_disabled",
+                    "message": "The fal.ai provider is switched off "
+                               "in Settings → AI Providers. Turn it "
+                               "on to generate."}
         key = (settings.get("fal_key") or "").strip()
         if not key:
             return {"ok": False, "error": "no_key",
@@ -4425,7 +4991,7 @@ class Api:
             return f"Full frame (source already {ratio})"
         if face_track:
             return "Face-tracked crop"
-        if ratio in ("16:9", "1:1"):
+        if ratio in ("16:9", "1:1", "4:5"):
             return "Smart crop (face-aware)"
         return "Centre crop"
 
@@ -4664,6 +5230,36 @@ class Api:
                          + os.path.basename(out)
                          + (f" [{_rd['encoder']}]"
                             if _rd.get("encoder") else ""))
+                # Phase 2: an above-source resolution pick is
+                # labelled on the record + job log (the pipeline
+                # rendered it via the Lanczos scale path).
+                _up = _pipeline.last_render_info()
+                if _up:
+                    _rd["upscaled"] = True
+                    _job_log(job_id,
+                             f"Upscaled to {_up['quality']} (Lanczos)"
+                             f" - source is {_up['src'][0]}x"
+                             f"{_up['src'][1]}, output "
+                             f"{_up['dst'][0]}x{_up['dst'][1]}")
+                # Phase 2: export history (Library view) - one row
+                # per finished clip, preset + encoder included.
+                try:
+                    _fsize = os.path.getsize(out)
+                except OSError:
+                    _fsize = 0
+                _record_export({
+                    "id": uuid.uuid4().hex[:12],
+                    "ts": time.time(),
+                    "job_id": job_id, "moment_index": i,
+                    "title": m["title"], "path": out,
+                    "preset": opts.get("export_preset") or "",
+                    "aspect": opts.get("ratio", "9:16"),
+                    "quality": opts.get("quality", "1080p"),
+                    "quality_tier": opts.get("quality_tier",
+                                             "maximum"),
+                    "encoder": _rd.get("encoder"),
+                    "upscaled": bool(_up),
+                    "size": _fsize})
                 # count the finished clip against the key's
                 # allowance (no-op for unlimited keys)
                 made += 1

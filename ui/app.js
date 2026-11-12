@@ -44,7 +44,7 @@ const TOOL_VIEWS = {
   generator: "generatorView", titles: "titlesView", script: "scriptView",
   transcript: "transcriptView", enhancer: "enhancerView",
   hookmaker: "hookmakerView", aimanager: "aiManagerView",
-  publishing: "publishingView",
+  publishing: "publishingView", channels: "channelsView",
   admin: "adminView",
 };
 
@@ -57,7 +57,7 @@ const VIEW_TITLES = {
   transcript: "Transcript Tool", enhancer: "Video Enhancer",
   hookmaker: "Hook Maker", captionstudio: "Caption Studio",
   aimanager: "AI Engine", admin: "Admin Panel",
-  publishing: "Publishing",
+  publishing: "Publishing", channels: "Channel Monitor",
 };
 function syncSidebar(view) {
   document.querySelectorAll(".side-item").forEach((b) =>
@@ -197,6 +197,7 @@ async function poll() {
     hide($("importError"));
     lastErrSig = "";
     $("videoTitle").textContent = st.title || "Video";
+    lastDuration = st.duration || lastDuration;
     $("videoMeta").textContent =
       `${fmtTime(st.duration)} · ${st.word_count} words transcribed`;
     reveal($("videoInfo"));
@@ -718,6 +719,8 @@ function initControls() {
   encodeTier = settings.quality_tier || "maximum";
   document.querySelectorAll("#encodePicker .quality-card").forEach((c) =>
     c.classList.toggle("on", c.dataset.value === encodeTier));
+  syncQualityAvailability();
+  loadExportPresets();
 }
 
 function syncDetectModeSub(mode) {
@@ -951,7 +954,24 @@ document.querySelectorAll("#ratioPicker .ratio-card").forEach((c) =>
     document.querySelectorAll("#ratioPicker .ratio-card").forEach((x) => x.classList.remove("on"));
     c.classList.add("on");
     ratio = c.dataset.value;
+    syncQualityAvailability();
   }));
+
+/* Phase 2: 1440p / 2160p exist only for the 16:9 and 1:1 aspects.
+   On other aspects those cards disable, and a high pick falls back
+   to 1080p instead of silently rendering something else. */
+function syncQualityAvailability() {
+  const highOk = ratio === "16:9" || ratio === "1:1";
+  document.querySelectorAll("#qualityPicker .q-high").forEach((c) => {
+    c.classList.toggle("disabled", !highOk);
+    c.title = highOk ? "" : "1440p / 4K are for 16:9 and 1:1 exports";
+  });
+  if (!highOk && (quality === "1440p" || quality === "2160p")) {
+    quality = "1080p";
+    document.querySelectorAll("#qualityPicker .quality-card").forEach((x) =>
+      x.classList.toggle("on", x.dataset.value === quality));
+  }
+}
 document.querySelectorAll("#clipLenPills .seg").forEach((b) =>
   b.addEventListener("click", () => {
     segSet("clipLenPills", b.dataset.value);
@@ -966,6 +986,10 @@ $("customLenInput").addEventListener("input", () => {
 $("customLenInput").addEventListener("change", persistClipLen);
 document.querySelectorAll("#qualityPicker .quality-card").forEach((c) =>
   c.addEventListener("click", () => {
+    if (c.classList.contains("disabled")) {
+      toast("1440p / 4K are for 16:9 and 1:1 exports", true);
+      return;
+    }
     document.querySelectorAll("#qualityPicker .quality-card").forEach((x) => x.classList.remove("on"));
     c.classList.add("on");
     quality = c.dataset.value;
@@ -1249,6 +1273,7 @@ function renderMoments(moments) {
   box.innerHTML = "";
   if (!moments.length) {
     hide($("momentsBar")); hide($("renderRow"));
+    hide($("timelineWrap"));
     show($("momentsEmpty"));
     return;
   }
@@ -1306,7 +1331,179 @@ function renderMoments(moments) {
     btn.addEventListener("click", () => openCaptionEditor(parseInt(btn.dataset.i, 10))));
   box.querySelectorAll(".pkgBtn").forEach((btn) =>
     btn.addEventListener("click", () => togglePostingPackage(parseInt(btn.dataset.i, 10), btn)));
+  renderTimeline(moments);
 }
+
+/* ---------------- Phase 2: Timeline Editor Lite ----------------
+   One strip for the whole source video: waveform + a block per
+   moment. Edits go through the SAME moment objects the renderer
+   consumes (trim_moment / add_moment / delete_moment persist into
+   job.json), so Generate renders the edited set — nothing parallel
+   or throwaway. */
+let tlSelected = -1;
+let tlPeaksFor = "";
+let tlPeaks = [];
+let lastDuration = 0;
+
+function tlDuration() {
+  const maxEnd = lastMoments.reduce((a, m) => Math.max(a, m.end || 0), 0);
+  return Math.max(lastDuration || 0, maxEnd, 1);
+}
+
+function renderTimeline(moments) {
+  const wrap = $("timelineWrap");
+  if (!moments || !moments.length || !jobId) { hide(wrap); return; }
+  show(wrap);
+  const dur = tlDuration();
+  const box = $("tlBlocks");
+  box.innerHTML = "";
+  moments.forEach((m, i) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "tl-block" + (i === tlSelected ? " sel" : "")
+      + (m.manual ? " manual" : "");
+    b.style.left = (100 * m.start / dur) + "%";
+    b.style.width = Math.max(1.2, 100 * (m.end - m.start) / dur) + "%";
+    b.title = `${m.title} — ${fmtTime(m.start)} → ${fmtTime(m.end)}`;
+    b.addEventListener("click", () => selectTlMoment(i));
+    box.appendChild(b);
+  });
+  if (tlSelected >= moments.length) tlSelected = moments.length - 1;
+  updateTlSelectionUI();
+  if (tlPeaksFor !== jobId) {
+    tlPeaksFor = jobId;
+    api.timeline_peaks(jobId).then((res) => {
+      if (res.ok) { tlPeaks = res.peaks || []; drawTlWave(); }
+    }).catch(() => {});
+  } else drawTlWave();
+}
+
+function drawTlWave() {
+  const cv = $("tlWave");
+  if (!cv || !cv.getContext) return;
+  const ctx = cv.getContext("2d");
+  if (!ctx) return;
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "rgba(120,140,160,.55)";
+  const n = tlPeaks.length || 240;
+  for (let x = 0; x < W; x++) {
+    const p = tlPeaks[Math.floor(x / W * n)] || 0;
+    const h = Math.max(1, p * (H - 4));
+    ctx.fillRect(x, (H - h) / 2, 1, h);
+  }
+}
+
+function selectTlMoment(i) {
+  tlSelected = i;
+  renderTimeline(lastMoments);
+}
+
+function updateTlSelectionUI() {
+  const m = lastMoments[tlSelected];
+  if (!m) {
+    $("tlSelLabel").textContent = "No moment selected";
+    $("tlStartInput").value = "";
+    $("tlEndInput").value = "";
+    return;
+  }
+  $("tlSelLabel").textContent =
+    `#${tlSelected + 1} ${m.title} — ${fmtTime(m.start)} → ${fmtTime(m.end)}`;
+  $("tlStartInput").value = (+m.start).toFixed(1);
+  $("tlEndInput").value = (+m.end).toFixed(1);
+}
+
+async function tlApplyTimes(start, end) {
+  if (tlSelected < 0 || !jobId) return;
+  const res = await api.trim_moment(jobId, tlSelected, start, end);
+  if (!res.ok) { $("tlMsg").textContent = res.error || "Could not apply."; return; }
+  $("tlMsg").textContent = "Saved — Generate renders this edited set.";
+  lastMomentsSig = "";
+  poll();
+}
+
+$("tlApplyBtn").addEventListener("click", () => {
+  const s = parseFloat($("tlStartInput").value);
+  const e = parseFloat($("tlEndInput").value);
+  if (isNaN(s) || isNaN(e)) {
+    $("tlMsg").textContent = "Enter start and end times in seconds.";
+    return;
+  }
+  tlApplyTimes(s, e);
+});
+document.querySelectorAll(".tl-nudge").forEach((b) =>
+  b.addEventListener("click", () => {
+    const m = lastMoments[tlSelected];
+    if (!m) { $("tlMsg").textContent = "Select a moment first."; return; }
+    const d = parseFloat(b.dataset.d);
+    if (b.dataset.t === "start") tlApplyTimes(m.start + d, m.end);
+    else tlApplyTimes(m.start, m.end + d);
+  }));
+$("tlDeleteBtn").addEventListener("click", async () => {
+  if (tlSelected < 0 || !jobId) {
+    $("tlMsg").textContent = "Select a moment first.";
+    return;
+  }
+  const res = await api.delete_moment(jobId, tlSelected);
+  if (!res.ok) { $("tlMsg").textContent = res.error || "Delete failed."; return; }
+  tlSelected = -1;
+  lastMomentsSig = "";
+  poll();
+});
+$("tlAddBtn").addEventListener("click", async () => {
+  const s = parseFloat($("tlAddStart").value);
+  const e = parseFloat($("tlAddEnd").value);
+  if (!jobId || isNaN(s) || isNaN(e)) {
+    $("tlMsg").textContent = "Enter the new moment's start and end (seconds).";
+    return;
+  }
+  const res = await api.add_moment(jobId, s, e, $("tlAddTitle").value.trim());
+  if (!res.ok) { $("tlMsg").textContent = res.error || "Add failed."; return; }
+  $("tlMsg").textContent = "Moment added to the set.";
+  tlSelected = lastMoments.length;
+  lastMomentsSig = "";
+  poll();
+});
+
+/* drag on the strip = mark a new moment's in/out points */
+(function () {
+  const track = $("tlTrack");
+  if (!track) return;
+  let dragStart = null;
+  const posToTime = (ev) => {
+    const r = track.getBoundingClientRect();
+    const f = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
+    return +(f * tlDuration()).toFixed(1);
+  };
+  track.addEventListener("pointerdown", (ev) => {
+    if (ev.target.closest && ev.target.closest(".tl-block")) return;
+    dragStart = posToTime(ev);
+    const d = $("tlDrag");
+    show(d);
+    d.style.left = (100 * dragStart / tlDuration()) + "%";
+    d.style.width = "0%";
+  });
+  track.addEventListener("pointermove", (ev) => {
+    if (dragStart === null) return;
+    const t = posToTime(ev);
+    const lo = Math.min(dragStart, t), hi = Math.max(dragStart, t);
+    const d = $("tlDrag");
+    d.style.left = (100 * lo / tlDuration()) + "%";
+    d.style.width = (100 * (hi - lo) / tlDuration()) + "%";
+  });
+  track.addEventListener("pointerup", (ev) => {
+    if (dragStart === null) return;
+    const t = posToTime(ev);
+    const lo = Math.min(dragStart, t), hi = Math.max(dragStart, t);
+    dragStart = null;
+    hide($("tlDrag"));
+    if (hi - lo >= 1) {
+      $("tlAddStart").value = lo.toFixed(1);
+      $("tlAddEnd").value = hi.toFixed(1);
+      $("tlMsg").textContent = "Marked — press “Add moment” to keep it.";
+    }
+  });
+})();
 
 /* posting package panel per moment */
 function copyText(t, label) {
@@ -1422,8 +1619,107 @@ function collectRenderOptions() {
     audio_polish: $("audioPolishCheck").checked,
     denoise_audio: $("denoiseAudioCheck").checked,
     logo_path: $("brandLogoInput").value.trim(),
+    export_preset: currentExportPresetName(),
   };
 }
+
+/* ---------------- Phase 2: export presets ----------------
+   A preset bundles aspect + resolution + render quality tier +
+   audio polish + caption style. Picking one applies it to the
+   pickers (visibly); renders made while one is selected record its
+   name in the export history. */
+let exportPresetsCache = [];
+let exportPresetDefaultId = "";
+
+function currentExportPresetName() {
+  const sel = $("exportPresetSel");
+  if (!sel || !sel.value) return "";
+  const p = exportPresetsCache.find((x) => x.id === sel.value);
+  return p ? p.name : "";
+}
+
+async function loadExportPresets() {
+  try {
+    const res = await api.export_presets();
+    exportPresetsCache = res.presets || [];
+    exportPresetDefaultId = res.default || "";
+  } catch (e) { exportPresetsCache = []; }
+  const sel = $("exportPresetSel");
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = "<option value=\"\">No preset</option>";
+  exportPresetsCache.forEach((p) => {
+    const o = document.createElement("option");
+    o.value = p.id;
+    o.textContent = p.name + (p.id === exportPresetDefaultId ? " ★" : "");
+    sel.appendChild(o);
+  });
+  const want = cur || exportPresetDefaultId;
+  if (want && exportPresetsCache.some((p) => p.id === want)) {
+    sel.value = want;
+    if (!cur) applyExportPreset(want, true);
+  }
+}
+
+function pickCard(pickerSel, value) {
+  document.querySelectorAll(pickerSel + " .quality-card, " + pickerSel + " .ratio-card")
+    .forEach((x) => x.classList.toggle("on", x.dataset.value === value));
+}
+
+function applyExportPreset(id, silent) {
+  const p = exportPresetsCache.find((x) => x.id === id);
+  if (!p) return;
+  ratio = p.ratio || "9:16";
+  pickCard("#ratioPicker", ratio);
+  quality = p.quality || "1080p";
+  syncQualityAvailability();  // may pull a high quality back to 1080p
+  pickCard("#qualityPicker", quality);
+  encodeTier = p.quality_tier || "maximum";
+  pickCard("#encodePicker", encodeTier);
+  settings.quality_tier = encodeTier;
+  captionStyle = p.caption_style || captionStyle;
+  syncStyleCards();
+  $("audioPolishCheck").checked = !!p.audio_polish;
+  if (!silent) toast(`Preset “${p.name}” applied`);
+}
+
+$("exportPresetSel").addEventListener("change", () => {
+  const id = $("exportPresetSel").value;
+  if (id) applyExportPreset(id);
+});
+
+$("exportPresetSaveBtn").addEventListener("click", async () => {
+  const name = $("exportPresetName").value.trim();
+  if (!name) { $("exportPresetMsg").textContent = "Give the preset a name first."; return; }
+  const res = await api.export_preset_save({
+    name, ratio, quality, quality_tier: encodeTier,
+    audio_polish: $("audioPolishCheck").checked,
+    caption_style: captionStyle,
+  });
+  if (!res.ok) { $("exportPresetMsg").textContent = res.error || "Save failed."; return; }
+  $("exportPresetName").value = "";
+  $("exportPresetMsg").textContent = `Preset “${name}” saved.`;
+  await loadExportPresets();
+  $("exportPresetSel").value = res.saved.id;
+});
+
+$("exportPresetDeleteBtn").addEventListener("click", async () => {
+  const id = $("exportPresetSel").value;
+  if (!id) { $("exportPresetMsg").textContent = "Pick a preset to delete."; return; }
+  await api.export_preset_delete(id);
+  $("exportPresetMsg").textContent = "Preset deleted.";
+  await loadExportPresets();
+});
+
+$("exportPresetDefaultBtn").addEventListener("click", async () => {
+  const id = $("exportPresetSel").value;
+  if (!id) { $("exportPresetMsg").textContent = "Pick a preset first."; return; }
+  const res = await api.export_preset_set_default(id);
+  exportPresetDefaultId = res.default || "";
+  $("exportPresetMsg").textContent = "Default preset set — it applies when Clip Maker opens.";
+  await loadExportPresets();
+  $("exportPresetSel").value = id;
+});
 
 /* speaker color + CTA text + logo path persist with the rest of settings */
 ["speakerColor1", "speakerColor2"].forEach((id) =>
@@ -1843,6 +2139,59 @@ document.querySelectorAll(".home-link").forEach((el) => {
   });
 });
 
+/* ---------------- Phase 2: export history ---------------- */
+const TIER_LABELS = { maximum: "Quality", balanced: "Balanced", fast: "Performance" };
+
+async function refreshExports() {
+  const list = $("exportsList");
+  if (!list) return;
+  let res;
+  try { res = await api.export_history(); }
+  catch (e) { return; }
+  const rows = (res && res.history) || [];
+  $("exportsEmpty").classList.toggle("hidden", rows.length > 0);
+  list.innerHTML = "";
+  rows.forEach((r) => {
+    const div = document.createElement("div");
+    div.className = "export-row";
+    const when = r.ts ? new Date(r.ts * 1000).toLocaleString() : "";
+    const badge = r.encoder
+      ? `<span class="enc-badge ${r.encoder === "GPU" ? "gpu" : "cpu"}">${escapeHtml(r.encoder)}</span>`
+      : "";
+    const size = r.size ? (r.size / 1048576).toFixed(1) + " MB" : "—";
+    div.innerHTML = `
+      <div class="export-main">
+        <div class="export-title">${escapeHtml(r.title || "Clip")} ${badge}${r.upscaled ? ' <span class="edited-tag">upscaled</span>' : ""}</div>
+        <div class="export-meta">${escapeHtml(r.aspect || "")} · ${escapeHtml(r.quality || "")} · ${escapeHtml(TIER_LABELS[r.quality_tier] || r.quality_tier || "")}${r.preset ? " · preset: " + escapeHtml(r.preset) : ""} · ${size} · ${escapeHtml(when)}${r.exists ? "" : " · file missing"}</div>
+      </div>
+      <div class="row row-tight">
+        <button class="ghost-btn small" data-act="reexport" data-id="${escapeHtml(r.id)}" ${r.exists ? "" : "disabled"}>Re-export</button>
+        <button class="ghost-btn small" data-act="folder" data-id="${escapeHtml(r.id)}">Open folder</button>
+      </div>`;
+    list.appendChild(div);
+  });
+  list.querySelectorAll("button[data-act]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      if (b.dataset.act === "folder") {
+        const res2 = await api.export_open_folder(b.dataset.id);
+        if (!res2.ok) toast(res2.error || "Could not open folder", true);
+        return;
+      }
+      b.disabled = true;
+      const res2 = await api.export_reexport(b.dataset.id);
+      if (!res2.ok) {
+        b.disabled = false;
+        toast(res2.error || "Re-export failed", true);
+        return;
+      }
+      toast("Re-export started — watch the project");
+      hideLibrary();
+      jobId = res2.job_id;
+      startPoll();
+      poll();
+    }));
+}
+
 function showLibrary() {
   noteNav({ view: "library", step: lastWizardStep });
   $("libraryBtn").classList.add("on");
@@ -1854,6 +2203,7 @@ function showLibrary() {
   hide($("removerView"));
   show($("libraryView"));
   refreshLibrary();
+  refreshExports();
   syncSidebar("library");
 }
 
@@ -1878,6 +2228,179 @@ function openProject(id) {
 
 $("libraryBtn").addEventListener("click", showLibrary);
 $("libBackBtn").addEventListener("click", backToStudio);
+
+/* ---------------- Phase 2: Channel Monitor ----------------
+   Local YouTube channel watcher on the official Data API. The key
+   lives server-side; the page only ever sees "a key is saved".
+   Api contract (app.py): channels_state() -> {has_key, interval_min,
+   channels:[{id, title, ref, interval_min, auto_import, min_dur,
+   max_dur, last_checked, last_new, last_error}]}; add/update/remove
+   return that same state; check returns state + results. */
+let channelsState = null;
+
+async function initChannels() {
+  try { channelsState = await api.channels_state(); }
+  catch (e) { channelsState = null; }
+  renderChannels();
+}
+
+function renderChannels() {
+  const st = channelsState || { has_key: false, channels: [] };
+  const hasKey = !!st.has_key;
+  $("channelsKeyInput").value = "";
+  $("channelsKeyState").textContent = hasKey
+    ? "A key is saved on this PC. Type a new one to replace it."
+    : "No key saved — the monitor is off until you add one.";
+  $("channelsMain").classList.toggle("hidden", !hasKey);
+  if (!hasKey) return;
+  $("channelsIntervalInput").value = st.interval_min || 60;
+  const list = $("channelsList");
+  list.innerHTML = "";
+  (st.channels || []).forEach((c) => {
+    const div = document.createElement("div");
+    div.className = "chan-row";
+    const err = c.last_error
+      ? `<div class="chan-err">\u26a0 ${escapeHtml(c.last_error)}</div>` : "";
+    const checked = c.last_checked
+      ? new Date(c.last_checked).toLocaleString() : "not yet";
+    const newCount = (c.last_new || []).length;
+    div.innerHTML = `
+      <div class="chan-main">
+        <div class="chan-title">${escapeHtml(c.title || c.ref || "")}</div>
+        <div class="chan-meta">Last checked ${escapeHtml(checked)}${newCount ? ` \u00b7 ${newCount} new last check` : ""}</div>
+        ${err}
+        <div class="row row-tight chan-prefs">
+          <label class="hint">Every <input type="number" class="chan-interval" min="0" max="1440" step="5" value="${c.interval_min || 0}" style="width:70px"> min (0 = global)</label>
+          <label class="hint">Min s <input type="number" class="chan-mind" min="0" value="${c.min_dur || 0}" style="width:70px"></label>
+          <label class="hint">Max s <input type="number" class="chan-maxd" min="0" value="${c.max_dur || 0}" style="width:70px"></label>
+          <label class="check-row"><input type="checkbox" class="chan-auto" ${c.auto_import ? "checked" : ""}><span>Auto-import new uploads</span></label>
+          <button class="ghost-btn small chan-save" type="button">Save prefs</button>
+          <button class="ghost-btn small chan-check" type="button">Check now</button>
+          <button class="ghost-btn small chan-remove" type="button">Remove</button>
+        </div>
+      </div>`;
+    div.querySelector(".chan-save").addEventListener("click", async () => {
+      const res = await api.channels_update(c.id, {
+        interval_min: parseInt(div.querySelector(".chan-interval").value, 10) || 0,
+        auto_import: div.querySelector(".chan-auto").checked,
+        min_dur: parseInt(div.querySelector(".chan-mind").value, 10) || 0,
+        max_dur: parseInt(div.querySelector(".chan-maxd").value, 10) || 0,
+      });
+      if (res && res.ok) {
+        channelsState = res;
+        $("channelsMsg").textContent = "Preferences saved.";
+      } else {
+        $("channelsMsg").textContent = (res && res.error) || "Save failed.";
+      }
+      renderChannels();
+    });
+    div.querySelector(".chan-check").addEventListener("click", async () => {
+      $("channelsMsg").textContent = "Checking\u2026";
+      const res = await api.channels_check(c.id);
+      if (res && res.ok) {
+        channelsState = res;
+        const mine = (res.results || []).find((r) => r.id === c.id);
+        $("channelsMsg").textContent = mine && mine.ok
+          ? `${(mine.new || []).length} new upload(s).`
+          : ((mine && mine.message) || "Check failed.");
+      } else {
+        $("channelsMsg").textContent = (res && (res.message || res.error)) || "Check failed.";
+      }
+      renderChannels();
+    });
+    div.querySelector(".chan-remove").addEventListener("click", async () => {
+      const res = await api.channels_remove(c.id);
+      if (res && res.ok) channelsState = res;
+      renderChannels();
+    });
+    list.appendChild(div);
+  });
+  // new uploads across channels, newest first
+  const news = [];
+  (st.channels || []).forEach((c) =>
+    (c.last_new || []).forEach((v) => news.push({ ...v, channel: c.title })));
+  news.sort((a, b) => (b.published_at || "").localeCompare(a.published_at || ""));
+  $("channelsNewEmpty").classList.toggle("hidden", news.length > 0);
+  const nl = $("channelsNewList");
+  nl.innerHTML = "";
+  news.forEach((v) => {
+    const div = document.createElement("div");
+    div.className = "chan-new";
+    div.innerHTML = `
+      ${v.thumbnail ? `<img class="chan-thumb" src="${escapeHtml(v.thumbnail)}" alt="">` : ""}
+      <div class="chan-main">
+        <div class="chan-title">${escapeHtml(v.title || "")}</div>
+        <div class="chan-meta">${escapeHtml(v.channel || "")} \u00b7 ${v.duration_s ? Math.round(v.duration_s / 60) + " min" : ""} \u00b7 ${escapeHtml((v.published_at || "").slice(0, 10))}</div>
+      </div>
+      <button class="primary small send-clip-btn" type="button">Send to Clip Maker</button>`;
+    div.querySelector(".send-clip-btn").addEventListener("click", async (ev) => {
+      ev.target.disabled = true;
+      resetForNewImport();
+      try {
+        const res = await api.import_url(v.url, false, "auto");
+        jobId = res.job_id;
+        showWizard(1);
+        startPoll();
+        toast("Imported \u2014 Clip Maker is on it");
+      } catch (e) {
+        ev.target.disabled = false;
+        toast("Import failed \u2014 is the app running?", true);
+      }
+    });
+    nl.appendChild(div);
+  });
+}
+
+$("channelsKeySaveBtn").addEventListener("click", async () => {
+  const k = $("channelsKeyInput").value.trim();
+  if (!k) { $("channelsKeyState").textContent = "Paste a key first."; return; }
+  const res = await api.channels_save_key(k);
+  if (!res.ok) {
+    $("channelsKeyState").textContent = res.error || "Could not save the key.";
+    return;
+  }
+  $("channelsKeyState").textContent = "Key saved on this PC.";
+  channelsState = await api.channels_state();
+  renderChannels();
+});
+$("channelsKeyClearBtn").addEventListener("click", async () => {
+  await api.channels_clear_key();
+  channelsState = await api.channels_state();
+  renderChannels();
+});
+$("channelsAddBtn").addEventListener("click", async () => {
+  const ref = $("channelsUrlInput").value.trim();
+  if (!ref) return;
+  $("channelsMsg").textContent = "Looking up the channel\u2026";
+  const res = await api.channels_add(ref);
+  if (!res.ok) {
+    $("channelsMsg").textContent = res.message || res.error || "Could not add that channel.";
+    return;
+  }
+  channelsState = res;
+  $("channelsUrlInput").value = "";
+  $("channelsMsg").textContent = "Channel added \u2014 watching it from now on.";
+  renderChannels();
+});
+$("channelsIntervalBtn").addEventListener("click", async () => {
+  const v = parseInt($("channelsIntervalInput").value, 10) || 60;
+  const res = await api.channels_set_interval(v);
+  if (channelsState && res.ok) channelsState.interval_min = res.interval_min;
+  $("channelsMsg").textContent = res.ok
+    ? `Checking every ${res.interval_min} minutes.` : (res.error || "Save failed.");
+});
+$("channelsCheckAllBtn").addEventListener("click", async () => {
+  $("channelsMsg").textContent = "Checking all channels\u2026";
+  const res = await api.channels_check("");
+  if (res && res.ok) {
+    channelsState = res;
+    const n = (res.results || []).reduce((a, r) => a + ((r.new || []).length), 0);
+    $("channelsMsg").textContent = `${n} new upload(s) found.`;
+  } else {
+    $("channelsMsg").textContent = (res && (res.message || res.error)) || "Check failed.";
+  }
+  renderChannels();
+});
 
 /* ---------------- Caption Remover ---------------- */
 let removerOpen = false;
@@ -2450,6 +2973,7 @@ function showTool(name) {
   }
   else if (name === "aimanager") initAiManager();
   else if (name === "publishing") initPublishing();
+  else if (name === "channels") initChannels();
   else if (name === "admin") initAdmin();
   syncSidebar(name);
 }
@@ -2810,6 +3334,8 @@ $("navTranscriptBtn").addEventListener("click", () => showTool("transcript"));
 $("navEnhBtn").addEventListener("click", () => showTool("enhancer"));
 $("navAiBtn").addEventListener("click", () => showTool("aimanager"));
 $("navPubBtn").addEventListener("click", () => showTool("publishing"));
+$("openChannelsBtn").addEventListener("click", () => showTool("channels"));
+$("channelsBackBtn").addEventListener("click", goHome);
 $("navAdminBtn").addEventListener("click", () => openAdmin());
 $("sideAiCard").addEventListener("click", () => showTool("aimanager"));
 $("homeSeeAllBtn").addEventListener("click", showLibrary);
@@ -2932,6 +3458,15 @@ async function initGenerator() {
     return;
   }
   genModels = res.models || [];
+  if (res.enabled === false) {
+    hide($("genNoKey"));
+    hide($("genControls"));
+    $("genError").textContent =
+      "The fal.ai provider is switched off in Settings → AI video generation. " +
+      "Turn it on there to generate — nothing is generated while it is off.";
+    show($("genError"));
+    return;
+  }
   const hasKey = !!res.has_key;
   $("genNoKey").classList.toggle("hidden", hasKey);
   $("genControls").classList.toggle("hidden", !hasKey);
@@ -3858,11 +4393,48 @@ $("settingsBtn").addEventListener("click", async () => {
   $("falKeyState").textContent = settings.fal_key_set
     ? "A key is saved on this PC. Type a new one to replace it."
     : "No key saved.";
+  $("falEnabledCheck").checked = settings.fal_enabled !== false;
+  renderFalTestState(settings.fal_last_test);
   openSettings();
   refreshStorage();
   refreshUpdateInfo();
 });
 $("closeSettingsBtn").addEventListener("click", closeSettings);
+
+/* Phase 2: provider management (fal.ai today; the pattern is
+   per-provider: enable/disable + a REAL connectivity test whose
+   result is shown as-is — never a fake success). */
+function renderFalTestState(t) {
+  const el = $("falTestState");
+  if (!el) return;
+  if (!t) { el.textContent = "Connection not tested yet."; return; }
+  const when = t.ts ? new Date(t.ts * 1000).toLocaleString() : "";
+  el.textContent = `${t.ok ? "✓" : "✗"} Tested ${when}: ${t.message || ""}`;
+}
+$("falEnabledCheck").addEventListener("change", async () => {
+  const on = $("falEnabledCheck").checked;
+  const res = await api.provider_set_enabled("fal", on);
+  if (!res.ok) {
+    $("falEnabledCheck").checked = !on;
+    toast(res.error || "Could not change the provider state", true);
+    return;
+  }
+  settings.fal_enabled = on;
+  toast(on ? "fal.ai enabled"
+    : "fal.ai disabled — the generator will say so instead of generating");
+});
+$("falTestBtn").addEventListener("click", async () => {
+  $("falTestState").textContent = "Testing…";
+  $("falTestBtn").disabled = true;
+  const res = await api.provider_test("fal");
+  $("falTestBtn").disabled = false;
+  if (!res.ok || !res.test) {
+    $("falTestState").textContent = "✗ " + (res.error || "Test failed.");
+    return;
+  }
+  settings.fal_last_test = res.test;
+  renderFalTestState(res.test);
+});
 $("saveSettingsBtn").addEventListener("click", async () => {
   const fk = $("falKeyInput").value.trim();
   if (fk) {
@@ -5220,6 +5792,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     $("cookiesCheck").checked = !!settings.use_cookies;
   } catch (e) { /* offline-safe defaults below */ }
   applyTheme();
+  syncQualityAvailability();
   updateBackBtn();
   syncSidebar("hub");
   checkAdminSession();
@@ -5231,3 +5804,95 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (sp) { sp.classList.add("gone"); setTimeout(() => sp.remove(), 750); }
   }, 1550);
 });
+
+/* ---------------- Phase 2: drag-and-drop import ----------------
+   Drop a video file (or a video URL as text) anywhere on the window
+   and it routes through the exact same handlers as the Step-1
+   buttons: file -> localPathInput + localFileBtn, URL -> urlInput
+   + importBtn. */
+let dragDepth = 0;
+window.addEventListener("dragenter", (e) => {
+  e.preventDefault();
+  dragDepth += 1;
+  show($("dropOverlay"));
+});
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("dragleave", (e) => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) hide($("dropOverlay"));
+});
+window.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  hide($("dropOverlay"));
+  const dt = e.dataTransfer;
+  if (!dt) return;
+  const file = dt.files && dt.files[0];
+  if (file) {
+    const p = file.path || file.name;
+    if (!p) return;
+    showWizard(1);
+    $("localPathInput").value = p;
+    $("localFileBtn").click();
+    return;
+  }
+  const text = (dt.getData && (dt.getData("text/uri-list")
+    || dt.getData("text/plain"))) || "";
+  const url = text.trim().split(/\s+/)[0];
+  if (/^https?:\/\//i.test(url)) {
+    showWizard(1);
+    $("urlInput").value = url;
+    $("importBtn").click();
+  }
+});
+
+/* ---------------- Phase 2: keyboard shortcuts ----------------
+   Small, documented set (press ? for the list). Inert while typing
+   in any field, and while a modal editor is open. */
+function typingTarget(e) {
+  const t = e.target;
+  if (!t) return false;
+  const tag = (t.tagName || "").toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select"
+    || t.isContentEditable;
+}
+function visibleVideo() {
+  const vids = [...document.querySelectorAll("video")];
+  return vids.find((v) => v.offsetParent !== null && !v.classList.contains("hidden"))
+    || vids.find((v) => v.src || (v.querySelector && v.querySelector("source")));
+}
+document.addEventListener("keydown", (e) => {
+  if (e.key === "?" && !typingTarget(e)) {
+    e.preventDefault();
+    $("shortcutsOverlay").classList.toggle("hidden");
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    if (typingTarget(e)) return;
+    if (!$("step2").classList.contains("hidden") && jobId
+        && selectedMoments.length) {
+      e.preventDefault();
+      startRender(selectedMoments);
+    }
+    return;
+  }
+  if (typingTarget(e) || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === " " || e.key === "k" || e.key === "K") {
+    const v = visibleVideo();
+    if (v && typeof v.play === "function") {
+      e.preventDefault();
+      if (v.paused) v.play(); else v.pause();
+    }
+    return;
+  }
+  if (e.key === "[" || e.key === "]") {
+    if ($("timelineWrap").classList.contains("hidden")) return;
+    const m = lastMoments[tlSelected];
+    if (!m) return;
+    e.preventDefault();
+    const d = e.key === "[" ? -1 : 1;
+    if (e.shiftKey) tlApplyTimes(m.start, m.end + d);
+    else tlApplyTimes(m.start + d, m.end);
+  }
+});
+$("shortcutsCloseBtn").addEventListener("click", () => hide($("shortcutsOverlay")));

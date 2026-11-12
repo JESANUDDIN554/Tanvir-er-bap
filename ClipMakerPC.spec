@@ -53,6 +53,7 @@ a = Analysis(
         "admin",
         "usage",
         "publishing",
+        "channels",
         "ai_components",
         "licensing",
         "updater",
