@@ -60,6 +60,7 @@ _GEN_JOBS = {}      # fal.ai generator runs (session-only)
 _ENHANCE_JOBS = {}  # Video Enhancer runs (session-only)
 _BENHANCE_BATCHES = {}  # Post-clipping Enhance-All queues (session-only;
                         # results persist on the job's render records)
+_PROCESS_START = time.time()
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"),
                               ".clipmaker_pc_settings.json")
 
@@ -123,16 +124,145 @@ def _session_folder(name):
     return os.path.join(_work_root(), name)
 
 
+_JOB_ID_RE = None  # compiled on first use (module import order)
+
+
+def _valid_job_id(jid):
+    """Job ids are server-minted tokens ([A-Za-z0-9_-]{1,64} - the
+    same class the /files route enforces). Anything else is not a
+    job id and must never reach a filesystem path."""
+    global _JOB_ID_RE
+    if _JOB_ID_RE is None:
+        import re as _re
+        _JOB_ID_RE = _re.compile(r"[A-Za-z0-9_-]{1,64}")
+    return bool(_JOB_ID_RE.fullmatch(jid or ""))
+
+
+def _folder_inside_work_roots(folder):
+    """True when folder is a DIRECT child of a work root. The
+    containment net under every rmtree of a job folder: even if a
+    caller passes an unsanitised id, the resolved path can only
+    ever be a folder the app itself created."""
+    ap = os.path.abspath(folder)
+    return any(os.path.dirname(ap) == os.path.abspath(root)
+               for root in _work_roots())
+
+
 def _drop_job(jid):
     job = JOBS.pop(jid, None)
     if job is None:
         return
     # free the disk too - a pruned job's /files URLs 404 anyway
+    folder = _job_folder(jid)
+    if not _folder_inside_work_roots(folder):
+        return  # never rmtree outside the work roots
     import shutil
-    shutil.rmtree(_job_folder(jid), ignore_errors=True)
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+def _folder_referenced(folder):
+    """True when any live job's video or render lives inside
+    folder (e.g. a generated video imported into the Library
+    keeps its file in the gen-* folder). Such folders are never
+    swept, however old they look."""
+    ap = os.path.abspath(folder) + os.sep
+    for j in list(JOBS.values()):
+        vp = j.get("video_path") or ""
+        if vp and os.path.abspath(vp).startswith(ap):
+            return True
+        for r in j.get("renders", []):
+            rp = r.get("path") or ""
+            if rp and os.path.abspath(rp).startswith(ap):
+                return True
+    return False
+
+
+def _rmtree_session_folder(name):
+    folder = _session_folder(name)
+    if not _folder_inside_work_roots(folder):
+        return
+    if _folder_referenced(folder):
+        return
+    import shutil
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+def _prune_sessions():
+    """Bound the session stores + their folders. JOBS has always
+    had TTL pruning; the remover/enhance/generator stores and
+    their on-disk folders NEVER did - every run (and every crash
+    orphan) accumulated for the life of the install (measured:
+    112 work dirs / 468 MB on one machine, only 24 of them
+    Library jobs). Terminal entries older than the job TTL are
+    dropped with their folders; active entries are never touched."""
+    now = time.time()
+    for store, prefix in ((_REMOVER_JOBS, "remover-"),
+                          (_ENHANCE_JOBS, "enhance-"),
+                          (_GEN_JOBS, "gen-")):
+        for sid, st in list(store.items()):
+            if st.get("status") in ("running", "queued"):
+                continue
+            if now - st.get("created", now) > JOB_TTL_S:
+                store.pop(sid, None)
+                _rmtree_session_folder(prefix + sid)
+    for bid, b in list(_BENHANCE_BATCHES.items()):
+        if b.get("state") != "running" \
+                and now - b.get("created", now) > JOB_TTL_S:
+            _BENHANCE_BATCHES.pop(bid, None)
+    for bid, b in list(BATCHES.items()):
+        if b.get("status") != "working" \
+                and now - b.get("created", now) > JOB_TTL_S:
+            BATCHES.pop(bid, None)
+
+
+def _sweep_orphan_folders():
+    """Startup sweep (runs once, from _load_library): session
+    folders left by a PREVIOUS process (crash/kill orphans - the
+    session dicts died with that process, so nothing can ever
+    serve them again) are removed, and stale render .part files
+    (interrupted encodes) older than a day go with them. A folder
+    holding a Library job's video/renders is never touched, and
+    folders with job.json (real projects) are not session folders
+    by construction."""
+    import glob as _glob
+    live = ({"remover-" + k for k in _REMOVER_JOBS}
+            | {"enhance-" + k for k in _ENHANCE_JOBS}
+            | {"gen-" + k for k in _GEN_JOBS})
+    for root in _work_roots():
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for name in names:
+            if not name.startswith(("remover-", "enhance-", "gen-")):
+                continue
+            if name in live:
+                continue
+            folder = os.path.join(root, name)
+            try:
+                if not os.path.isdir(folder):
+                    continue
+                if os.path.getmtime(folder) > _PROCESS_START - 5:
+                    continue  # created by THIS process - not an orphan
+            except OSError:
+                continue
+            if _folder_referenced(folder):
+                continue
+            import shutil
+            shutil.rmtree(folder, ignore_errors=True)
+        # stale .part encodes inside job folders (never job.json
+        # folders themselves, never fresh parts a render may own)
+        for part in _glob.glob(os.path.join(root, "*", "clips",
+                                            "*.part.mp4")):
+            try:
+                if time.time() - os.path.getmtime(part) > 86400:
+                    os.remove(part)
+            except OSError:
+                pass
 
 
 def _prune_jobs():
+    _prune_sessions()
     now = time.time()
     for jid, job in list(JOBS.items()):
         if job.get("status") == "working":
@@ -161,6 +291,7 @@ def _prune_jobs():
 # startup, so the Library keeps projects until the user deletes them.
 _LIBRARY_STATUSES = ("transcribed", "moments", "done")
 _LIBRARY_LOADED = False
+_CORRUPT_JOBS = set()  # folders whose job.json exists but won't parse
 
 
 def _is_library_job(job_id):
@@ -211,7 +342,11 @@ def _load_library():
         try:
             with open(meta, encoding="utf-8") as f:
                 data = json.load(f)
-        except Exception:  # noqa: BLE001 - skip corrupt entries
+        except Exception:  # noqa: BLE001 - corrupt entry: the
+            # project must not silently VANISH from the Library
+            # while its folder sits on disk. Remember it; the
+            # Library listing and job_status report it as damaged.
+            _CORRUPT_JOBS.add(name)
             continue
         video_path = data.get("video_path") or ""
         if not video_path or not os.path.isfile(video_path):
@@ -240,6 +375,13 @@ def _load_library():
             "category": data.get("category", ""),
             "source": data.get("source", "url"),
             "created": data.get("created", 0) or os.path.getmtime(meta)}
+    # Library is loaded: now the reference check can see every
+    # saved project, so orphaned session folders from previous
+    # processes can be swept safely.
+    try:
+        _sweep_orphan_folders()
+    except Exception:  # noqa: BLE001 - housekeeping, never fatal
+        pass
 
 DEFAULT_SETTINGS = {
     "detect_mode": "local",        # "local" (Built-in AI) or "offline"
@@ -302,12 +444,24 @@ CLIP_LEN_PRESETS = {
 LONG_VIDEO_WARN_S = 2 * 3600  # Step-1 amber warning at 2h+
 
 
+_SETTINGS_LOCK = threading.Lock()
+_SETTINGS_LOAD_WARNING = {"active": False}
+
+
 def load_settings():
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         data = {}
+    except (OSError, ValueError):
+        # The file EXISTS but cannot be read: the app boots on
+        # defaults, which silently reverts the saved data folder
+        # and looks like lost settings. Remember it so the UI can
+        # say so honestly (get_settings surfaces load_warning)
+        # instead of the failure being invisible.
+        data = {}
+        _SETTINGS_LOAD_WARNING["active"] = True
     merged = dict(DEFAULT_SETTINGS)
     merged.update(data or {})
     # Migration: the old cloud-AI option is gone. A stored key from an
@@ -321,9 +475,16 @@ def load_settings():
 
 def save_settings(data):
     data = {k: v for k, v in (data or {}).items() if k != "api_key"}
+    # tmp + os.replace: the old bare open("w") truncated the file
+    # in place, so a crash or kill mid-save corrupted the settings
+    # (which carry the license key and data-dir pointer). Same
+    # pattern usage.py and admin.py already use for their files.
     try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
+        os.replace(tmp, SETTINGS_PATH)
+        _SETTINGS_LOAD_WARNING["active"] = False
     except OSError:
         pass
 
@@ -1027,17 +1188,27 @@ class Api:
         # WHETHER one is saved, never the key itself.
         s["fal_key_set"] = bool((s.get("fal_key") or "").strip())
         s.pop("fal_key", None)
+        if _SETTINGS_LOAD_WARNING["active"]:
+            s["load_warning"] = (
+                "Your settings file couldn't be read (it may be "
+                "damaged), so the app started with default settings. "
+                "Saving settings will repair the file.")
         return s
 
     def save_settings(self, settings):
-        current = load_settings()
-        settings = dict(settings or {})
-        # data_dir has its own endpoint (set_data_dir below):
-        # changing it can mean moving a 9 GB model, which a generic
-        # settings save must never trigger - or silently bypass.
-        settings.pop("data_dir", None)
-        current.update(settings)
-        save_settings(current)
+        # The load-modify-save cycle runs under a lock: several
+        # settings savers (UI saves, detect prefs, data-dir flow)
+        # run on different waitress threads, and unlocked cycles
+        # silently dropped each other's changes.
+        with _SETTINGS_LOCK:
+            current = load_settings()
+            settings = dict(settings or {})
+            # data_dir has its own endpoint (set_data_dir below):
+            # changing it can mean moving a 9 GB model, which a generic
+            # settings save must never trigger - or silently bypass.
+            settings.pop("data_dir", None)
+            current.update(settings)
+            save_settings(current)
         return {"ok": True}
 
     # -- in-app updates (signed file-replacement packs) ---------------
@@ -1116,7 +1287,8 @@ class Api:
         if not p:
             local_ai.set_data_dir(None)
             s["data_dir"] = ""
-            save_settings(s)
+            with _SETTINGS_LOCK:
+                save_settings(s)
             return {"ok": True, "data_dir": "",
                     "message": "Storage location cleared - the app "
                                "folder is used again."}
@@ -1144,9 +1316,10 @@ class Api:
         if eff and os.path.abspath(eff) != os.path.abspath(want):
             def _done(ok, err, _ap=ap):
                 if ok:
-                    cur = load_settings()
-                    cur["data_dir"] = _ap
-                    save_settings(cur)
+                    with _SETTINGS_LOCK:
+                        cur = load_settings()
+                        cur["data_dir"] = _ap
+                        save_settings(cur)
             if local_ai.start_model_move(ap, on_done=_done):
                 return {"ok": True, "data_dir": ap, "moving": True,
                         "message": "Moving the AI model to the new "
@@ -1156,7 +1329,8 @@ class Api:
                     "error": "The model move could not be started."}
         local_ai.set_data_dir(ap)
         s["data_dir"] = ap
-        save_settings(s)
+        with _SETTINGS_LOCK:
+            save_settings(s)
         return {"ok": True, "data_dir": ap,
                 "message": "Storage location saved."}
 
@@ -1237,7 +1411,7 @@ class Api:
                                    language or "auto"),
                              daemon=True)
         t.start()
-        return {"job_id": job_id}
+        return {"ok": True, "job_id": job_id}
 
     def import_file(self, path, language="auto"):
         """Use a local video file already on the PC (no download)."""
@@ -1330,11 +1504,29 @@ class Api:
                 "source": j.get("source", ""),
                 "clips": len(j.get("renders", [])),
                 "moments": len(j.get("moments", []))})
+        # Damaged projects stay VISIBLE (marked corrupt) instead of
+        # vanishing from the Library while their folders sit on disk.
+        for cid in sorted(_CORRUPT_JOBS):
+            if cid not in JOBS:
+                projects.append({
+                    "job_id": cid, "title": "(damaged project)",
+                    "status": "corrupt",
+                    "stage": "Saved data damaged - delete and "
+                             "re-import",
+                    "duration": 0, "created": 0, "source": "",
+                    "clips": 0, "moments": 0, "corrupt": True})
         projects.sort(key=lambda p: p.get("created", 0), reverse=True)
         return {"projects": projects}
 
     def delete_job(self, job_id):
         """Delete a saved project and its files (Library action)."""
+        # The id goes straight into a folder path that is then
+        # rmtree'd: an unsanitised "../" id deleted arbitrary
+        # folders the app process could reach. Validate the id and
+        # keep the delete inside the work roots (the same defences
+        # the /files route has always had).
+        if not _valid_job_id(job_id):
+            return {"ok": False, "error": "Project not found."}
         job = JOBS.get(job_id)
         if job and job.get("status") == "working":
             return {"ok": False,
@@ -1342,6 +1534,8 @@ class Api:
                              "to finish first."}
         folder = _job_folder(job_id)
         if job is None and not os.path.isdir(folder):
+            return {"ok": False, "error": "Project not found."}
+        if not _folder_inside_work_roots(folder):
             return {"ok": False, "error": "Project not found."}
         _drop_job(job_id)  # pops JOBS + removes the folder when loaded
         import shutil
@@ -1431,8 +1625,14 @@ class Api:
             cmd = ["ffmpeg", "-y", "-v", "error", "-ss", str(t),
                    "-i", job["video_path"], "-frames:v", "1",
                    "-q:v", "4", thumb]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
+            try:
+                # No timeout before: a wedged ffmpeg on a corrupt
+                # source held a WSGI thread forever (8 threads
+                # serve the whole UI).
+                subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=30)
+            except subprocess.TimeoutExpired:
+                return {"ok": False}
         if os.path.exists(thumb):
             return {"ok": True, "url": f"/files/{job_id}/thumb.jpg"}
         return {"ok": False}
@@ -1440,6 +1640,10 @@ class Api:
     @staticmethod
     def _friendly_error(e):
         msg = str(e)
+        if "No space left on device" in msg or "[Errno 28]" in msg:
+            return ("Your disk is full - free up some space, then "
+                    "try again. (Videos and the Built-in AI model "
+                    "need several GB.)")
         if "youtube_bot_check" in msg or "not a bot" in msg.lower():
             return ("YouTube asked for bot verification. Turn on 'Use my "
                     "browser's YouTube login' in Step 1 (log into YouTube "
@@ -1664,7 +1868,10 @@ class Api:
 
     # -- built-in AI download/status (Step 2 card) ------------------------
     def local_ai_status(self):
-        st = local_ai.download_state()
+        # This endpoint is the ONE sanctioned auto-resume trigger:
+        # it exists to report on the download, so it may also heal
+        # it. Every other reader uses the pure download_state().
+        st = local_ai.maybe_auto_resume()
         info = local_ai.model_info()
         return {"ok": True,
                 "ready": local_ai.model_ready(),
@@ -1764,9 +1971,10 @@ class Api:
         st = licensing.try_unlock((key or "").strip(), BASE_DIR,
                                   _load_corepack)
         if st.get("unlocked"):
-            current = load_settings()
-            current["license_key"] = (key or "").strip()
-            save_settings(current)
+            with _SETTINGS_LOCK:
+                current = load_settings()
+                current["license_key"] = (key or "").strip()
+                save_settings(current)
             return {"ok": True,
                     "licensee": (st.get("payload") or {}).get("name", "")}
         return {"ok": False, "error": st.get("reason")
@@ -1864,7 +2072,7 @@ class Api:
                 src, _dl_title, _dl_dur = download_video(
                     source, work,
                     lambda p, t: cb(int(p * 0.25), t),
-                    use_cookies=bool(settings.get("use_browser_cookies")))
+                    use_cookies=bool(settings.get("use_cookies")))
                 try:
                     _mb = os.path.getsize(src) / (1024 * 1024)
                     _remover_log(rid, f"Download finished ({_mb:.1f} MB)")
@@ -2012,7 +2220,7 @@ class Api:
                 src, _dl_title, _dl_dur = download_video(
                     source, work,
                     lambda p, t: cb(int(p * 0.25), t),
-                    use_cookies=bool(settings.get("use_browser_cookies")))
+                    use_cookies=bool(settings.get("use_cookies")))
                 _remover_log(rid, "Download finished")
             else:
                 src = source
@@ -2189,11 +2397,20 @@ class Api:
         moments = job.get("moments") or []
         mi = r.get("moment_index", 0)
         m = moments[mi] if 0 <= mi < len(moments) else {}
-        words = m.get("edited_words") or [
-            w for w in job.get("words", [])
-            if w["end"] > m.get("start", 0)
-            and w["start"] < m.get("end", 0)]
-        base = float(m.get("start", 0))
+        if m:
+            words = m.get("edited_words") or [
+                w for w in job.get("words", [])
+                if w["end"] > m.get("start", 0)
+                and w["start"] < m.get("end", 0)]
+            base = float(m.get("start", 0))
+        else:
+            # Hook/teaser/merged renders carry moment_index -1 (no
+            # source moment): the old code fell through with an
+            # empty moment, so their covers were generated with NO
+            # spoken-beat input at all. Their words live on the
+            # render record, already on the clip's own timeline.
+            words = r.get("words") or []
+            base = 0.0
         cap = [dict(w, start=max(0.0, w["start"] - base),
                     end=w["end"] - base) for w in words]
         out = os.path.splitext(clip)[0] + "_cover.jpg"
@@ -2447,6 +2664,10 @@ class Api:
         return {"ok": True}
 
     def _run_hook_render(self, job_id, hook_text, start, end):
+        with _capped_render_slot():
+            self._run_hook_render_impl(job_id, hook_text, start, end)
+
+    def _run_hook_render_impl(self, job_id, hook_text, start, end):
         job = JOBS[job_id]
         try:
             self._render_hook_file(job_id, job, hook_text, start, end,
@@ -2525,6 +2746,12 @@ class Api:
 
     def _run_hook_combo(self, job_id, hook_text, start, end, moment,
                         clip_index):
+        with _capped_render_slot():
+            self._run_hook_combo_impl(job_id, hook_text, start, end,
+                                      moment, clip_index)
+
+    def _run_hook_combo_impl(self, job_id, hook_text, start, end,
+                             moment, clip_index):
         job = JOBS[job_id]
         try:
             ih = self._render_hook_file(
@@ -2560,7 +2787,7 @@ class Api:
                 _job_log(job_id, "Render finished - "
                          + os.path.basename(out))
                 ic = len(job["renders"]) - 1
-            merged = self.merge_selected(job_id, [ih, ic],
+            merged = self._merge_selected_internal(job_id, [ih, ic],
                                          transition="cut")
             if not merged.get("ok"):
                 raise RuntimeError(merged.get("error")
@@ -2667,6 +2894,12 @@ class Api:
 
     def _run_hook_teaser(self, job_id, hook_text, win, moment,
                          clip_index):
+        with _capped_render_slot():
+            self._run_hook_teaser_impl(job_id, hook_text, win,
+                                       moment, clip_index)
+
+    def _run_hook_teaser_impl(self, job_id, hook_text, win, moment,
+                              clip_index):
         job = JOBS[job_id]
         hs, he = win
         ms, me = float(moment["start"]), float(moment["end"])
@@ -2716,7 +2949,7 @@ class Api:
             job["stage"] = "Rendering teaser"
             ic = self._teaser_clip_render(job_id, job, moment,
                                           clip_index)
-            merged = self.merge_selected(job_id, [ih, ic],
+            merged = self._merge_selected_internal(job_id, [ih, ic],
                                          transition="cut")
             if not merged.get("ok"):
                 raise RuntimeError(merged.get("error")
@@ -2889,6 +3122,11 @@ class Api:
                                           "(the app was restarted)."}
         if st["status"] in ("done", "error"):
             return {"ok": True, **_gen_public(st)}
+        if st.get("_dl_claimed"):
+            # The result download is already running on its worker
+            # thread - don't fetch fal status again, and never
+            # start a second download of the same file.
+            return {"ok": True, **_gen_public(st)}
         if time.time() - st["created"] > 1800:
             st["status"] = "error"
             st["error"] = "Timed out waiting for fal.ai (30 min)."
@@ -2950,7 +3188,23 @@ class Api:
             _admin_log_gen(st)
             return {"ok": True, **_gen_public(st)}
         st["remote_url"] = remote
-        # Download locally so the file survives + can enter the Library.
+        # Claim the result download exactly once and run it on a
+        # worker thread. This poll used to download the whole file
+        # INLINE - up to 300 s blocking one of the 8 WSGI threads -
+        # and two concurrent polls both downloaded to the same
+        # path (interleaved writes) and both wrote the admin "ok"
+        # log line, double-counting the generation.
+        st["_dl_claimed"] = True
+        st["status"] = "running"
+        st["stage"] = "Downloading result…"
+        threading.Thread(target=self._gen_download,
+                         args=(st, remote), daemon=True).start()
+        return {"ok": True, **_gen_public(st)}
+
+    def _gen_download(self, st, remote):
+        """Worker: fetch a finished generation's file next to the
+        app so it survives + can enter the Library. Runs exactly
+        once per generation (claimed by gen_video_status)."""
         folder_name = "gen-" + st["id"]
         folder = os.path.join(_work_root(), folder_name)
         os.makedirs(folder, exist_ok=True)
@@ -2973,7 +3227,6 @@ class Api:
         st["status"] = "done"
         st["stage"] = "Done"
         _admin_log_gen(st)
-        return {"ok": True, **_gen_public(st)}
 
     def gen_video_import(self, gen_id):
         """Send a finished generated VIDEO into the Library through
@@ -3017,10 +3270,20 @@ class Api:
             return {"ok": False, "error": "Pick a Library project or "
                                           "paste a local video file "
                                           "path first."}
+        # Double-submit: a second enhance of the SAME input while
+        # one is running is pure duplicate compute - return the
+        # live one instead of queueing a twin.
+        apath = os.path.abspath(path)
+        for ex in list(_ENHANCE_JOBS.values()):
+            if ex.get("status") == "running" \
+                    and ex.get("source_path") == apath:
+                return {"ok": True, "id": ex["id"],
+                        "note": "already enhancing this file"}
         eid = uuid.uuid4().hex[:12]
         _ENHANCE_JOBS[eid] = {"id": eid, "status": "running", "pct": 0,
                               "stage": "Starting", "error": None,
                               "url": None, "created": time.time(),
+                              "source_path": apath,
                               "source_name": os.path.basename(path)}
         admin.bump_counter("enhancer")
         t = threading.Thread(target=self._run_enhance,
@@ -3151,6 +3414,24 @@ class Api:
         job = JOBS.get(job_id)
         if not job:
             return {"ok": False, "error": "Project not found."}
+        # One active batch per project: two batches over one job
+        # share every item's .part and output paths (out paths are
+        # derived from the render paths), so a double-submit made
+        # two workers interleave encodes on the same files.
+        for ex in list(_BENHANCE_BATCHES.values()):
+            # "Active" means a live worker or items still queued -
+            # not merely a stale "running" label a dead worker may
+            # have left behind, which must not brick re-enhancing.
+            active = ex.get("state") == "running" and (
+                ex.get("worker_alive")
+                or any(it.get("state") in ("queued", "running")
+                       for it in ex.get("items", [])))
+            if ex.get("job_id") == job_id and active:
+                return {"ok": False,
+                        "error": "enhance_in_progress",
+                        "message": "An enhance batch is already "
+                                   "running for this project - wait "
+                                   "for it to finish."}
         options = options or {}
         mode = options.get("mode") or "smart"
         renders = job.get("renders", [])
@@ -3633,7 +3914,8 @@ class Api:
         job = JOBS[job_id]
         lock = job.get("_render_lock")
         try:
-            self._render_clips(job_id, indices, opts)
+            with _capped_render_slot():
+                self._render_clips(job_id, indices, opts)
         finally:
             if lock is not None:
                 try:
@@ -4221,8 +4503,17 @@ class Api:
                           f"{_fontsdir_opt()}",
                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
-            r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE, text=True)
+            try:
+                # Bounded like get_thumbnail: previews can span the
+                # 15-minute moment preset, and an unbounded run on a
+                # WSGI thread starves the whole 8-thread server.
+                r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE, text=True,
+                                   timeout=180)
+            except subprocess.TimeoutExpired:
+                return {"ok": False,
+                        "error": "Preview timed out - try a shorter "
+                                 "moment."}
             if r.returncode != 0 or not os.path.exists(out):
                 return {"ok": False,
                         "error": "Preview failed: " + r.stderr[-300:]}
@@ -4233,11 +4524,10 @@ class Api:
                 pass
         return {"ok": True, "url": self._download_url(job_id, out)}
 
-    def merge_selected(self, job_id, render_indices, transition="cut",
-                       intro_path="", outro_path=""):
-        gate = _license_gate()
-        if gate:
-            return gate
+    def _merge_prepare(self, job_id, render_indices, intro_path,
+                       outro_path):
+        """Shared validation for merges: returns an error dict, or
+        (job, idxs, paths, intro, outro)."""
         job = JOBS.get(job_id)
         if not job:
             return {"ok": False, "error": "No job."}
@@ -4253,10 +4543,70 @@ class Api:
             if p and not os.path.isfile(p):
                 return {"ok": False, "error": "Intro/outro file not found: "
                                               + p[:120]}
+        return job, idxs, paths, intro, outro
+
+    def merge_selected(self, job_id, render_indices, transition="cut",
+                       intro_path="", outro_path=""):
+        gate = _license_gate()
+        if gate:
+            return gate
+        prep = self._merge_prepare(job_id, render_indices,
+                                   intro_path, outro_path)
+        if isinstance(prep, dict):
+            return prep
+        job, idxs, paths, intro, outro = prep
+        # Take the job's render lock: merging ran with NO lock,
+        # synchronously on a WSGI thread, and its output name was
+        # derived from the renders count - a render finishing
+        # mid-merge (or a double-submitted merge) could land two
+        # writers on the same merged_NN.mp4. The lock refuses a
+        # concurrent merge/render honestly; the name scan makes
+        # collisions impossible even across restarts.
+        lock = job.setdefault("_render_lock", threading.Lock())
+        if not lock.acquire(blocking=False):
+            return {"ok": False, "error": "render_in_progress",
+                    "message": "A render is already running for this "
+                               "video - wait for it to finish."}
+        try:
+            return self._merge_selected_locked(job_id, job, idxs,
+                                               paths, transition,
+                                               intro, outro)
+        finally:
+            try:
+                lock.release()
+            except RuntimeError:
+                pass  # already released
+
+    def _merge_selected_internal(self, job_id, render_indices,
+                                 transition="cut", intro_path="",
+                                 outro_path=""):
+        """Merge for callers that ALREADY hold the job's render
+        lock (the Hook Maker workers, via _hook_begin): the public
+        merge_selected's non-blocking acquire can never succeed
+        there - it is the same lock - so combo/teaser merges went
+        through this path from the start... except the sweep's
+        first cut of the lock fix pointed them at the public
+        method and they failed with render_in_progress (caught by
+        the sweep's own regression battery). Same validation, same
+        body - just no second acquire."""
+        prep = self._merge_prepare(job_id, render_indices,
+                                   intro_path, outro_path)
+        if isinstance(prep, dict):
+            return prep
+        job, idxs, paths, intro, outro = prep
+        return self._merge_selected_locked(job_id, job, idxs, paths,
+                                           transition, intro, outro)
+
+    def _merge_selected_locked(self, job_id, job, idxs, paths,
+                               transition, intro, outro):
         outdir = os.path.join(_job_folder(job_id), "clips")
         os.makedirs(outdir, exist_ok=True)
-        out = os.path.join(outdir,
-                           f"merged_{len(job['renders']) + 1:02d}.mp4")
+        used = {os.path.basename(r.get("path", ""))
+                for r in job.get("renders", [])}
+        seq = len(job["renders"]) + 1
+        while f"merged_{seq:02d}.mp4" in used:
+            seq += 1
+        out = os.path.join(outdir, f"merged_{seq:02d}.mp4")
         try:
             merge_clips(paths, out,
                         transition=transition if transition in (
@@ -4300,6 +4650,13 @@ class Api:
         _load_library()
         job = JOBS.get(job_id)
         if not job:
+            if job_id in _CORRUPT_JOBS:
+                return {"status": "error",
+                        "error": "This project's saved data is "
+                                 "damaged (its job.json can't be "
+                                 "read). The folder is still on disk; "
+                                 "delete the project and import the "
+                                 "video again."}
             return {"status": "missing"}
         # don't ship the full word list to the UI
         return {
@@ -4451,6 +4808,41 @@ def _usage_count(n=1):
         return None
 
 
+_CAPPED_RENDER_LOCK = threading.Lock()
+
+
+class _capped_render_slot:
+    """Serialize renders APP-WIDE while the active key is capped.
+
+    The cap check and the count increment bracket a whole render,
+    so two jobs rendering simultaneously each saw the same
+    remaining allowance and both spent it: measured live, a cap
+    of 3 with two concurrent 4-clip batches completed 4 clips
+    total (overshoot exactly +1 per extra simultaneous job; the
+    counter itself was exact). Holding this lock for the whole
+    render - only for capped keys; unlimited keys never wait -
+    makes check-then-count atomic per render. Per-job locks still
+    apply on top, exactly as before."""
+
+    def __enter__(self):
+        self.held = False
+        try:
+            if _usage_status().get("state") != "unlimited":
+                _CAPPED_RENDER_LOCK.acquire()
+                self.held = True
+        except Exception:  # noqa: BLE001 - never break a render
+            self.held = False
+        return self
+
+    def __exit__(self, *exc):
+        if self.held:
+            try:
+                _CAPPED_RENDER_LOCK.release()
+            except RuntimeError:
+                pass
+        return False
+
+
 def _COREPACK_READY():
     import pipeline as _p
     return _p.corepack_loaded()
@@ -4472,6 +4864,31 @@ def _work_in_progress():
     try:
         if any(j.get("status") == "working" for j in list(JOBS.values())):
             what.append("video processing")
+    except Exception:  # noqa: BLE001
+        pass
+    # The session tools were invisible to the guard: closing the
+    # app mid Caption-Remover / Enhancer / Generator / Enhance-All
+    # run cut the work off with no warning at all, despite this
+    # function's contract ("work that closing the app would cut").
+    for store, label in ((_REMOVER_JOBS, "caption removal"),
+                         (_ENHANCE_JOBS, "video enhancement"),
+                         (_GEN_JOBS, "AI video generation")):
+        try:
+            if any(s.get("status") in ("running", "queued")
+                   for s in list(store.values())):
+                what.append(label)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        if any(b.get("state") == "running"
+               for b in list(_BENHANCE_BATCHES.values())):
+            what.append("clip enhancement")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if any(b.get("status") == "working"
+               for b in list(BATCHES.values())):
+            what.append("batch import")
     except Exception:  # noqa: BLE001
         pass
     return what
@@ -4643,12 +5060,49 @@ def _admin_stats_payload():
             "providers": admin.provider_summaries(entries)}
 
 
+_MAX_API_BODY = 16 * 1024 * 1024  # no endpoint takes a bigger body
+_UNLOCK_GUARD = {"fails": 0, "until": 0.0}
+_UNLOCK_GUARD_LOCK = threading.Lock()
+
+
+def _post_origin_ok(environ):
+    """Drive-by defence for the local API's POST surface.
+
+    The server binds 127.0.0.1 on an ephemeral port, but every
+    mutating action is a POST (delete a project, apply an update,
+    uninstall) and any web page open in the user's browser could
+    try to POST to a guessed port. Browsers always send Origin on
+    POST, and a cross-origin page's Origin can never equal our
+    Host - so those are refused, as is any request addressed to a
+    non-loopback Host (DNS rebinding). Same-origin UI fetches
+    pass; requests with no Origin at all (the app's own tooling,
+    curl) pass. A hostile local PROCESS could still call the API,
+    but it already runs with the user's full file access - that
+    layer is not defensible from here and never was."""
+    host = (environ.get("HTTP_HOST") or "").strip().lower()
+    if host and not host.startswith(("127.0.0.1", "localhost",
+                                      "[::1]")):
+        return False
+    origin = (environ.get("HTTP_ORIGIN") or "").strip()
+    if origin:
+        from urllib.parse import urlparse
+        if urlparse(origin).netloc.lower() != host:
+            return False
+    return True
+
+
 def make_wsgi_app(api):
     ui_dir = os.path.abspath(os.path.join(BASE_DIR, "ui"))
 
     def app(environ, start_response):
         method = environ.get("REQUEST_METHOD", "GET")
         path = environ.get("PATH_INFO", "/") or "/"
+
+        # --- POST origin guard (see _post_origin_ok) --------------
+        if method == "POST" and not _post_origin_ok(environ):
+            return _wsgi_response(
+                start_response, "403 Forbidden", "application/json",
+                json.dumps({"ok": False, "error": "forbidden origin"}))
 
         # --- license gate: while locked, only the activation page
         # and the two license endpoints exist -------------------------
@@ -4752,6 +5206,7 @@ def make_wsgi_app(api):
                     length = int(environ.get("CONTENT_LENGTH") or 0)
                 except (TypeError, ValueError):
                     length = 0
+                length = min(length, 65536)  # a key is never bigger
                 raw = (environ["wsgi.input"].read(length)
                        if length > 0 else b"{}")
                 try:
@@ -4767,8 +5222,27 @@ def make_wsgi_app(api):
                 return ""
 
             if method == "POST" and path == "/api/admin/unlock":
+                # Brute-force backoff: key verification itself is
+                # cheap (a local Ed25519 check), and there was NO
+                # limit on attempts. After 10 consecutive failures
+                # the endpoint pauses for a minute. The legitimate
+                # owner succeeds on the first try, so the suites and
+                # the real unlock flow never notice.
+                with _UNLOCK_GUARD_LOCK:
+                    if time.time() < _UNLOCK_GUARD["until"]:
+                        return _json(
+                            "429 Too Many Requests",
+                            {"ok": False,
+                             "error": "Too many unlock attempts - "
+                                      "wait a minute, then try "
+                                      "again."})
                 payload = admin.verify_owner_key(_read_key())
                 if payload is None:
+                    with _UNLOCK_GUARD_LOCK:
+                        _UNLOCK_GUARD["fails"] += 1
+                        if _UNLOCK_GUARD["fails"] >= 10:
+                            _UNLOCK_GUARD["fails"] = 0
+                            _UNLOCK_GUARD["until"] = time.time() + 60
                     # One generic refusal for every failure mode:
                     # damaged, forged, expired, wrong machine, or a
                     # valid key without the owner claim.
@@ -4776,6 +5250,9 @@ def make_wsgi_app(api):
                                  {"ok": False,
                                   "error": "That key doesn't unlock "
                                            "the Admin Panel."})
+                with _UNLOCK_GUARD_LOCK:
+                    _UNLOCK_GUARD["fails"] = 0
+                    _UNLOCK_GUARD["until"] = 0.0
                 token, ttl = admin.create_session()
                 cookie = (f"{_ADMIN_COOKIE}={token}; HttpOnly; "
                           f"Path=/; SameSite=Strict; Max-Age={ttl}")
@@ -4830,6 +5307,17 @@ def make_wsgi_app(api):
                 length = int(environ.get("CONTENT_LENGTH") or 0)
             except (TypeError, ValueError):
                 length = 0
+            if length > _MAX_API_BODY:
+                # Bodies were read at whatever Content-Length a
+                # caller claimed, unbounded: a single request could
+                # make the server buffer arbitrary memory. Imports
+                # pass file PATHS, not bytes - nothing legitimate
+                # is anywhere near this cap.
+                return _wsgi_response(
+                    start_response, "413 Request Entity Too Large",
+                    "application/json",
+                    json.dumps({"ok": False,
+                                "error": "request too large"}))
             raw = environ["wsgi.input"].read(length) if length > 0 else b"{}"
             try:
                 payload = json.loads(raw.decode("utf-8") or "{}")
@@ -5419,6 +5907,12 @@ def _auto_update_ytdlp():
 
     Runs in a background thread with a short timeout; never blocks launch
     and never fails loudly."""
+    if getattr(sys, "frozen", False):
+        # In the shipped build sys.executable IS ClipMakerPC.exe:
+        # "ClipMakerPC.exe -m pip install" just launched a second
+        # copy of the app (bounced by the single-instance guard)
+        # and upgraded nothing. Source runs keep the real upgrade.
+        return
     try:
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q", "--upgrade",
