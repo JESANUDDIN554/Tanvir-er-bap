@@ -52,6 +52,7 @@ a = Analysis(
         "local_ai",
         "admin",
         "usage",
+        "publishing",
         "ai_components",
         "licensing",
         "updater",

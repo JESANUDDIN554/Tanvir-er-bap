@@ -45,6 +45,7 @@ from pipeline import (  # noqa: E402
 import local_ai  # noqa: E402  (built-in local LLM: engine/model/server)
 import admin  # noqa: E402  (Owner Admin Panel: sessions/log/stats)
 import usage  # noqa: E402  (per-key clip limits: signed max_clips)
+import publishing  # noqa: E402  (Auto Publishing: accounts/queue/scheduler)
 import ai_components  # noqa: E402  (AI Installation Manager backend)
 import licensing  # noqa: E402  (signed license + core pack + integrity)
 import updater  # noqa: E402  (signed file-replacement update packs)
@@ -427,6 +428,37 @@ DEFAULT_SETTINGS = {
                                    #   export_name}] - local posting planner
     "fal_key": "",                 # user's own fal.ai API key (Studio
                                    # Generator) - never sent to the UI
+    # -- Auto Publishing (publishing.py) ------------------------------
+    # Credentials below live ONLY in this server-side settings file.
+    # get_settings() masks every secret (same pattern as fal_key);
+    # adapters read them through publishing.resolve_account_config().
+    "pub_enabled": False,          # master switch for the worker
+    "pub_approval_mode": "manual",  # manual | auto
+    "pub_max_batch": 10,           # max jobs per create action
+    "pub_daily_limit": 0,          # per account per day; 0 = no limit
+    "pub_delay_s": 20,             # min seconds between uploads/account
+    "pub_default_preset": "",      # preset id for render auto-publish
+    "pub_default_visibility": "public",  # public | unlisted | private
+    "pub_presets": [],             # [{id, name, platforms, approval,
+                                   #   visibility, delay_minutes}]
+    "pub_accounts": [],            # [{id, platform, label,
+                                   #   external_id, token}] - token is
+                                   #   a secret, masked in get_settings
+    "pub_default_accounts": {},    # platform -> account id
+    "pub_account_status": {},      # account id -> last test result
+    "pub_fb_app_id": "",
+    "pub_fb_app_secret": "",       # secret
+    "pub_fb_base": "",             # "" = graph.facebook.com/v21.0
+    "pub_yt_client_id": "",
+    "pub_yt_client_secret": "",    # secret
+    "pub_yt_base": "",             # "" = www.googleapis.com
+    "pub_tt_client_key": "",
+    "pub_tt_client_secret": "",    # secret
+    "pub_tt_base": "",             # "" = open.tiktokapis.com
+    "pub_tt_audited": False,       # TikTok app passed audit (else
+                                   # posts are SELF_ONLY - surfaced)
+    "pub_webhook_url": "",         # completion events; off when ""
+    "pub_webhook_secret": "",      # secret - HMAC key for the outbox
     "data_dir": "",                # Settings -> Storage: folder for
                                    # the AI model + new projects;
                                    # "" = the app folder (default)
@@ -487,6 +519,31 @@ def save_settings(data):
         _SETTINGS_LOAD_WARNING["active"] = False
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Auto Publishing glue: publishing.py reads/writes app settings through
+# these injected callables (it never imports app.py). The saver merges
+# under the settings lock, so the module's write-backs (connection
+# test results) can't race a UI settings save, and masked credential
+# values never round-trip through it.
+# ---------------------------------------------------------------------------
+
+def _pub_save_settings_patch(patch):
+    with _SETTINGS_LOCK:
+        s = load_settings()
+        s.update(patch or {})
+        save_settings(s)
+
+
+_PUB_BOUND = {"done": False}
+
+
+def _ensure_pub():
+    if not _PUB_BOUND["done"]:
+        publishing.bind_settings(load_settings, _pub_save_settings_patch)
+        _PUB_BOUND["done"] = True
+    publishing.ensure_worker()
 
 
 # ---------------------------------------------------------------------------
@@ -1188,6 +1245,18 @@ class Api:
         # WHETHER one is saved, never the key itself.
         s["fal_key_set"] = bool((s.get("fal_key") or "").strip())
         s.pop("fal_key", None)
+        # Publishing credentials get the same treatment: app secrets
+        # and account tokens are replaced by *_set flags, and account
+        # rows go out token-free with a has_token flag.
+        for key in ("pub_fb_app_secret", "pub_yt_client_secret",
+                    "pub_tt_client_secret", "pub_webhook_secret"):
+            s[key + "_set"] = bool(str(s.get(key) or "").strip())
+            s.pop(key, None)
+        s["pub_accounts"] = [
+            publishing.account_view(a, s)
+            for a in (s.get("pub_accounts") or [])
+            if isinstance(a, dict)]
+        s.pop("pub_account_status", None)
         if _SETTINGS_LOAD_WARNING["active"]:
             s["load_warning"] = (
                 "Your settings file couldn't be read (it may be "
@@ -1207,6 +1276,33 @@ class Api:
             # changing it can mean moving a 9 GB model, which a generic
             # settings save must never trigger - or silently bypass.
             settings.pop("data_dir", None)
+            # Publishing secrets never arrive from the UI masked (they
+            # are *_set flags there), and a wholesale save must not be
+            # able to wipe them; the dedicated pub_* endpoints own
+            # these keys. Account rows arriving token-free keep their
+            # stored token (matched by id).
+            for key in ("pub_fb_app_secret", "pub_yt_client_secret",
+                        "pub_tt_client_secret", "pub_webhook_secret",
+                        "pub_account_status"):
+                settings.pop(key, None)
+                settings.pop(key + "_set", None)
+            if "pub_accounts" in settings:
+                stored = {a.get("id"): a for a in
+                          (current.get("pub_accounts") or [])
+                          if isinstance(a, dict)}
+                merged_accounts = []
+                for a in settings.get("pub_accounts") or []:
+                    if not isinstance(a, dict):
+                        continue
+                    a = dict(a)
+                    a.pop("has_token", None)
+                    a.pop("last_test", None)
+                    a.pop("is_default", None)
+                    if not str(a.get("token") or "").strip():
+                        old = stored.get(a.get("id")) or {}
+                        a["token"] = old.get("token") or ""
+                    merged_accounts.append(a)
+                settings["pub_accounts"] = merged_accounts
             current.update(settings)
             save_settings(current)
         return {"ok": True}
@@ -2377,6 +2473,475 @@ class Api:
         _save_job(job_id)
         return {"ok": True, "package": _with_broll_credits(pkg),
                 "cached": False}
+
+    # -- Auto Publishing ------------------------------------------------
+    def _pub_render(self, job_id, render_index):
+        _load_library()
+        job = JOBS.get(job_id)
+        if not job:
+            return None, None, "Project not found."
+        renders = job.get("renders") or []
+        try:
+            idx = int(render_index)
+        except (TypeError, ValueError):
+            return None, None, "Bad clip index."
+        if not (0 <= idx < len(renders)):
+            return None, None, "Clip not found in this project."
+        return job, renders[idx], None
+
+    def _pub_package_for(self, job_id, render):
+        """The clip's posting package via the existing generator
+        (posting_package(): local-AI when ready, offline extractive
+        otherwise). Falls back to a title-only package when the moment
+        has no captions, so metadata generation never hard-fails."""
+        title = render.get("title") or "New clip"
+        mi = render.get("moment_index")
+        if mi is not None:
+            try:
+                res = self.posting_package(job_id, mi)
+            except Exception:  # noqa: BLE001
+                res = None
+            if res and res.get("ok") and res.get("package"):
+                return res["package"]
+        genre = load_settings().get("genre") or ""
+        tags = []
+        try:
+            cp = _load_corepack() or {}
+            tags = (cp.get("genre_hashtags") or {}).get(genre) or []
+        except Exception:  # noqa: BLE001
+            tags = []
+        return {"titles": [title], "description": "",
+                "hashtags": list(tags), "mode": "fallback"}
+
+    def _pub_platform_tag(self, job, render):
+        mi = render.get("moment_index")
+        moments = (job or {}).get("moments") or []
+        name = ""
+        if mi is not None and 0 <= mi < len(moments):
+            plat = moments[mi].get("platform") or {}
+            name = plat.get("name") if isinstance(plat, dict) \
+                else str(plat)
+        name = str(name or "").lower()
+        for key in publishing.PLATFORMS:
+            if key in name:
+                return key
+        if "short" in name:
+            return "youtube"
+        if "reel" in name:
+            return "facebook"
+        return ""
+
+    def _pub_build_item(self, job_id, render_index, platform,
+                        account_id, meta_override, scheduled_at,
+                        override, source, approval):
+        job, render, err = self._pub_render(job_id, render_index)
+        if err:
+            return None, err
+        path = render.get("path") or ""
+        settings = load_settings()
+        if not account_id:
+            account_id = publishing.default_account_id(platform,
+                                                       settings) or ""
+        if meta_override:
+            meta = {k: meta_override.get(k) for k in
+                    ("title", "description", "caption", "hashtags",
+                     "visibility") if k in meta_override}
+            meta.setdefault("visibility",
+                            settings.get("pub_default_visibility")
+                            or "public")
+        else:
+            pkg = self._pub_package_for(job_id, render)
+            vertical = True
+            try:
+                w, h, _f = probe_video(path)
+                vertical = bool(h > w > 0)
+            except Exception:  # noqa: BLE001
+                pass
+            meta = publishing.platform_metadata(
+                pkg, platform,
+                clip_title=render.get("title") or "",
+                vertical=vertical,
+                visibility=settings.get("pub_default_visibility")
+                or "public")
+        item = {"file_path": path,
+                "title": render.get("title")
+                or os.path.basename(path),
+                "clip_job_id": job_id, "render_index": render_index,
+                "thumb_url": self._enh_thumb(job_id, path),
+                "platform": platform, "account_id": account_id,
+                "metadata": meta, "scheduled_at": scheduled_at,
+                "override": bool(override), "source": source,
+                "approval": approval or ""}
+        return item, None
+
+    def _pub_auto_queue(self, job_id, indices):
+        """Auto-publish on render completion: when the master switch
+        is on and a default preset is chosen, queue each freshly
+        rendered clip for the preset's platforms. Best-effort by
+        design - a publishing hiccup must never fail a render batch.
+        Publishing never consumes clip credits (renders were counted
+        when they completed, above)."""
+        try:
+            _ensure_pub()
+            settings = load_settings()
+            if not settings.get("pub_enabled"):
+                return
+            preset = None
+            for p in settings.get("pub_presets") or []:
+                if p.get("id") == settings.get("pub_default_preset"):
+                    preset = p
+                    break
+            if not preset or not preset.get("platforms"):
+                return
+            delay = int(preset.get("delay_minutes") or 0)
+            scheduled = time.time() + delay * 60 if delay else None
+            for idx in indices:
+                for platform in preset["platforms"]:
+                    item, err = self._pub_build_item(
+                        job_id, idx, platform, "", None, scheduled,
+                        False, "auto", preset.get("approval") or "")
+                    if item:
+                        publishing.create_job(item)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def pub_state(self):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        settings = load_settings()
+        return {"ok": True,
+                "platforms": [publishing.connection_state(p)
+                              for p in publishing.PLATFORMS],
+                "config": {
+                    "enabled": bool(settings.get("pub_enabled")),
+                    "approval_mode": settings.get("pub_approval_mode")
+                    or "manual",
+                    "max_batch": settings.get("pub_max_batch") or 10,
+                    "daily_limit": settings.get("pub_daily_limit") or 0,
+                    "delay_s": settings.get("pub_delay_s") or 0,
+                    "default_preset": settings.get(
+                        "pub_default_preset") or "",
+                    "default_visibility": settings.get(
+                        "pub_default_visibility") or "public",
+                    "presets": settings.get("pub_presets") or [],
+                    "webhook_url": settings.get("pub_webhook_url")
+                    or "",
+                    "webhook_secret_set": bool(str(
+                        settings.get("pub_webhook_secret") or "")
+                        .strip()),
+                    "tt_audited": bool(settings.get("pub_tt_audited")),
+                    "pause_all": publishing.pause_all()},
+                "stats": publishing.admin_stats()}
+
+    def pub_save_app_creds(self, platform, fields):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        if platform not in publishing.PLATFORMS:
+            return {"ok": False, "error": "Unknown platform."}
+        fields = fields or {}
+        patch = {}
+        for key, _label, secret in \
+                publishing.APP_CRED_FIELDS[platform]:
+            if key not in fields:
+                continue
+            val = str(fields.get(key) or "")
+            if secret and not val.strip():
+                continue  # blank secret field = keep the saved one
+            patch[key] = val
+        base_key = publishing.BASE_KEYS[platform]
+        if base_key in fields:
+            patch[base_key] = str(fields.get(base_key) or "").strip()
+        if patch:
+            _pub_save_settings_patch(patch)
+        return self.pub_state()
+
+    def pub_save_account(self, platform, account):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        if platform not in publishing.PLATFORMS:
+            return {"ok": False, "error": "Unknown platform."}
+        account = account or {}
+        settings = load_settings()
+        accounts = [dict(a) for a in
+                    (settings.get("pub_accounts") or [])
+                    if isinstance(a, dict)]
+        aid = account.get("id") or ""
+        target = None
+        for a in accounts:
+            if a.get("id") == aid and a.get("platform") == platform:
+                target = a
+                break
+        if target is None:
+            target = {"id": uuid.uuid4().hex[:12],
+                      "platform": platform, "token": ""}
+            accounts.append(target)
+        target["label"] = str(account.get("label") or "")[:80]
+        target["external_id"] = str(
+            account.get("external_id") or "")[:120]
+        token = str(account.get("token") or "")
+        if token.strip():
+            target["token"] = token.strip()
+        _pub_save_settings_patch({"pub_accounts": accounts})
+        if account.get("make_default"):
+            self.pub_set_default_account(platform, target["id"])
+        return self.pub_state()
+
+    def pub_disconnect(self, platform, account_id):
+        """Disconnect = wipe the stored token (the account row stays
+        so it can be reconnected without re-typing the Page/ID)."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        settings = load_settings()
+        accounts = [dict(a) for a in
+                    (settings.get("pub_accounts") or [])
+                    if isinstance(a, dict)]
+        for a in accounts:
+            if a.get("id") == account_id:
+                a["token"] = ""
+        status = dict(settings.get("pub_account_status") or {})
+        status.pop(account_id, None)
+        _pub_save_settings_patch({"pub_accounts": accounts,
+                                  "pub_account_status": status})
+        return self.pub_state()
+
+    def pub_delete_account(self, platform, account_id):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        settings = load_settings()
+        accounts = [a for a in (settings.get("pub_accounts") or [])
+                    if isinstance(a, dict)
+                    and a.get("id") != account_id]
+        defaults = dict(settings.get("pub_default_accounts") or {})
+        if defaults.get(platform) == account_id:
+            defaults.pop(platform, None)
+        status = dict(settings.get("pub_account_status") or {})
+        status.pop(account_id, None)
+        _pub_save_settings_patch(
+            {"pub_accounts": accounts,
+             "pub_default_accounts": defaults,
+             "pub_account_status": status})
+        return self.pub_state()
+
+    def pub_set_default_account(self, platform, account_id):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        settings = load_settings()
+        defaults = dict(settings.get("pub_default_accounts") or {})
+        if account_id:
+            defaults[platform] = account_id
+        else:
+            defaults.pop(platform, None)
+        _pub_save_settings_patch({"pub_default_accounts": defaults})
+        return self.pub_state()
+
+    def pub_test_connection(self, platform, account_id=""):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        if platform not in publishing.PLATFORMS:
+            return {"ok": False, "error": "Unknown platform."}
+        if not account_id:
+            account_id = publishing.default_account_id(platform) or ""
+        result = publishing.test_connection(platform, account_id)
+        result["ok"] = bool(result.get("ok"))
+        return result
+
+    def pub_assistant(self, job_id, render_index):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        job, render, err = self._pub_render(job_id, render_index)
+        if err:
+            return {"ok": False, "error": err}
+        pkg = self._pub_package_for(job_id, render)
+        settings = load_settings()
+        vertical = True
+        try:
+            w, h, _f = probe_video(render.get("path") or "")
+            vertical = bool(h > w > 0)
+        except Exception:  # noqa: BLE001
+            pass
+        tag = self._pub_platform_tag(job, render)
+        variants = {p: publishing.platform_metadata(
+            pkg, p, clip_title=render.get("title") or "",
+            vertical=vertical,
+            visibility=settings.get("pub_default_visibility")
+            or "public") for p in publishing.PLATFORMS}
+        return {"ok": True, "variants": variants,
+                "assistant": publishing.assistant_options(
+                    pkg, platform_tag=tag, vertical=vertical),
+                "package_mode": pkg.get("mode") or "",
+                "per_platform_gates": {
+                    p: publishing.quality_gate(
+                        render.get("path") or "", p)[1]
+                    for p in publishing.PLATFORMS}}
+
+    def pub_create_jobs(self, items):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        items = items or []
+        settings = load_settings()
+        max_batch = int(settings.get("pub_max_batch") or 10)
+        if len(items) > max_batch:
+            return {"ok": False,
+                    "error": "That is %d jobs — the max uploads per "
+                             "batch is %d (Publishing settings)."
+                             % (len(items), max_batch)}
+        created, refused = [], []
+        for it in items:
+            item, err = self._pub_build_item(
+                it.get("job_id") or "", it.get("render_index"),
+                it.get("platform") or "", it.get("account_id") or "",
+                it.get("metadata"), it.get("scheduled_at"),
+                it.get("override"), it.get("source") or "manual",
+                it.get("approval") or "")
+            if err:
+                refused.append({"platform": it.get("platform"),
+                                "reason": err})
+                continue
+            job, reason = publishing.create_job(item)
+            if job:
+                created.append(job)
+            else:
+                refused.append({"platform": it.get("platform"),
+                                "title": item.get("title"),
+                                "reason": reason})
+        return {"ok": True, "created": created, "refused": refused}
+
+    def pub_projects(self):
+        """Projects with renders, for the Publishing view's picker."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        _load_library()
+        out = []
+        for jid, j in JOBS.items():
+            renders = j.get("renders") or []
+            if not renders:
+                continue
+            rows = []
+            for i, r in enumerate(renders):
+                p = r.get("path") or ""
+                if not p or not os.path.isfile(p):
+                    continue
+                rows.append({"idx": i,
+                             "title": r.get("title")
+                             or os.path.basename(p),
+                             "thumb_url": self._enh_thumb(jid, p),
+                             "platform": self._pub_platform_tag(j, r)})
+            if rows:
+                out.append({"job_id": jid,
+                            "title": j.get("title") or jid,
+                            "renders": rows})
+        out.sort(key=lambda x: x["title"].lower())
+        return {"ok": True, "projects": out}
+
+    def pub_jobs(self, platform="", status=""):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        return {"ok": True,
+                "jobs": publishing.list_jobs(platform or "",
+                                             status or ""),
+                "pause_all": publishing.pause_all()}
+
+    def pub_set_pause_all(self, paused):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        publishing.set_pause_all(bool(paused))
+        return {"ok": True, "pause_all": publishing.pause_all()}
+
+    def pub_job_action(self, pub_job_id, action):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        out = publishing.job_action(pub_job_id, action)
+        if isinstance(out, str):
+            return {"ok": False, "error": out}
+        return {"ok": True, "job": out}
+
+    def pub_save_config(self, config):
+        gate = _license_gate()
+        if gate:
+            return gate
+        _ensure_pub()
+        config = config or {}
+        patch = {}
+        if "enabled" in config:
+            patch["pub_enabled"] = bool(config["enabled"])
+        if config.get("approval_mode") in ("manual", "auto"):
+            patch["pub_approval_mode"] = config["approval_mode"]
+        if "max_batch" in config:
+            patch["pub_max_batch"] = max(
+                1, min(100, int(config["max_batch"] or 10)))
+        if "daily_limit" in config:
+            patch["pub_daily_limit"] = max(
+                0, min(10000, int(config["daily_limit"] or 0)))
+        if "delay_s" in config:
+            patch["pub_delay_s"] = max(
+                0, min(3600, int(config["delay_s"] or 0)))
+        if "default_preset" in config:
+            patch["pub_default_preset"] = str(
+                config["default_preset"] or "")
+        if config.get("default_visibility") in ("public", "unlisted",
+                                                "private"):
+            patch["pub_default_visibility"] = \
+                config["default_visibility"]
+        if "tt_audited" in config:
+            patch["pub_tt_audited"] = bool(config["tt_audited"])
+        if "webhook_url" in config:
+            url = str(config["webhook_url"] or "").strip()
+            patch["pub_webhook_url"] = url if url.startswith(
+                ("http://", "https://")) else ""
+        if "webhook_secret" in config:
+            patch["pub_webhook_secret"] = str(
+                config["webhook_secret"] or "")
+        if "presets" in config:
+            presets = []
+            for p in config.get("presets") or []:
+                if not isinstance(p, dict):
+                    continue
+                presets.append({
+                    "id": str(p.get("id")
+                              or uuid.uuid4().hex[:12]),
+                    "name": str(p.get("name") or "Preset")[:60],
+                    "platforms": [x for x in
+                                  (p.get("platforms") or [])
+                                  if x in publishing.PLATFORMS],
+                    "approval": p.get("approval")
+                    if p.get("approval") in ("manual", "auto")
+                    else "manual",
+                    "visibility": p.get("visibility")
+                    if p.get("visibility") in
+                    ("public", "unlisted", "private") else "public",
+                    "delay_minutes": max(
+                        0, min(10080,
+                               int(p.get("delay_minutes") or 0)))})
+            patch["pub_presets"] = presets
+        if patch:
+            _pub_save_settings_patch(patch)
+        return self.pub_state()
 
     # -- Cover Maker ---------------------------------------------------
     def make_cover(self, job_id, render_index, text=""):
@@ -3987,6 +4552,7 @@ class Api:
         made = 0
         limit_hit = False
         tamper_hit = False
+        fresh_pub = []  # render indices this batch made (auto-publish)
         try:
             for n, i in enumerate(indices):
                 u0 = _usage_status()
@@ -4093,6 +4659,14 @@ class Api:
                 job["stage"] = f"Done - {len(renders)} clips rendered"
                 job["progress"] = 100
                 job.pop("render_error", None)
+                # Auto Publishing hook point: only a clean full-batch
+                # completion queues the clips this batch just made
+                # (the last `made` render records). Runs after
+                # _save_job below; publishing never touches the usage
+                # counter - these renders were already counted above.
+                if made:
+                    fresh_pub = list(range(len(renders) - made,
+                                           len(renders)))
                 # A batch that lands exactly on the cap is a full
                 # success - but say the key is now used up, so the
                 # next refusal is never a surprise.
@@ -4112,6 +4686,8 @@ class Api:
             # keep any clips that finished before the failure
             job["renders"] = renders
         _save_job(job_id)
+        if fresh_pub:
+            self._pub_auto_queue(job_id, fresh_pub)
 
     # -- caption exports (SRT/VTT), ZIP, XML timeline, previews -----------
     def _render_words(self, job, render_idx):
@@ -5057,7 +5633,8 @@ def _admin_stats_payload():
             "storage": storage,
             "license": license_panel,
             "system": admin.system_info(disk_path=_work_root()),
-            "providers": admin.provider_summaries(entries)}
+            "providers": admin.provider_summaries(entries),
+            "publishing": publishing.admin_stats()}
 
 
 _MAX_API_BODY = 16 * 1024 * 1024  # no endpoint takes a bigger body
@@ -5092,6 +5669,7 @@ def _post_origin_ok(environ):
 
 
 def make_wsgi_app(api):
+    _ensure_pub()  # bind publishing settings + start its worker
     ui_dir = os.path.abspath(os.path.join(BASE_DIR, "ui"))
 
     def app(environ, start_response):
@@ -5286,6 +5864,23 @@ def make_wsgi_app(api):
                               "failures": [e for e in entries
                                            if e.get("status")
                                            != "ok"][:50]})
+            if method == "POST" and path == "/api/admin/pub-pause":
+                # Owner-session-gated like every /api/admin/* route:
+                # the Publishing pause-all kill switch.
+                try:
+                    length = int(environ.get("CONTENT_LENGTH") or 0)
+                except (TypeError, ValueError):
+                    length = 0
+                raw = (environ["wsgi.input"].read(
+                    min(length, 65536)) if length > 0 else b"{}")
+                try:
+                    data = json.loads(raw or b"{}")
+                except Exception:  # noqa: BLE001
+                    data = {}
+                publishing.set_pause_all(bool(data.get("paused")))
+                return _json("200 OK",
+                             {"ok": True,
+                              "publishing": publishing.admin_stats()})
             return _json("404 Not Found",
                          {"ok": False, "error": "unknown admin route"})
 

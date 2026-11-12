@@ -44,6 +44,7 @@ const TOOL_VIEWS = {
   generator: "generatorView", titles: "titlesView", script: "scriptView",
   transcript: "transcriptView", enhancer: "enhancerView",
   hookmaker: "hookmakerView", aimanager: "aiManagerView",
+  publishing: "publishingView",
   admin: "adminView",
 };
 
@@ -56,6 +57,7 @@ const VIEW_TITLES = {
   transcript: "Transcript Tool", enhancer: "Video Enhancer",
   hookmaker: "Hook Maker", captionstudio: "Caption Studio",
   aimanager: "AI Engine", admin: "Admin Panel",
+  publishing: "Publishing",
 };
 function syncSidebar(view) {
   document.querySelectorAll(".side-item").forEach((b) =>
@@ -1491,6 +1493,7 @@ function renderRenders(renders) {
         <button class="ghost-btn small srtBtn" data-i="${i}">SRT</button>
         <button class="ghost-btn small vttBtn" data-i="${i}">VTT</button>
         <button class="ghost-btn small enhCardBtn" data-i="${i}">Enhance</button>
+        <button class="ghost-btn small pubCardBtn" data-i="${i}">📤 Publish</button>
       </div>
       <div class="trim-row">
         <input type="text" class="trim-s" data-i="${i}" inputmode="decimal" placeholder="Start s" title="Trim start (seconds)">
@@ -1566,6 +1569,9 @@ function renderRenders(renders) {
       if (res.ok) { toast("Scheduled ✓"); refreshPlanner(); }
       else toast(res.error || "Schedule failed", true);
     }));
+  box.querySelectorAll(".pubCardBtn").forEach((btn) =>
+    btn.addEventListener("click", () =>
+      openPublishFor(jobId, parseInt(btn.dataset.i, 10))));
   renderRenders._list = renders;
   refreshPlanner();
   refreshEnhancePanel();
@@ -2370,6 +2376,7 @@ function closeStudioViews() {
   stopEnhancerPoll();
   stopHookPoll();
   stopAiPoll();
+  stopPubPoll();
   const sb = $("studioBtn");
   if (sb) sb.classList.remove("on");
 }
@@ -2392,6 +2399,7 @@ function showHub() {
   stopEnhancerPoll();
   stopHookPoll();
   stopAiPoll();
+  stopPubPoll();
   stopPoll();
   hubOpen = true;
   hide($("step1")); hide($("step2")); hide($("step3"));
@@ -2423,6 +2431,7 @@ function showTool(name) {
   stopEnhancerPoll();
   stopHookPoll();
   stopAiPoll();
+  stopPubPoll();
   toolOpen = name;
   hide($("step1")); hide($("step2")); hide($("step3"));
   show($(TOOL_VIEWS[name]));
@@ -2440,6 +2449,7 @@ function showTool(name) {
     });
   }
   else if (name === "aimanager") initAiManager();
+  else if (name === "publishing") initPublishing();
   else if (name === "admin") initAdmin();
   syncSidebar(name);
 }
@@ -2799,6 +2809,7 @@ $("navScriptBtn").addEventListener("click", () => showTool("script"));
 $("navTranscriptBtn").addEventListener("click", () => showTool("transcript"));
 $("navEnhBtn").addEventListener("click", () => showTool("enhancer"));
 $("navAiBtn").addEventListener("click", () => showTool("aimanager"));
+$("navPubBtn").addEventListener("click", () => showTool("publishing"));
 $("navAdminBtn").addEventListener("click", () => openAdmin());
 $("sideAiCard").addEventListener("click", () => showTool("aimanager"));
 $("homeSeeAllBtn").addEventListener("click", showLibrary);
@@ -3479,6 +3490,9 @@ function stopEnhPoll() {
 
 $("enhAllBtn").addEventListener("click", () =>
   startEnhanceBatch([...enhChecked].sort((a, b) => a - b)));
+$("enhPubBtn").addEventListener("click", () => {
+  if (jobId) openPublishFor(jobId, null);
+});
 $("enhPauseBtn").addEventListener("click", async () => {
   if (!enhBatchId) return;
   const st = await api.enhance_batch_status(enhBatchId);
@@ -4199,6 +4213,535 @@ $("themeQuickBtn").addEventListener("click", async () => {
   try { await api.save_settings({ theme: settings.theme }); } catch (e) { /* offline */ }
 });
 
+/* ---------------- Publishing ----------------
+   Social Accounts + publish queue over publishing.py. Credentials
+   are write-only from here: the server never sends a token back, so
+   every secret field renders empty with a "saved" hint. */
+let pubState = null;
+let pubTimer = null;
+let pubProjectsCache = [];
+let pubMeta = {};
+let pubMetaTab = "facebook";
+let pubMetaClip = "";       // "jobId:idx" the loaded variants belong to
+let pubFocus = null;        // {jobId, renderIndex} from a Publish btn
+let adPubPaused = false;
+
+const PUB_LABELS = { facebook: "Facebook", instagram: "Instagram",
+                     youtube: "YouTube", tiktok: "TikTok" };
+const PUB_ID_HINT = { facebook: "Page ID", instagram: "Instagram user ID",
+                      youtube: "Channel name (label only)",
+                      tiktok: "TikTok open_id (label only)" };
+const PUB_TOKEN_HINT = {
+  facebook: "Page access token", instagram: "User access token",
+  youtube: "OAuth refresh token", tiktok: "Access token" };
+
+function stopPubPoll() {
+  if (pubTimer) { clearInterval(pubTimer); pubTimer = null; }
+}
+
+function openPublishFor(jid, renderIndex) {
+  pubFocus = { jobId: jid, renderIndex };
+  showTool("publishing");
+}
+
+async function initPublishing() {
+  await refreshPubState();
+  await refreshPubProjects();
+  await refreshPubJobs();
+  stopPubPoll();
+  pubTimer = setInterval(() => refreshPubJobs(true), 4000);
+}
+
+async function refreshPubState() {
+  let res;
+  try { res = await api.pub_state(); } catch (e) { return; }
+  if (!res || !res.ok) return;
+  pubState = res;
+  renderPubAccounts();
+  renderPubDestinations();
+  renderPubConfig();
+  renderPubPresets();
+  $("pubPausedBanner").classList.toggle("hidden", !res.config.pause_all);
+  $("pubPauseBtn").textContent = res.config.pause_all
+    ? "Resume all" : "Pause all";
+}
+
+function pubStateBadge(state) {
+  if (state === "connected") return '<span class="badge b-ok">Connected</span>';
+  if (state === "token_expired") return '<span class="badge b-bad">Token expired</span>';
+  if (state === "error") return '<span class="badge b-bad">Error</span>';
+  if (state === "not_connected") return '<span class="badge b-warn">Not connected</span>';
+  return '<span class="badge b-warn">Not configured</span>';
+}
+
+function renderPubAccounts() {
+  const box = $("pubAccounts");
+  box.innerHTML = "";
+  (pubState.platforms || []).forEach((p) => {
+    const card = document.createElement("div");
+    card.className = "find-box pub-acct";
+    const fields = (p.app_fields || []).map((f) => `
+      <label class="enh-opt">${escapeHtml(f.label)}${f.set ? ' <span class="hint">saved ✓</span>' : ""}
+        <input type="${f.secret ? "password" : "text"}" class="input pub-app-field" data-key="${escapeHtml(f.key)}" placeholder="${f.set ? "Saved — type to replace" : "Not set"}" spellcheck="false"></label>`).join("");
+    const accounts = (p.accounts || []).map((a) => `
+      <div class="pub-acct-row">
+        <span>${a.is_default ? "⭐ " : ""}<b>${escapeHtml(a.label || "Account")}</b>
+          <span class="hint">${escapeHtml(a.external_id || "")}</span>
+          ${a.has_token ? '<span class="badge b-ok">token saved</span>' : '<span class="badge b-warn">no token</span>'}
+          ${a.last_test && a.last_test.detail ? `<div class="hint">Last test: ${escapeHtml(a.last_test.detail)}</div>` : ""}
+        </span>
+        <span class="row row-tight">
+          <button type="button" class="ghost-btn small pub-test-btn" data-acct="${escapeHtml(a.id)}">Test connection</button>
+          <button type="button" class="ghost-btn small pub-default-btn" data-acct="${escapeHtml(a.id)}">Make default</button>
+          <button type="button" class="ghost-btn small pub-disconnect-btn" data-acct="${escapeHtml(a.id)}">Disconnect</button>
+          <button type="button" class="ghost-btn small pub-delete-btn" data-acct="${escapeHtml(a.id)}">Remove</button>
+        </span>
+      </div>`).join("");
+    card.innerHTML = `
+      <div class="row-between"><div class="field-label" style="margin:0">${escapeHtml(p.label)}</div>${pubStateBadge(p.state)}</div>
+      ${p.note ? `<p class="hint">⚠ ${escapeHtml(p.note)}</p>` : ""}
+      ${p.missing && p.missing.length ? `<p class="hint">Missing: ${escapeHtml(p.missing.join(", "))}.</p>` : ""}
+      <div class="row row-tight" style="margin-top:8px">${fields}
+        <label class="enh-opt">API base URL <span class="hint">— default ${escapeHtml(p.base)}</span>
+          <input type="text" class="input pub-base-field" placeholder="${escapeHtml(p.base)}" spellcheck="false"></label>
+        <button type="button" class="ghost-btn pub-save-creds">Save app credentials</button>
+      </div>
+      <div style="margin-top:10px">${accounts || '<p class="hint">No account saved yet.</p>'}</div>
+      <div class="row row-tight" style="margin-top:8px">
+        <label class="enh-opt">Label <input type="text" class="input pub-acct-label" placeholder="My page" style="max-width:150px"></label>
+        <label class="enh-opt">${escapeHtml(PUB_ID_HINT[p.platform])} <input type="text" class="input pub-acct-ext" spellcheck="false" style="max-width:170px"></label>
+        <label class="enh-opt">${escapeHtml(PUB_TOKEN_HINT[p.platform])} <input type="password" class="input pub-acct-token" spellcheck="false" style="max-width:200px"></label>
+        <button type="button" class="ghost-btn pub-add-acct">Add account</button>
+      </div>
+      <details style="margin-top:8px"><summary class="hint">How to connect ${escapeHtml(p.label)}</summary>
+        <ol class="hint">${(p.setup_steps || []).map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol></details>`;
+    card.querySelector(".pub-save-creds").addEventListener("click", async () => {
+      const out = {};
+      card.querySelectorAll(".pub-app-field").forEach((inp) => {
+        if (inp.value.trim()) out[inp.dataset.key] = inp.value.trim();
+      });
+      out.base = card.querySelector(".pub-base-field").value.trim();
+      const baseKey = { facebook: "pub_fb_base", instagram: "pub_fb_base",
+                        youtube: "pub_yt_base", tiktok: "pub_tt_base" }[p.platform];
+      const payload = Object.assign({}, out);
+      delete payload.base;
+      payload[baseKey] = out.base || "";
+      // base may legitimately be cleared back to the platform default
+      const res = await api.pub_save_app_creds(p.platform, payload);
+      if (res && res.ok) { pubState = res; renderPubAccounts(); renderPubDestinations(); renderPubConfig(); renderPubPresets(); toast(p.label + " credentials saved"); }
+      else toast("Save failed", true);
+    });
+    card.querySelector(".pub-add-acct").addEventListener("click", async () => {
+      const label = card.querySelector(".pub-acct-label").value.trim();
+      const ext = card.querySelector(".pub-acct-ext").value.trim();
+      const token = card.querySelector(".pub-acct-token").value.trim();
+      if (!token && !ext && !label) { toast("Fill in the account fields first", true); return; }
+      const res = await api.pub_save_account(p.platform,
+        { label, external_id: ext, token });
+      if (res && res.ok) { pubState = res; renderPubAccounts(); renderPubDestinations(); toast("Account saved"); }
+      else toast("Save failed", true);
+    });
+    card.querySelectorAll(".pub-test-btn").forEach((b) =>
+      b.addEventListener("click", async () => {
+        b.disabled = true; b.textContent = "Testing…";
+        const res = await api.pub_test_connection(p.platform, b.dataset.acct);
+        toast(res && res.ok ? ("Connected ✓ " + (res.detail || ""))
+          : ("Not connected: " + ((res && (res.error || res.detail)) || "unknown error")), !(res && res.ok));
+        await refreshPubState();
+      }));
+    card.querySelectorAll(".pub-default-btn").forEach((b) =>
+      b.addEventListener("click", async () => {
+        await api.pub_set_default_account(p.platform, b.dataset.acct);
+        await refreshPubState();
+      }));
+    card.querySelectorAll(".pub-disconnect-btn").forEach((b) =>
+      b.addEventListener("click", async () => {
+        await api.pub_disconnect(p.platform, b.dataset.acct);
+        await refreshPubState();
+        toast("Disconnected — token wiped");
+      }));
+    card.querySelectorAll(".pub-delete-btn").forEach((b) =>
+      b.addEventListener("click", async () => {
+        await api.pub_delete_account(p.platform, b.dataset.acct);
+        await refreshPubState();
+      }));
+    box.appendChild(card);
+  });
+}
+
+async function refreshPubProjects() {
+  let res;
+  try { res = await api.pub_projects(); } catch (e) { return; }
+  if (!res || !res.ok) return;
+  pubProjectsCache = res.projects || [];
+  const sel = $("pubProjectSel");
+  const keep = pubFocus ? pubFocus.jobId : sel.value;
+  sel.innerHTML = pubProjectsCache.map((p2) =>
+    `<option value="${escapeHtml(p2.job_id)}">${escapeHtml(p2.title)} (${p2.renders.length} clips)</option>`).join("");
+  if (keep && pubProjectsCache.some((p2) => p2.job_id === keep))
+    sel.value = keep;
+  renderPubClips();
+}
+
+function pubSelectedProject() {
+  const jid = $("pubProjectSel").value;
+  return pubProjectsCache.find((p2) => p2.job_id === jid) || null;
+}
+
+function renderPubClips() {
+  const box = $("pubClipList");
+  const proj = pubSelectedProject();
+  box.innerHTML = "";
+  if (!proj) {
+    box.innerHTML = '<p class="hint">No projects with rendered clips yet — render clips in Clip Maker first.</p>';
+    return;
+  }
+  proj.renders.forEach((r) => {
+    const row = document.createElement("label");
+    row.className = "pub-clip-row";
+    const checked = pubFocus && pubFocus.jobId === proj.job_id
+      && pubFocus.renderIndex != null
+      ? r.idx === pubFocus.renderIndex : true;
+    row.innerHTML = `
+      <input type="checkbox" class="pub-clip-chk" data-idx="${r.idx}" ${checked ? "checked" : ""}>
+      ${r.thumb_url ? `<img class="pub-thumb" src="${escapeHtml(r.thumb_url)}" alt="">` : ""}
+      <span>${escapeHtml(r.title)}</span>`;
+    box.appendChild(row);
+  });
+  if (pubFocus) pubFocus = null;
+}
+
+function renderPubDestinations() {
+  const box = $("pubDestList");
+  box.innerHTML = "";
+  (pubState.platforms || []).forEach((p) => {
+    if (!p.accounts || !p.accounts.length) {
+      const row = document.createElement("div");
+      row.className = "pub-dest-row";
+      row.innerHTML = `<label class="pub-check"><input type="checkbox" disabled> ${escapeHtml(p.label)} <span class="hint">— no account connected</span></label>`;
+      box.appendChild(row);
+      return;
+    }
+    p.accounts.forEach((a) => {
+      const row = document.createElement("div");
+      row.className = "pub-dest-row";
+      row.innerHTML = `<label class="pub-check"><input type="checkbox" class="pub-dest-chk" data-platform="${escapeHtml(p.platform)}" data-acct="${escapeHtml(a.id)}" ${a.is_default ? "checked" : ""}> ${escapeHtml(p.label)} — ${escapeHtml(a.label || a.external_id || "Account")}${a.has_token ? "" : ' <span class="hint">(no token — job will wait for connection)</span>'}</label>`;
+      box.appendChild(row);
+    });
+  });
+}
+
+function pubCollectMeta() {
+  pubMeta[pubMetaTab] = {
+    title: $("pubMetaTitle").value,
+    description: $("pubMetaDesc").value,
+    caption: $("pubMetaCaption").value,
+    hashtags: $("pubMetaTags").value.split(/[\s,]+/)
+      .map((t) => t.trim()).filter(Boolean)
+      .map((t) => (t.startsWith("#") ? t : "#" + t)),
+  };
+}
+
+function pubShowMetaTab(platform) {
+  pubCollectMeta();
+  pubMetaTab = platform;
+  document.querySelectorAll(".pub-tab").forEach((b) =>
+    b.classList.toggle("on", b.dataset.pubtab === platform));
+  const m = pubMeta[platform] || {};
+  $("pubMetaTitle").value = m.title || "";
+  $("pubMetaDesc").value = m.description || "";
+  $("pubMetaCaption").value = m.caption || "";
+  $("pubMetaTags").value = (m.hashtags || []).join(" ");
+  $("pubMetaTitleHint").textContent = platform === "youtube"
+    ? "— max 100 characters for Shorts/SEO" : "";
+}
+
+document.querySelectorAll(".pub-tab").forEach((b) =>
+  b.addEventListener("click", () => pubShowMetaTab(b.dataset.pubtab)));
+
+async function pubLoadAssistant() {
+  const proj = pubSelectedProject();
+  const first = document.querySelector(".pub-clip-chk:checked");
+  if (!proj || !first) { toast("Pick a project and tick a clip first", true); return; }
+  const idx = parseInt(first.dataset.idx, 10);
+  const res = await api.pub_assistant(proj.job_id, idx);
+  if (!res || !res.ok) { toast((res && res.error) || "Assistant failed", true); return; }
+  pubMetaClip = proj.job_id + ":" + idx;
+  Object.entries(res.variants || {}).forEach(([p, v]) => {
+    pubMeta[p] = { title: v.title || "", description: v.description || "",
+                   caption: v.caption || "", hashtags: v.hashtags || [] };
+  });
+  pubShowMetaTab(pubMetaTab);
+  const a = res.assistant || {};
+  $("pubAssistBox").classList.remove("hidden");
+  $("pubAssistNote").textContent = a.note || "";
+  const titles = $("pubAssistTitles");
+  titles.innerHTML = "";
+  (a.titles || []).forEach((t) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "ghost-btn small";
+    b.textContent = t;
+    b.addEventListener("click", () => { $("pubMetaTitle").value = t; pubCollectMeta(); });
+    titles.appendChild(b);
+  });
+  const caps = $("pubAssistCaptions");
+  caps.innerHTML = "";
+  (a.captions || []).forEach((c) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "ghost-btn small";
+    b.textContent = c.length > 90 ? c.slice(0, 90) + "…" : c;
+    b.addEventListener("click", () => {
+      if (pubMetaTab === "youtube") $("pubMetaDesc").value = c;
+      else $("pubMetaCaption").value = c;
+      pubCollectMeta();
+    });
+    caps.appendChild(b);
+  });
+  const slots = a.recommended_slots || {};
+  $("pubAssistRec").textContent =
+    "Suggested first platform: " + (PUB_LABELS[a.recommended_platform] || a.recommended_platform || "—")
+    + " · Suggested times — " + Object.entries(slots)
+      .map(([p, s]) => (PUB_LABELS[p] || p) + " " + s).join(" · ")
+    + " (suggestions only)";
+  const gates = res.per_platform_gates || {};
+  const g = gates[pubMetaTab] || [];
+  $("pubMetaGate").textContent = g.length
+    ? "⚠ This clip can't go to " + PUB_LABELS[pubMetaTab] + ": " + g.join(" ")
+    : "";
+  toast("Assistant loaded — variants differ per platform tab");
+}
+
+$("pubAssistBtn").addEventListener("click", pubLoadAssistant);
+$("pubProjectSel").addEventListener("change", renderPubClips);
+$("pubReloadProjectsBtn").addEventListener("click", refreshPubProjects);
+
+function pubSelectedPreset() {
+  const id = $("pubPresetSel").value;
+  if (!id || !pubState) return null;
+  return (pubState.config.presets || []).find((p) => p.id === id) || null;
+}
+
+async function pubCreateJobs(scheduled) {
+  pubCollectMeta();
+  const proj = pubSelectedProject();
+  if (!proj) { toast("Pick a project first", true); return; }
+  const clips = [...document.querySelectorAll(".pub-clip-chk:checked")]
+    .map((c) => parseInt(c.dataset.idx, 10));
+  const dests = [...document.querySelectorAll(".pub-dest-chk:checked")]
+    .map((c) => ({ platform: c.dataset.platform, account_id: c.dataset.acct }));
+  if (!clips.length) { toast("Tick at least one clip", true); return; }
+  if (!dests.length) { toast("Tick at least one destination", true); return; }
+  let scheduledAt = null;
+  if (scheduled) {
+    const v = $("pubWhenInput").value;
+    if (!v) { toast("Pick a date and time to schedule", true); return; }
+    scheduledAt = Math.floor(new Date(v).getTime() / 1000);
+    if (!(scheduledAt > Date.now() / 1000)) {
+      toast("That time is in the past", true); return;
+    }
+  }
+  const preset = pubSelectedPreset();
+  const items = [];
+  clips.forEach((idx, ci) => {
+    dests.forEach((d) => {
+      const item = { job_id: proj.job_id, render_index: idx,
+                     platform: d.platform, account_id: d.account_id,
+                     scheduled_at: scheduledAt,
+                     override: $("pubOverrideChk").checked,
+                     source: "manual",
+                     approval: preset ? preset.approval : "" };
+      // The hand-edited wording applies to the first clip; other
+      // clips get their own server-generated per-platform text.
+      if (ci === 0 && pubMetaClip === proj.job_id + ":" + idx
+          && pubMeta[d.platform]) {
+        item.metadata = Object.assign({}, pubMeta[d.platform],
+          { visibility: preset ? preset.visibility : undefined });
+        if (!item.metadata.visibility) delete item.metadata.visibility;
+      }
+      items.push(item);
+    });
+  });
+  const res = await api.pub_create_jobs(items);
+  if (!res || !res.ok) {
+    $("pubCreateMsg").textContent = (res && res.error) || "Queueing failed.";
+    return;
+  }
+  const parts = [];
+  if (res.created.length) parts.push(res.created.length + " job(s) queued.");
+  (res.refused || []).forEach((r) =>
+    parts.push("Skipped (" + (PUB_LABELS[r.platform] || r.platform || "") + "): " + r.reason));
+  $("pubCreateMsg").textContent = parts.join(" ");
+  toast(res.created.length ? "Queued " + res.created.length + " job(s)" : "Nothing queued — see reasons below", !res.created.length);
+  await refreshPubJobs();
+}
+
+$("pubNowBtn").addEventListener("click", () => pubCreateJobs(false));
+$("pubScheduleBtn").addEventListener("click", () => pubCreateJobs(true));
+
+const PUB_STATUS_BADGE = {
+  published: "b-ok", failed: "b-bad", uploading: "b-info",
+  publishing: "b-info", ready: "b-info", scheduled: "b-warn",
+  waiting: "b-warn", awaiting_approval: "b-warn",
+  awaiting_connection: "b-warn", paused: "b-warn", cancelled: "b-warn",
+};
+
+async function refreshPubJobs(quiet) {
+  let res;
+  try {
+    res = await api.pub_jobs($("pubFilterPlatform").value,
+                             $("pubFilterStatus").value);
+  } catch (e) { return; }
+  if (!res || !res.ok) return;
+  const box = $("pubJobsList");
+  box.innerHTML = "";
+  if (!res.jobs.length) {
+    box.innerHTML = '<p class="hint">No jobs match. Queue one above — or finish a render and hit Publish on the clip.</p>';
+    return;
+  }
+  res.jobs.forEach((j) => {
+    const row = document.createElement("div");
+    row.className = "pub-job-row";
+    const acts = [];
+    if (j.status === "awaiting_approval") acts.push(["approve", "Approve"]);
+    if (!["published", "failed", "cancelled"].includes(j.status)) acts.push(["pause", "Pause"]);
+    if (j.status === "paused") acts.push(["resume", "Resume"]);
+    if (["failed", "awaiting_connection", "cancelled"].includes(j.status)) acts.push(["retry", "Retry"]);
+    if (j.status !== "published") acts.push(["cancel", "Cancel"]);
+    row.innerHTML = `
+      ${j.thumb_url ? `<img class="pub-thumb" src="${escapeHtml(j.thumb_url)}" alt="">` : ""}
+      <div class="pub-job-main">
+        <div><b>${escapeHtml(j.title || "")}</b> <span class="badge ${PUB_STATUS_BADGE[j.status] || "b-warn"}">${escapeHtml(j.status.replace(/_/g, " "))}</span></div>
+        <div class="hint">${escapeHtml(PUB_LABELS[j.platform] || j.platform)} · ${escapeHtml(j.account_label || "")} · attempts ${j.attempts || 0}${j.scheduled_at ? " · scheduled " + escapeHtml(fmtWhen(j.scheduled_at)) : ""}</div>
+        ${j.published_url ? `<div><a href="${escapeHtml(j.published_url)}" target="_blank" rel="noopener">${escapeHtml(j.published_url)}</a></div>` : ""}
+        ${j.last_error ? `<div class="hint" style="color:var(--bad,#e66)">⚠ ${escapeHtml(j.last_error)}</div>` : ""}
+      </div>
+      <div class="row row-tight">${acts.map(([a, label]) =>
+        `<button type="button" class="ghost-btn small pub-job-act" data-act="${a}" data-id="${escapeHtml(j.id)}">${label}</button>`).join("")}</div>`;
+    box.appendChild(row);
+  });
+  box.querySelectorAll(".pub-job-act").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const r = await api.pub_job_action(b.dataset.id, b.dataset.act);
+      if (r && !r.ok) toast(r.error || "Action failed", true);
+      await refreshPubJobs();
+    }));
+  if (!quiet) { /* manual refresh also syncs the pause banner */ }
+}
+
+$("pubRefreshBtn").addEventListener("click", () => refreshPubJobs());
+$("pubFilterPlatform").addEventListener("change", () => refreshPubJobs());
+$("pubFilterStatus").addEventListener("change", () => refreshPubJobs());
+
+async function pubTogglePauseAll() {
+  const next = !(pubState && pubState.config.pause_all);
+  const res = await api.pub_set_pause_all(next);
+  if (res && res.ok) {
+    toast(next ? "Publishing paused" : "Publishing resumed");
+    await refreshPubState();
+  }
+}
+$("pubPauseBtn").addEventListener("click", pubTogglePauseAll);
+$("pubResumeAllBtn").addEventListener("click", pubTogglePauseAll);
+
+function renderPubConfig() {
+  const c = pubState.config;
+  $("pubEnabledChk").checked = !!c.enabled;
+  $("pubApprovalSel").value = c.approval_mode || "manual";
+  $("pubMaxBatchInput").value = c.max_batch ?? 10;
+  $("pubDailyLimitInput").value = c.daily_limit ?? 0;
+  $("pubDelayInput").value = c.delay_s ?? 0;
+  $("pubVisibilitySel").value = c.default_visibility || "public";
+  $("pubTtAuditedChk").checked = !!c.tt_audited;
+  $("pubWebhookUrl").value = c.webhook_url || "";
+  $("pubWebhookSecretState").textContent = c.webhook_secret_set
+    ? "— a secret is saved; type to replace" : "— none saved";
+}
+
+$("pubSaveConfigBtn").addEventListener("click", async () => {
+  const patch = {
+    enabled: $("pubEnabledChk").checked,
+    approval_mode: $("pubApprovalSel").value,
+    max_batch: parseInt($("pubMaxBatchInput").value, 10) || 10,
+    daily_limit: parseInt($("pubDailyLimitInput").value, 10) || 0,
+    delay_s: parseInt($("pubDelayInput").value, 10) || 0,
+    default_visibility: $("pubVisibilitySel").value,
+    tt_audited: $("pubTtAuditedChk").checked,
+    webhook_url: $("pubWebhookUrl").value.trim(),
+    default_preset: $("pubDefaultPresetSel").value,
+  };
+  const secret = $("pubWebhookSecret").value;
+  if (secret) patch.webhook_secret = secret;
+  const res = await api.pub_save_config(patch);
+  if (res && res.ok) {
+    pubState = res;
+    $("pubWebhookSecret").value = "";
+    renderPubAccounts(); renderPubDestinations(); renderPubConfig(); renderPubPresets();
+    toast("Publishing settings saved");
+  } else toast("Save failed", true);
+});
+
+function renderPubPresets() {
+  const presets = (pubState.config && pubState.config.presets) || [];
+  const mk = (sel, blankLabel) => {
+    const keep = sel.value;
+    sel.innerHTML = `<option value="">${blankLabel}</option>` + presets.map((p) =>
+      `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`).join("");
+    if (presets.some((p) => p.id === keep)) sel.value = keep;
+  };
+  mk($("pubPresetSel"), "No preset (use settings)");
+  mk($("pubDefaultPresetSel"), "None — no auto-publish");
+  if (pubState.config.default_preset)
+    $("pubDefaultPresetSel").value = pubState.config.default_preset;
+  const list = $("pubPresetList");
+  list.innerHTML = presets.length ? "" : '<p class="hint">No presets yet.</p>';
+  presets.forEach((p) => {
+    const row = document.createElement("div");
+    row.className = "pub-acct-row";
+    row.innerHTML = `<span><b>${escapeHtml(p.name)}</b> <span class="hint">${(p.platforms || []).map((x) => PUB_LABELS[x] || x).join(", ")} · ${escapeHtml(p.approval)} · ${escapeHtml(p.visibility)}${p.delay_minutes ? " · +" + p.delay_minutes + " min" : ""}</span></span>`;
+    const del = document.createElement("button");
+    del.type = "button"; del.className = "ghost-btn small"; del.textContent = "Delete";
+    del.addEventListener("click", async () => {
+      const left = presets.filter((x) => x.id !== p.id);
+      const res = await api.pub_save_config({ presets: left });
+      if (res && res.ok) { pubState = res; renderPubPresets(); }
+    });
+    row.appendChild(del);
+    list.appendChild(row);
+  });
+}
+
+$("pubPresetAddBtn").addEventListener("click", async () => {
+  const name = $("pubPresetName").value.trim();
+  if (!name) { toast("Name the preset first", true); return; }
+  const platforms = [...document.querySelectorAll(
+    "#pubPresetPlatforms input:checked")].map((c) => c.value);
+  if (!platforms.length) { toast("Tick at least one platform", true); return; }
+  const presets = [...((pubState.config && pubState.config.presets) || []),
+    { name, platforms, approval: $("pubPresetApproval").value,
+      visibility: "public",
+      delay_minutes: parseInt($("pubPresetDelay").value, 10) || 0 }];
+  const res = await api.pub_save_config({ presets });
+  if (res && res.ok) {
+    pubState = res;
+    $("pubPresetName").value = "";
+    renderPubPresets();
+    toast("Preset saved");
+  } else toast("Save failed", true);
+});
+
+/* Admin Panel — the Publishing pause-all kill switch (owner session
+   enforced server-side on /api/admin/*). */
+$("adPubPauseBtn").addEventListener("click", async () => {
+  const r = await adminFetch("/api/admin/pub-pause",
+    { method: "POST", body: JSON.stringify({ paused: !adPubPaused }) });
+  if (r.status === 200 && r.data && r.data.ok) {
+    toast(adPubPaused ? "Publishing resumed" : "All publishing paused");
+    refreshAdmin();
+  } else {
+    toast("Admin session ended — unlock again.", true);
+  }
+});
+
 /* ---------------- Admin Panel (owner only) ----------------
    The server is the gatekeeper: /api/admin/* answers 403 without
    a live server-side session, and only a license key carrying the
@@ -4414,6 +4957,29 @@ function renderAdminStats(d) {
       : String(lic.clips_remaining)],
     ["Usage record", usageStateTxt],
   ]);
+  const pub = d.publishing || {};
+  const pubByStatus = Object.entries(pub.by_status || {})
+    .map(([k, v]) => k + " " + v).join(" · ") || "—";
+  const pubByPlatform = Object.entries(pub.by_platform || {})
+    .map(([k, v]) => k + ": " + (v.published || 0) + "/"
+      + (v.total || 0) + " published").join(" · ") || "—";
+  $("adPubList").innerHTML = dlRows([
+    ["Total jobs", String(pub.total ?? 0)],
+    ["Published", String(pub.published ?? 0)],
+    ["Failed", String(pub.failed ?? 0)],
+    ["By status", pubByStatus],
+    ["By platform", pubByPlatform],
+    ["Worker", pub.pause_all ? "PAUSED (all publishing)"
+      : "Running"],
+    ["Completion outbox", String(pub.outbox ?? 0) + " events"],
+  ]);
+  adPubPaused = !!pub.pause_all;
+  $("adPubPauseBtn").textContent = adPubPaused
+    ? "Resume all publishing" : "Pause all publishing";
+  $("adPubErrors").innerHTML = (pub.recent_errors || []).length
+    ? (pub.recent_errors || []).map((e) =>
+      `<div class="prov-row"><span class="prov-name">${escapeHtml(e.platform || "")} — ${escapeHtml(e.title || "")}</span><span class="prov-note">${escapeHtml(e.error || "")}</span></div>`).join("")
+    : '<p class="hint">No publishing errors recorded.</p>';
   const ram = (sys.ram_total
     ? fmtBytes(sys.ram_free || 0) + " free of "
       + fmtBytes(sys.ram_total) : "—");

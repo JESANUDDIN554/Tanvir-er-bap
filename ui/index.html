@@ -51,6 +51,8 @@
     <button id="navStudioBtn" class="side-item" data-nav="captionstudio" title="Caption Studio — style a clip's captions"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="3"/><path d="M6.5 10h7M6.5 14h11"/></svg><span>Caption Studio</span></button>
     <div class="side-label">Library</div>
     <button id="libraryBtn" class="side-item" data-nav="library" title="Library — your saved videos"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg><span>Library</span></button>
+    <div class="side-label">Distribute</div>
+    <button id="navPubBtn" class="side-item" data-nav="publishing" title="Publishing — post clips to Facebook, Instagram, YouTube and TikTok"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V6"/><path d="M5.5 11.5L12 5l6.5 6.5"/><path d="M4 21h16"/></svg><span>Publishing</span></button>
     <div class="side-label">Tools</div>
     <button id="navTitlesBtn" class="side-item" data-nav="titles" title="Title &amp; Hook Generator"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 7V4.5h14V7M12 4.5V20M9 20h6"/></svg><span>Titles &amp; Hooks</span></button>
     <button id="navScriptBtn" class="side-item" data-nav="script" title="AI Scriptwriter"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.6 3.6a2.1 2.1 0 0 1 3 3L8 18.2l-4.2 1.1L4.9 15z"/></svg><span>Scriptwriter</span></button>
@@ -129,6 +131,12 @@
         <span class="tool-name">Hook Maker</span>
         <span class="tool-desc">For videos with a slow start: finds the most gripping moment, writes hook lines from the transcript, and builds a ready-to-post hook clip.</span>
         <span class="badge-row"><span class="badge badge-new">New</span><span class="badge badge-off">Offline</span></span>
+      </button>
+      <button type="button" class="tool-card" data-tool="publishing" data-name="publishing publish post social facebook instagram youtube tiktok schedule queue auto upload">
+        <span class="tool-emoji">📤</span>
+        <span class="tool-name">Publishing</span>
+        <span class="tool-desc">Post finished clips straight to your social pages — pick destinations, approve, schedule and track every upload in one queue.</span>
+        <span class="badge-row"><span class="badge badge-new">New</span></span>
       </button>
     </div>
 
@@ -601,6 +609,7 @@
         <button id="enhPauseBtn" class="ghost-btn hidden">Pause queue</button>
         <button id="enhDlAllBtn" class="ghost-btn">Download All Clips</button>
         <button id="enhZipBtn" class="ghost-btn hidden">Download All Enhanced (ZIP)</button>
+        <button id="enhPubBtn" class="ghost-btn">Publish clips…</button>
       </div>
     </div>
 
@@ -644,6 +653,171 @@
       <div class="empty-sub">Import a video and it will live here permanently.</div>
     </div>
     <div id="libraryGrid" class="library-grid"></div>
+  </section>
+
+  <!-- ============ PUBLISHING ============ -->
+  <section id="publishingView" class="card step-card hidden">
+    <div class="card-kicker">Publishing</div>
+    <div class="row-between">
+      <h2>Publishing</h2>
+      <button class="tool-back ghost-btn">← Back to studio</button>
+    </div>
+    <p class="sub">Post finished clips to Facebook, Instagram, YouTube and TikTok through each platform's official API. Nothing is ever posted without a connected account — jobs wait honestly in the queue until a real upload succeeds.</p>
+    <div id="pubPausedBanner" class="enh-done hidden">⏸ Publishing is paused — the queue will not start new uploads. <button id="pubResumeAllBtn" class="ghost-btn small" type="button">Resume publishing</button></div>
+
+    <div class="field" style="margin-top:14px">
+      <div class="field-label">Social Accounts <span class="hint">— credentials are saved only on this PC and are never shown again after saving</span></div>
+      <div id="pubAccounts" class="pub-accounts"></div>
+    </div>
+
+    <div class="field" style="margin-top:18px">
+      <div class="field-label">New publish job</div>
+      <div class="row row-tight">
+        <label class="enh-opt">Project
+          <select id="pubProjectSel" class="select"></select></label>
+        <button id="pubReloadProjectsBtn" class="ghost-btn" type="button">Reload</button>
+      </div>
+      <div id="pubClipList" class="pub-clip-list"></div>
+      <div class="field-label" style="margin-top:12px">Destinations</div>
+      <div id="pubDestList" class="pub-dest-list"></div>
+      <div class="field-label" style="margin-top:12px">Text for the post <span class="hint">— switch platform tabs; each platform keeps its own wording</span></div>
+      <div class="row row-tight" id="pubMetaTabs">
+        <button type="button" class="ghost-btn small pub-tab on" data-pubtab="facebook">Facebook</button>
+        <button type="button" class="ghost-btn small pub-tab" data-pubtab="instagram">Instagram</button>
+        <button type="button" class="ghost-btn small pub-tab" data-pubtab="youtube">YouTube</button>
+        <button type="button" class="ghost-btn small pub-tab" data-pubtab="tiktok">TikTok</button>
+        <button id="pubAssistBtn" class="ghost-btn small" type="button">✨ AI Publishing Assistant</button>
+      </div>
+      <div id="pubAssistBox" class="find-box hidden" style="margin-top:10px">
+        <div class="field-label">Assistant suggestions <span class="hint" id="pubAssistNote"></span></div>
+        <div class="field-label">Titles — click to use</div>
+        <div id="pubAssistTitles" class="pub-chip-wrap"></div>
+        <div class="field-label" style="margin-top:8px">Captions — click to use</div>
+        <div id="pubAssistCaptions" class="pub-chip-wrap"></div>
+        <p class="hint" id="pubAssistRec"></p>
+      </div>
+      <div class="field" style="margin-top:10px">
+        <label class="field-label" for="pubMetaTitle">Title <span class="hint" id="pubMetaTitleHint"></span></label>
+        <input id="pubMetaTitle" type="text" class="input" maxlength="200" placeholder="Post title">
+      </div>
+      <div class="field">
+        <label class="field-label" for="pubMetaDesc">Description</label>
+        <textarea id="pubMetaDesc" class="input" rows="3" placeholder="Description"></textarea>
+      </div>
+      <div class="field">
+        <label class="field-label" for="pubMetaCaption">Caption</label>
+        <textarea id="pubMetaCaption" class="input" rows="3" placeholder="Caption"></textarea>
+      </div>
+      <div class="field">
+        <label class="field-label" for="pubMetaTags">Hashtags <span class="hint">— space or comma separated</span></label>
+        <input id="pubMetaTags" type="text" class="input" placeholder="#bodycam #police">
+      </div>
+      <p class="hint" id="pubMetaGate"></p>
+      <div class="row row-tight" style="margin-top:10px">
+        <label class="enh-opt">Preset
+          <select id="pubPresetSel" class="select"><option value="">No preset (use settings)</option></select></label>
+        <label class="enh-opt">Schedule for
+          <input id="pubWhenInput" type="datetime-local" class="input"></label>
+        <label class="switch-row" for="pubOverrideChk"><span class="switch-text">Allow duplicates</span><span class="switch"><input type="checkbox" id="pubOverrideChk"><span class="track"><span class="thumb"></span></span></span></label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="pubNowBtn" class="primary" type="button">Queue — publish now</button>
+        <button id="pubScheduleBtn" class="ghost-btn" type="button">Queue — scheduled</button>
+      </div>
+      <p id="pubCreateMsg" class="hint"></p>
+    </div>
+
+    <div class="field" style="margin-top:18px">
+      <div class="row-between">
+        <div class="field-label">Publish queue</div>
+        <div class="row row-tight">
+          <select id="pubFilterPlatform" class="select">
+            <option value="">All platforms</option>
+            <option value="facebook">Facebook</option>
+            <option value="instagram">Instagram</option>
+            <option value="youtube">YouTube</option>
+            <option value="tiktok">TikTok</option>
+          </select>
+          <select id="pubFilterStatus" class="select">
+            <option value="">All statuses</option>
+            <option value="awaiting_approval">Awaiting approval</option>
+            <option value="scheduled">Scheduled</option>
+            <option value="ready">Ready</option>
+            <option value="waiting">Waiting (retry)</option>
+            <option value="uploading">Uploading</option>
+            <option value="publishing">Publishing</option>
+            <option value="awaiting_connection">Awaiting connection</option>
+            <option value="paused">Paused</option>
+            <option value="published">Published</option>
+            <option value="failed">Failed</option>
+            <option value="cancelled">Cancelled</option>
+          </select>
+          <button id="pubRefreshBtn" class="ghost-btn" type="button">Refresh</button>
+          <button id="pubPauseBtn" class="ghost-btn" type="button">Pause all</button>
+        </div>
+      </div>
+      <div id="pubJobsList" class="pub-jobs"></div>
+    </div>
+
+    <div class="field" style="margin-top:18px">
+      <div class="find-box">
+        <div class="field-label">Auto Upload Settings</div>
+        <label class="switch-row" for="pubEnabledChk"><span class="switch-text">Publishing worker on (uploads run in the background)</span><span class="switch"><input type="checkbox" id="pubEnabledChk"><span class="track"><span class="thumb"></span></span></span></label>
+        <div class="row row-tight" style="margin-top:10px">
+          <label class="enh-opt">Approval mode
+            <select id="pubApprovalSel" class="select">
+              <option value="manual">Manual — I approve each job</option>
+              <option value="auto">Fully automatic</option>
+            </select></label>
+          <label class="enh-opt">Max uploads per batch
+            <input id="pubMaxBatchInput" type="number" class="input" min="1" max="100" style="max-width:110px"></label>
+          <label class="enh-opt">Daily limit per account (0 = none)
+            <input id="pubDailyLimitInput" type="number" class="input" min="0" max="10000" style="max-width:110px"></label>
+          <label class="enh-opt">Delay between uploads (seconds)
+            <input id="pubDelayInput" type="number" class="input" min="0" max="3600" style="max-width:110px"></label>
+          <label class="enh-opt">Default visibility
+            <select id="pubVisibilitySel" class="select">
+              <option value="public">Public</option>
+              <option value="unlisted">Unlisted</option>
+              <option value="private">Private</option>
+            </select></label>
+        </div>
+        <label class="switch-row" for="pubTtAuditedChk" style="margin-top:10px"><span class="switch-text">My TikTok app is audited (posts can be public)</span><span class="switch"><input type="checkbox" id="pubTtAuditedChk"><span class="track"><span class="thumb"></span></span></span></label>
+        <div class="row row-tight" style="margin-top:10px">
+          <label class="enh-opt">Default preset (auto-publish after a render finishes)
+            <select id="pubDefaultPresetSel" class="select"><option value="">None — no auto-publish</option></select></label>
+        </div>
+        <div class="field" style="margin-top:10px">
+          <label class="field-label" for="pubWebhookUrl">Completion webhook URL <span class="hint">— optional; signed events are always kept in the local outbox, posted here only if set</span></label>
+          <input id="pubWebhookUrl" type="text" class="input" placeholder="https://…" spellcheck="false">
+        </div>
+        <div class="field">
+          <label class="field-label" for="pubWebhookSecret">Webhook secret <span class="hint" id="pubWebhookSecretState"></span></label>
+          <input id="pubWebhookSecret" type="password" class="input" placeholder="HMAC signing secret" spellcheck="false">
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button id="pubSaveConfigBtn" class="primary" type="button">Save publishing settings</button>
+        </div>
+        <div class="field-label" style="margin-top:16px">Presets <span class="hint">— a preset bundles platforms + approval for one-tap queueing and render auto-publish</span></div>
+        <div class="row row-tight">
+          <input id="pubPresetName" type="text" class="input" placeholder="Preset name" style="max-width:200px">
+          <span id="pubPresetPlatforms" class="pub-chip-wrap">
+            <label class="pub-check"><input type="checkbox" value="facebook"> Facebook</label>
+            <label class="pub-check"><input type="checkbox" value="instagram"> Instagram</label>
+            <label class="pub-check"><input type="checkbox" value="youtube"> YouTube</label>
+            <label class="pub-check"><input type="checkbox" value="tiktok"> TikTok</label>
+          </span>
+          <select id="pubPresetApproval" class="select">
+            <option value="manual">Manual approval</option>
+            <option value="auto">Auto-approve</option>
+          </select>
+          <label class="enh-opt">Delay (minutes)
+            <input id="pubPresetDelay" type="number" class="input" min="0" max="10080" value="0" style="max-width:100px"></label>
+          <button id="pubPresetAddBtn" class="ghost-btn" type="button">Add preset</button>
+        </div>
+        <div id="pubPresetList" class="pub-presets"></div>
+      </div>
+    </div>
   </section>
 
   <!-- ============ CAPTION REMOVER ============ -->
@@ -1128,6 +1302,18 @@
         <div class="field-label">License &amp; Limits</div>
         <dl class="admin-dl" id="adLimitsList"></dl>
         <p class="hint">The allowance is baked into the license key's signature at issue time — it can only be changed by issuing a new key. Counts are this PC's own record of completed clip renders under the active key.</p>
+      </div>
+    </div>
+
+    <div class="field" style="margin-top:18px">
+      <div class="find-box">
+        <div class="field-label">Publishing</div>
+        <dl class="admin-dl" id="adPubList"></dl>
+        <div class="row" style="margin-top:10px">
+          <button id="adPubPauseBtn" class="ghost-btn" type="button">Pause all publishing</button>
+        </div>
+        <div class="field-label" style="margin-top:12px">Recent publishing errors</div>
+        <div id="adPubErrors" class="admin-providers"></div>
       </div>
     </div>
 
