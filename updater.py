@@ -39,6 +39,7 @@ Apply order (nothing on disk changes until every check passes):
 """
 import ast
 import hashlib
+import itertools
 import json
 import os
 import shutil
@@ -50,6 +51,23 @@ import licensing
 
 OVERRIDE_NAME = "integrity_update.json"
 BACKUP_DIRNAME = "update_backup"
+_backup_seq = itertools.count()
+_KEEP_BACKUPS = 3
+
+
+def _prune_backups(base_dir, keep_dir):
+    """Keep the newest _KEEP_BACKUPS backup dirs (names sort
+    chronologically); older ones are removed. Best-effort."""
+    root = os.path.join(base_dir, BACKUP_DIRNAME)
+    try:
+        names = sorted(d for d in os.listdir(root)
+                       if os.path.isdir(os.path.join(root, d)))
+    except OSError:
+        return
+    keep = set(names[-_KEEP_BACKUPS:]) | {os.path.basename(keep_dir)}
+    for d in names:
+        if d not in keep:
+            shutil.rmtree(os.path.join(root, d), ignore_errors=True)
 _ALLOWED_PREFIXES = ("ui/", "fonts/")
 _ALLOWED_FILES = ("corepack.enc", "integrity.py")
 _RESERVED = ("update.json", "update.sig")
@@ -223,7 +241,15 @@ def apply_update_pack(zip_path, base_dir):
                 "app's integrity check, so it was not applied")
 
     # 5. Back up everything we are about to touch.
-    stamp = time.strftime("%Y%m%d-%H%M%S")
+    # The stamp has SECOND resolution and was used as-is: two
+    # packs applied within one second shared one backup dir, so a
+    # rollback could restore a MIX of two generations - and if the
+    # second apply failed midway, the first pack's clean backup
+    # was silently overwritten. A unique suffix keeps every
+    # pack's backup its own. Old backups are also pruned below
+    # (they used to accumulate forever).
+    stamp = time.strftime("%Y%m%d-%H%M%S") + \
+        "-%d-%04d" % (os.getpid(), next(_backup_seq))
     backup_dir = os.path.join(base_dir, BACKUP_DIRNAME, stamp)
     touched = list(payload)
     if new_override is not None:
@@ -282,5 +308,6 @@ def apply_update_pack(zip_path, base_dir):
             f"({bad}) - the update was rolled back and nothing "
             "changed. Update packs that change protected files "
             "must carry a signed integrity.py for the new files.")
+    _prune_backups(base_dir, backup_dir)
     return {"ok": True, "version": version,
             "files": sorted(payload), "backup": backup_dir}

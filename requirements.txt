@@ -7,3 +7,4 @@ yt-dlp>=2024.8.6
 requests>=2.32.0
 numpy>=1.26
 opencv-python>=4.8.0  # face-tracked 9:16 reframe (YuNet DNN, model bundled in models/)
+onnxruntime>=1.17  # pipeline.py imports it DIRECTLY (LaMa inpainting + PP-OCR text detection for the Caption Remover). It used to arrive only transitively via faster-whisper's VAD - an undeclared direct dependency: if faster-whisper ever drops it, the AI remover would have broken at runtime with no build error.
