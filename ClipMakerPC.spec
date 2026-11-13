@@ -54,6 +54,7 @@ a = Analysis(
         "admin",
         "usage",
         "publishing",
+        "ai_endpoint",
         "superadmin",
         "channels",
         "ai_components",

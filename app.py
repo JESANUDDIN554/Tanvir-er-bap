@@ -49,6 +49,7 @@ import publishing  # noqa: E402  (Auto Publishing: accounts/queue/scheduler)
 import channels  # noqa: E402  (Phase 2: YouTube Channel Monitor client)
 import superadmin  # noqa: E402  (opt-in Super Admin connection + SDK)
 import ai_components  # noqa: E402  (AI Installation Manager backend)
+import ai_endpoint  # noqa: E402  (FB Automation Built-in AI channel, contract v1.1)
 import licensing  # noqa: E402  (signed license + core pack + integrity)
 import updater  # noqa: E402  (signed file-replacement update packs)
 from pipeline import load_corepack as _load_corepack  # noqa: E402
@@ -679,6 +680,18 @@ def _ensure_pub():
         publishing.bind_settings(load_settings, _pub_save_settings_patch)
         _PUB_BOUND["done"] = True
     publishing.ensure_worker()
+
+
+_AI_EP_BOUND = {"done": False}
+
+
+def _ensure_ai_endpoint():
+    """Bind the Built-in AI channel's settings + lock check (once).
+    Inert until a request arrives: no thread, no socket of its own -
+    it rides the app's existing WSGI server (see ai_endpoint.py)."""
+    if not _AI_EP_BOUND["done"]:
+        ai_endpoint.bind_settings(load_settings, _license_locked)
+        _AI_EP_BOUND["done"] = True
 
 
 # ---------------------------------------------------------------------------
@@ -6558,6 +6571,7 @@ def _post_origin_ok(environ):
 
 def make_wsgi_app(api):
     _ensure_pub()  # bind publishing settings + start its worker
+    _ensure_ai_endpoint()  # bind the Built-in AI channel (no worker)
     ui_dir = os.path.abspath(os.path.join(BASE_DIR, "ui"))
 
     def app(environ, start_response):
@@ -6569,6 +6583,20 @@ def make_wsgi_app(api):
             return _wsgi_response(
                 start_response, "403 Forbidden", "application/json",
                 json.dumps({"ok": False, "error": "forbidden origin"}))
+
+        # --- FB Automation: Built-in AI channel (contract v1.1) ---
+        # POST /api/v1/clipper/builtin-ai/caption. The channel
+        # carries its own HMAC auth (the publishing webhook secret),
+        # so it is dispatched BEFORE the license gate: a locked copy
+        # still answers in contract shape (503 engine_unavailable)
+        # instead of the UI's locked blob, and never generates.
+        # Server-to-server calls send no Origin, which the guard
+        # above already passes; the server binds 127.0.0.1, so the
+        # channel is not LAN-exposed.
+        if method == "POST" and path == ai_endpoint.PATH:
+            status, payload = ai_endpoint.handle(environ)
+            return _wsgi_response(start_response, status,
+                                  "application/json", payload)
 
         # --- license gate: while locked, only the activation page
         # and the two license endpoints exist -------------------------
