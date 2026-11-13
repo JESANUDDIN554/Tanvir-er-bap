@@ -617,6 +617,560 @@ def _read_wav_mono16k(wav_path):
     return (audio.astype("float32") / 32768.0)
 
 
+def _wav_duration_s(wav_path):
+    """Duration of a WAV in seconds from its header alone, or None
+    when the header cannot be read (the caller then just runs the
+    whole-file path, which reports any real problem itself)."""
+    import wave
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            rate = wf.getframerate()
+            if not rate:
+                return None
+            return wf.getnframes() / float(rate)
+    except Exception:  # noqa: BLE001 - probe only
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Chunked transcription (P-1)
+#
+# The whole-file path below peaks at ~0.6 MB of RAM per second of
+# audio (multi-GB on multi-hour inputs) because faster-whisper's
+# feature extractor runs one STFT over the entire waveform and the
+# VAD materialises the whole audio several times over. The decode
+# itself is already windowed (30 s) inside the library.
+#
+# This path therefore changes only HOW the library's inputs are
+# materialised, never the decoding algorithm:
+#   * VAD probabilities are computed by driving Silero's ONNX session
+#     in the same 10 000-window batches the library uses, streamed
+#     from the extracted WAV, with the LSTM state and per-window
+#     context carried across batches - identical probabilities, then
+#     a verbatim copy of the library's segmentation state machine.
+#   * The log-mel features are produced lazily: a small array-like
+#     object computes each requested window's frames from the WAV on
+#     disk, reproducing the whole-file extractor exactly, including
+#     its global log floor (from a bounded streaming pre-pass).
+#   * Segments come from the library's own generate_segments() with
+#     the options WhisperModel.transcribe() builds for this call,
+#     and word timestamps are restored by the library's
+#     restore_speech_timestamps().
+# It engages only above _CHUNKED_THRESHOLD_S; below that, transcribe()
+# runs the original whole-file code untouched. A previous windowed
+# prototype that re-ran model.transcribe() per window diverged 5-6x
+# beyond the run-to-run noise envelope (fresh VAD, fresh prompt, a
+# re-anchored seek grid per window) and was rejected - see
+# qa-zero-bugs/f1/VERDICT.md. This design exists to avoid exactly
+# that: one whole-file VAD, one continuous decode.
+# ---------------------------------------------------------------------------
+
+_CHUNKED_THRESHOLD_S = 2700.0  # 45 min
+
+
+class _ChunkedUnsupported(Exception):
+    """The extracted WAV is not the 16 kHz mono shape _extract_wav
+    guarantees; transcribe() falls back to the whole-file path."""
+
+
+class _Wav16kReader:
+    """Random-access reader over the extracted 16 kHz mono WAV.
+
+    Sample values are produced with exactly the arithmetic
+    _read_wav_mono16k uses (int16 -> float32 / 32768), one bounded
+    block at a time, so nothing here scales with file duration."""
+
+    def __init__(self, wav_path):
+        import wave
+        self._wf = wave.open(wav_path, "rb")
+        if (self._wf.getframerate() != 16000
+                or self._wf.getnchannels() != 1
+                or self._wf.getsampwidth() != 2):
+            self._wf.close()
+            raise _ChunkedUnsupported(
+                "chunked path needs 16 kHz mono 16-bit WAV")
+        self.n_samples = self._wf.getnframes()
+
+    def close(self):
+        try:
+            self._wf.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def read(self, start, end):
+        """float32 samples [start, end) of the original timeline."""
+        import numpy as np
+        start = max(0, int(start))
+        end = min(self.n_samples, int(end))
+        if end <= start:
+            return np.zeros(0, dtype=np.float32)
+        self._wf.setpos(start)
+        raw = self._wf.readframes(end - start)
+        got = np.frombuffer(raw, dtype=np.int16)
+        return got.astype(np.float32) / 32768.0
+
+    def max_abs(self):
+        """max |sample| over the whole file, streamed - the digital-
+        silence test the whole-file path applies to the full array
+        (division by 2**15 is exact, so the comparison is identical)."""
+        import numpy as np
+        peak = 0
+        pos = 0
+        block = 16000 * 60
+        while pos < self.n_samples:
+            end = min(self.n_samples, pos + block)
+            self._wf.setpos(pos)
+            raw = self._wf.readframes(end - pos)
+            if raw:
+                vals = np.frombuffer(raw, dtype=np.int16).astype(np.int32)
+                peak = max(peak, int(np.abs(vals).max()))
+            pos = end
+        return peak / 32768.0
+
+
+def _streaming_speech_timestamps(reader):
+    """Silero VAD speech chunks for the whole file, computed by
+    streaming: the same list faster_whisper.vad.get_speech_timestamps
+    returns for the same audio. The probabilities come from the same
+    ONNX session, fed in the same 10 000-window batches with the
+    same LSTM state flow and context construction (including the
+    reference code's view-aliasing quirk: building the context zeroes
+    the final window's own last 64 samples before the run - that is
+    reproduced here for the global last window). The segmentation
+    state machine below is a verbatim copy of the library's."""
+    import numpy as np
+    from faster_whisper.vad import VadOptions, get_vad_model
+
+    vad_options = VadOptions()
+    sampling_rate = 16000
+    window_size_samples = 512
+    threshold = vad_options.threshold
+    neg_threshold = vad_options.neg_threshold
+    min_speech_duration_ms = vad_options.min_speech_duration_ms
+    max_speech_duration_s = vad_options.max_speech_duration_s
+    min_silence_duration_ms = vad_options.min_silence_duration_ms
+    speech_pad_ms = vad_options.speech_pad_ms
+    min_speech_samples = sampling_rate * min_speech_duration_ms / 1000
+    speech_pad_samples = sampling_rate * speech_pad_ms / 1000
+    max_speech_samples = (
+        sampling_rate * max_speech_duration_s
+        - window_size_samples
+        - 2 * speech_pad_samples
+    )
+    min_silence_samples = sampling_rate * min_silence_duration_ms / 1000
+    min_silence_samples_at_max_speech = sampling_rate * 98 / 1000
+
+    audio_length_samples = reader.n_samples
+    n_windows = -(-audio_length_samples // window_size_samples)
+    session = get_vad_model().session
+
+    speech_probs = np.zeros(n_windows, dtype=np.float32)
+    h = np.zeros((1, 1, 128), dtype="float32")
+    c = np.zeros((1, 1, 128), dtype="float32")
+    prev_tail = np.zeros(64, dtype=np.float32)
+    pos = 0
+    while pos < n_windows:
+        take = min(10000, n_windows - pos)
+        samples = np.zeros(take * window_size_samples, dtype=np.float32)
+        block = reader.read(
+            pos * window_size_samples,
+            min(audio_length_samples, (pos + take) * window_size_samples))
+        samples[:len(block)] = block
+        batched = samples.reshape(take, window_size_samples)
+        context = np.empty((take, 64), dtype=np.float32)
+        if take > 1:
+            context[1:] = batched[:-1, -64:]
+        context[0] = prev_tail if pos > 0 else 0.0
+        if pos + take == n_windows:
+            batched[-1, -64:] = 0.0  # the view-aliasing quirk, above
+        prev_tail = batched[-1, -64:].copy()
+        inp = np.concatenate([context, batched], axis=1)
+        out, h, c = session.run(None, {"input": inp, "h": h, "c": c})
+        speech_probs[pos:pos + take] = np.asarray(
+            out, dtype=np.float32).reshape(take)
+        pos += take
+
+    # --- get_speech_timestamps state machine, verbatim ---
+    if neg_threshold is None:
+        neg_threshold = max(threshold - 0.15, 0.01)
+
+    triggered = False
+    speeches = []
+    current_speech = {}
+    # to save potential segment end (and tolerate some silence)
+    temp_end = 0
+    # to save potential segment limits in case of maximum segment size reached
+    prev_end = next_start = 0
+
+    for i, speech_prob in enumerate(speech_probs):
+        if (speech_prob >= threshold) and temp_end:
+            temp_end = 0
+            if next_start < prev_end:
+                next_start = window_size_samples * i
+
+        if (speech_prob >= threshold) and not triggered:
+            triggered = True
+            current_speech["start"] = window_size_samples * i
+            continue
+
+        if (
+            triggered
+            and (window_size_samples * i) - current_speech["start"] > max_speech_samples
+        ):
+            if prev_end:
+                current_speech["end"] = prev_end
+                speeches.append(current_speech)
+                current_speech = {}
+                # previously reached silence (< neg_thres) and is still not speech (< thres)
+                if next_start < prev_end:
+                    triggered = False
+                else:
+                    current_speech["start"] = next_start
+                prev_end = next_start = temp_end = 0
+            else:
+                current_speech["end"] = window_size_samples * i
+                speeches.append(current_speech)
+                current_speech = {}
+                prev_end = next_start = temp_end = 0
+                triggered = False
+                continue
+
+        if (speech_prob < neg_threshold) and triggered:
+            if not temp_end:
+                temp_end = window_size_samples * i
+            # condition to avoid cutting in very short silence
+            if (window_size_samples * i) - temp_end > min_silence_samples_at_max_speech:
+                prev_end = temp_end
+            if (window_size_samples * i) - temp_end < min_silence_samples:
+                continue
+            else:
+                current_speech["end"] = temp_end
+                if (
+                    current_speech["end"] - current_speech["start"]
+                ) > min_speech_samples:
+                    speeches.append(current_speech)
+                current_speech = {}
+                prev_end = next_start = temp_end = 0
+                triggered = False
+                continue
+
+    if (
+        current_speech
+        and (audio_length_samples - current_speech["start"]) > min_speech_samples
+    ):
+        current_speech["end"] = audio_length_samples
+        speeches.append(current_speech)
+
+    for i, speech in enumerate(speeches):
+        if i == 0:
+            speech["start"] = int(max(0, speech["start"] - speech_pad_samples))
+        if i != len(speeches) - 1:
+            silence_duration = speeches[i + 1]["start"] - speech["end"]
+            if silence_duration < 2 * speech_pad_samples:
+                speech["end"] += int(silence_duration // 2)
+                speeches[i + 1]["start"] = int(
+                    max(0, speeches[i + 1]["start"] - silence_duration // 2)
+                )
+            else:
+                speech["end"] = int(
+                    min(audio_length_samples, speech["end"] + speech_pad_samples)
+                )
+                speeches[i + 1]["start"] = int(
+                    max(0, speeches[i + 1]["start"] - speech_pad_samples)
+                )
+        else:
+            speech["end"] = int(
+                min(audio_length_samples, speech["end"] + speech_pad_samples)
+            )
+
+    return speeches
+
+
+class _LazyFeatures:
+    """Array-like replacement for the whole-file log-mel matrix.
+
+    generate_segments() / detect_language() only read .shape and
+    slice [:, a:b] / [..., :b]; each slice is computed on demand from
+    the WAV behind the (possibly VAD-concatenated) timeline, so the
+    matrix itself - the whole-file path's multi-GB peak - never
+    exists. Frame values reproduce FeatureExtractor.__call__ exactly,
+    including the whole-file log floor (global max from a bounded
+    streaming pre-pass) and the boundary padding rules (the
+    extractor's trailing 160-sample zero pad, then the STFT's
+    reflect padding outside it)."""
+
+    _BLOCK_FRAMES = 15000  # mel pre-pass block: 150 s of frames
+
+    def __init__(self, extractor, reader, pieces):
+        import numpy as np
+        self._ex = extractor
+        self._reader = reader
+        self._pieces = pieces            # [(start, end)] original samples
+        self._starts = []                # concatenated offset per piece
+        acc = 0
+        for s, e in pieces:
+            self._starts.append(acc)
+            acc += e - s
+        self._total = acc                # len of the concatenated audio
+        self.shape = (extractor.mel_filters.shape[0],
+                      (self._total + 160) // 160)
+        self.dtype = np.float32
+        self.ndim = 2
+        self._global_log_max = self._compute_global_log_max()
+
+    def _a_read(self, g0, g1):
+        """Concatenated-timeline samples [g0, g1)."""
+        import bisect
+        import numpy as np
+        out = np.zeros(g1 - g0, dtype=np.float32)
+        i = bisect.bisect_right(self._starts, g0) - 1
+        pos = g0
+        while pos < g1 and 0 <= i < len(self._pieces):
+            s, e = self._pieces[i]
+            base = self._starts[i]
+            lo = max(pos, base)
+            hi = min(g1, base + (e - s))
+            if lo < hi:
+                out[lo - g0:hi - g0] = self._reader.read(
+                    s + (lo - base), s + (hi - base))
+                pos = hi
+            i += 1
+        return out
+
+    def _wp0(self, j0, j1):
+        """Samples of the extractor's padded waveform (concatenated
+        audio followed by 160 zeros) at padded indices [j0, j1), with
+        the STFT's reflect padding applied outside [0, total + 160).
+        Index-exact against the whole-file computation."""
+        import numpy as np
+        n = self._total
+        plen = n + 160
+        out = np.zeros(j1 - j0, dtype=np.float32)
+        lo, hi = max(j0, 0), min(j1, n)
+        if lo < hi:
+            out[lo - j0:hi - j0] = self._a_read(lo, hi)
+        lo, hi = j0, min(j1, 0)
+        if lo < hi:
+            # left reflect: padded index j < 0 reads wp0[-j]
+            src = -np.arange(lo, hi)
+            vals = np.zeros(hi - lo, dtype=np.float32)
+            m = src < n
+            if m.any():
+                s_lo, s_hi = int(src[m].min()), int(src[m].max())
+                vals[m] = self._a_read(s_lo, s_hi + 1)[src[m] - s_lo]
+            out[lo - j0:hi - j0] = vals
+        lo, hi = max(j0, plen), j1
+        if lo < hi:
+            # right reflect: padded index j >= plen reads wp0[2*plen-2-j]
+            src = 2 * plen - 2 - np.arange(lo, hi)
+            vals = np.zeros(hi - lo, dtype=np.float32)
+            m = src < n
+            if m.any():
+                s_lo, s_hi = int(src[m].min()), int(src[m].max())
+                vals[m] = self._a_read(s_lo, s_hi + 1)[src[m] - s_lo]
+            out[lo - j0:hi - j0] = vals
+        # [n, plen) is the extractor's zero pad: already zeros.
+        return out
+
+    def _raw_mel(self, a, b):
+        """Unfloored mel spectrogram for frames [a, b) - the values
+        FeatureExtractor.__call__ computes before its log floor."""
+        import numpy as np
+        from faster_whisper.feature_extractor import FeatureExtractor
+        seg = self._wp0(160 * a - 200, 160 * b + 200)
+        window = np.hanning(self._ex.n_fft + 1)[:-1].astype("float32")
+        stft = FeatureExtractor.stft(
+            seg, self._ex.n_fft, self._ex.hop_length,
+            window=window, center=False,
+            return_complex=True).astype("complex64")
+        magnitudes = np.abs(stft[..., :-1]) ** 2
+        return self._ex.mel_filters @ magnitudes
+
+    def _compute_global_log_max(self):
+        """The whole-file log_spec.max() the extractor's floor uses,
+        from a streaming pass over the concatenated timeline."""
+        import numpy as np
+        peak = 0.0
+        a = 0
+        while a < self.shape[1]:
+            b = min(self.shape[1], a + self._BLOCK_FRAMES)
+            mel = self._raw_mel(a, b)
+            if mel.size:
+                peak = max(peak, float(mel.max()))
+            a = b
+        return float(np.log10(max(peak, 1e-10)))
+
+    def _frames(self, a, b):
+        import numpy as np
+        mel = self._raw_mel(a, b)
+        log_spec = np.log10(np.clip(mel, a_min=1e-10, a_max=None))
+        log_spec = np.maximum(log_spec, self._global_log_max - 8.0)
+        return (log_spec + 4.0) / 4.0
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            row, col = key
+        else:
+            row, col = slice(None), key
+        if row is Ellipsis:
+            row = slice(None)
+        if not (isinstance(row, slice)
+                and row.start in (None, 0)
+                and row.stop in (None, self.shape[0])
+                and row.step in (None, 1)):
+            raise IndexError("lazy features: full-row slices only")
+        a, b, step = col.indices(self.shape[1])
+        if step != 1:
+            raise IndexError("lazy features: unit-step slices only")
+        return self._frames(a, max(a, b))
+
+
+def _collect_words(segments, audio_dur, progress_cb, pct):
+    """Segment -> word dicts: a mirror of the collector inside
+    transcribe() (same progress formula, same segment-level
+    fallback), used by the chunked path whose segments arrive on the
+    restored original timeline just like the whole-file path's."""
+    out = []
+    for seg in segments:
+        if progress_cb and audio_dur > 0:
+            p = 15 + int(min(seg.end, audio_dur) / audio_dur * 80)
+            if p > pct["last"]:
+                pct["last"] = p
+                progress_cb(p, "Transcribing audio")
+        if seg.words:
+            for w in seg.words:
+                out.append(
+                    {"start": float(w.start), "end": float(w.end),
+                     "word": w.word.strip()}
+                )
+        else:
+            tokens = seg.text.strip().split()
+            if not tokens:
+                continue
+            dur = (seg.end - seg.start) / len(tokens)
+            for j, tok in enumerate(tokens):
+                out.append({
+                    "start": seg.start + j * dur,
+                    "end": seg.start + (j + 1) * dur,
+                    "word": tok,
+                })
+    return out
+
+
+def _chunked_decode(model, reader, lang, progress_cb, pct, use_vad):
+    """One chunked decode attempt (VAD or not). Mirrors what
+    WhisperModel.transcribe() does with the arguments transcribe()
+    passes it: same tokenizer, same options, same language
+    detection, same timestamp restoration - only the feature matrix
+    is lazy."""
+    from faster_whisper.tokenizer import Tokenizer
+    from faster_whisper.transcribe import (
+        TranscriptionOptions,
+        get_suppressed_tokens,
+        restore_speech_timestamps,
+    )
+
+    if use_vad:
+        speech_chunks = _streaming_speech_timestamps(reader)
+        pieces = [(int(ch["start"]), int(ch["end"]))
+                  for ch in speech_chunks]
+    else:
+        speech_chunks = None
+        pieces = [(0, reader.n_samples)]
+    if sum(e - s for s, e in pieces) <= 0:
+        return []  # VAD kept nothing: no words, like the whole file
+    feats = _LazyFeatures(model.feature_extractor, reader, pieces)
+
+    language = lang
+    if language is None:
+        if not model.model.is_multilingual:
+            language = "en"
+        else:
+            language, _prob, _all = model.detect_language(
+                features=feats,
+                language_detection_segments=1,
+                language_detection_threshold=0.5)
+    tokenizer = Tokenizer(model.hf_tokenizer, model.model.is_multilingual,
+                          task="transcribe", language=language)
+    options = TranscriptionOptions(
+        beam_size=5,
+        best_of=5,
+        patience=1,
+        length_penalty=1,
+        repetition_penalty=1,
+        no_repeat_ngram_size=0,
+        log_prob_threshold=-1.0,
+        no_speech_threshold=0.6,
+        compression_ratio_threshold=2.4,
+        condition_on_previous_text=True,
+        prompt_reset_on_temperature=0.5,
+        temperatures=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        initial_prompt=None,
+        prefix=None,
+        suppress_blank=True,
+        suppress_tokens=get_suppressed_tokens(tokenizer, [-1]),
+        without_timestamps=False,
+        max_initial_timestamp=1.0,
+        word_timestamps=True,
+        prepend_punctuations="\"'“¿([{-",
+        append_punctuations="\"'.。,，!！?？:：”)]}、",
+        multilingual=False,
+        max_new_tokens=None,
+        clip_timestamps="0",
+        hallucination_silence_threshold=None,
+        hotwords=None,
+    )
+    segments = model.generate_segments(feats, tokenizer, options,
+                                       False, None)
+    if speech_chunks is not None:
+        segments = restore_speech_timestamps(segments, speech_chunks,
+                                             16000)
+    return _collect_words(segments, reader.n_samples / 16000.0,
+                          progress_cb, pct)
+
+
+def _transcribe_chunked(model, wav_path, lang, progress_cb):
+    """Bounded-memory transcription for long inputs. Mirrors
+    transcribe()'s observable behaviour: same progress messages,
+    same digital-silence rule, same VAD-then-no-VAD failure
+    semantics (partial words discarded), same word-bounding tail."""
+    if progress_cb:
+        progress_cb(15, "Transcribing audio")
+    reader = _Wav16kReader(wav_path)
+    try:
+        audio_dur = reader.n_samples / 16000.0
+        if reader.max_abs() < 1e-4:
+            if progress_cb:
+                progress_cb(100, "Transcription complete (0 words)")
+            return []
+        pct = {"last": 15}
+        try:
+            words = _chunked_decode(model, reader, lang, progress_cb,
+                                    pct, use_vad=True)
+        except Exception:
+            # Same contract as the whole-file path: retry once
+            # without VAD - the usual culprit - keeping the language.
+            if progress_cb:
+                progress_cb(pct["last"],
+                            "Transcribing audio (retrying without "
+                            "voice filtering)")
+            words = _chunked_decode(model, reader, lang, progress_cb,
+                                    pct, use_vad=False)
+        words = [w for w in words if w["word"]]
+        bounded = []
+        for w in words:
+            if w["start"] >= audio_dur:
+                continue
+            w["end"] = min(w["end"], audio_dur)
+            bounded.append(w)
+        if progress_cb:
+            progress_cb(100, f"Transcription complete "
+                             f"({len(bounded)} words)")
+        return bounded
+    finally:
+        reader.close()
+
+
 def _whisper_cache_dir(model_name):
     """The huggingface hub cache folder for the faster-whisper model,
     or None if it cannot be located."""
@@ -716,6 +1270,22 @@ def transcribe(video_path, model_name="base", progress_cb=None,
     os.close(wav_fd)
     try:
         _extract_wav(video_path, wav_path)
+        # P-1: past _CHUNKED_THRESHOLD_S the whole-file path's memory
+        # peaks in the multi-GB range, so long inputs take the
+        # bounded-memory chunked path (same library decode, lazily
+        # materialised inputs - see the P-1 section above). Anything
+        # unexpected about the WAV, or glue drift against a future
+        # faster-whisper's internals, falls back to the proven
+        # whole-file code below instead of failing the job.
+        if (_wav_duration_s(wav_path) or 0.0) > _CHUNKED_THRESHOLD_S:
+            try:
+                return _transcribe_chunked(
+                    model, wav_path,
+                    None if language in (None, "auto", "") else language,
+                    progress_cb)
+            except (_ChunkedUnsupported, AttributeError, TypeError,
+                    ImportError, IndexError, ValueError):
+                pass
         audio = _read_wav_mono16k(wav_path)
     finally:
         try:
