@@ -10,6 +10,7 @@ Built-in AI (a local model) - nothing is sent to any cloud service.
 import json
 import os
 import sys
+import shutil
 import threading
 import time
 import uuid
@@ -1411,6 +1412,114 @@ def _admin_log_gen(st):
         error=st.get("error"), kind="generation")
 
 
+
+# ---------------------------------------------------------------------------
+# Move-everything (Settings -> Storage): model + all projects to a
+# new drive in one operation. The model rides the existing verified
+# model move; project folders are moved entry by entry with
+# byte-based progress. The storage setting switches only when the
+# model phase succeeded; project entries that cannot move stay
+# behind (still visible - the app scans both work roots) and are
+# reported by count, never silently dropped.
+# ---------------------------------------------------------------------------
+_move_all_state = {"active": False, "pct": 0, "error": None,
+                   "done": False, "stage": "", "moved": 0,
+                   "skipped": 0, "target": ""}
+_move_all_lock = threading.Lock()
+_move_all_thread = None
+
+
+def _move_all_snapshot():
+    with _move_all_lock:
+        return dict(_move_all_state)
+
+
+def _set_move_all(**kw):
+    with _move_all_lock:
+        _move_all_state.update(kw)
+
+
+def _dir_bytes(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def _move_all_worker(ap, sources):
+    try:
+        # Phase 1: the AI model, via the verified model move.
+        _set_move_all(stage="Moving the AI model")
+        eff = local_ai.existing_model_path()
+        want = os.path.join(ap, "models", local_ai.active_model_file())
+        if eff and os.path.abspath(eff) != os.path.abspath(want):
+            done_ev = threading.Event()
+            result = {}
+
+            def _done(ok, err):
+                result["ok"] = ok
+                result["err"] = err
+                done_ev.set()
+
+            if not local_ai.start_model_move(ap, on_done=_done):
+                raise RuntimeError("the model move could not be "
+                                   "started")
+            while not done_ev.wait(timeout=1.0):
+                mv = local_ai.model_move_state()
+                _set_move_all(pct=int((mv.get("pct") or 0) * 0.5))
+            if not result.get("ok"):
+                raise RuntimeError("the model move failed (%s) - "
+                                   "nothing was switched"
+                                   % (result.get("err") or "unknown"))
+        # Phase 2: every existing project/clip folder.
+        _set_move_all(stage="Moving your projects and clips")
+        target_root = os.path.join(ap, "work")
+        os.makedirs(target_root, exist_ok=True)
+        entries = []
+        total = 0
+        for root in sources:
+            if not os.path.isdir(root):
+                continue
+            for name in sorted(os.listdir(root)):
+                src_p = os.path.join(root, name)
+                dst_p = os.path.join(target_root, name)
+                size = _dir_bytes(src_p) if os.path.isdir(src_p) \
+                    else os.path.getsize(src_p)
+                entries.append((src_p, dst_p, size))
+                total += size
+        moved = skipped = 0
+        done_bytes = 0
+        for src_p, dst_p, size in entries:
+            if os.path.exists(dst_p):
+                skipped += 1
+                done_bytes += size
+                continue
+            try:
+                shutil.move(src_p, dst_p)
+                moved += 1
+            except (OSError, shutil.Error):
+                skipped += 1
+            done_bytes += size
+            pct = 50 + int(50 * done_bytes / total) if total else 100
+            _set_move_all(pct=pct, moved=moved, skipped=skipped)
+        # Switch the storage location now the model phase is good.
+        local_ai.set_data_dir(ap)
+        with _SETTINGS_LOCK:
+            cur = load_settings()
+            cur["data_dir"] = ap
+            save_settings(cur)
+        _set_move_all(active=False, done=True, pct=100, error=None,
+                      moved=moved, skipped=skipped,
+                      stage="Everything now lives on the new drive")
+    except Exception as e:  # noqa: BLE001 - surfaced to the UI
+        _set_move_all(active=False, done=False,
+                      error=str(e)[:300], stage="Move stopped")
+
+
 class Api:
     # -- options -------------------------------------------------------
     def get_options(self):
@@ -1740,7 +1849,8 @@ class Api:
                 "model_ready": local_ai.model_ready(),
                 "work_root": _work_root(),
                 "legacy_work_root": os.path.join(BASE_DIR, "work"),
-                "move": local_ai.model_move_state()}
+                "move": local_ai.model_move_state(),
+                "move_all": _move_all_snapshot()}
 
     def set_data_dir(self, path):
         """Save the storage location. When a downloaded model sits
@@ -1804,6 +1914,69 @@ class Api:
             save_settings(s)
         return {"ok": True, "data_dir": ap,
                 "message": "Storage location saved."}
+
+    def move_all_to_drive(self, path):
+        """Settings -> Storage: move EVERYTHING to the chosen
+        folder/drive - the AI model plus all existing projects and
+        clips - in one background operation with progress. The
+        plain Save-location flow only moves the model and applies
+        to new projects; this one empties the old drive."""
+        gate = _license_gate()
+        if gate:
+            return gate
+        p = (path or "").strip().strip('"')
+        if not p:
+            return {"ok": False,
+                    "error": "Type the new location first (e.g. "
+                             "D:\\ItrajiData)."}
+        ap = os.path.abspath(p)
+        if ap == os.path.abspath(BASE_DIR):
+            return {"ok": False,
+                    "error": "That is the app's own folder - pick a "
+                             "different folder on the other drive."}
+        busy = _work_in_progress()
+        if busy:
+            return {"ok": False,
+                    "error": "Wait until %s finishes, then move."
+                             % " and ".join(busy)}
+        if local_ai.model_move_state().get("active"):
+            return {"ok": False,
+                    "error": "A model move is already running - "
+                             "wait for it to finish."}
+        if _move_all_snapshot().get("active"):
+            return {"ok": False,
+                    "error": "A move is already running."}
+        try:
+            os.makedirs(os.path.join(ap, "models"), exist_ok=True)
+            os.makedirs(os.path.join(ap, "work"), exist_ok=True)
+            probe = os.path.join(ap, "work", ".write-test")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+        except OSError as e:
+            return {"ok": False,
+                    "error": "That folder cannot be used: "
+                             + str(e)[:160]}
+        s = load_settings()
+        sources = list(_work_roots())
+        old_dd = (s.get("data_dir") or "").strip()
+        if old_dd:
+            old_root = os.path.join(os.path.abspath(old_dd), "work")
+            if old_root not in sources:
+                sources.append(old_root)
+        target_root = os.path.join(ap, "work")
+        sources = [r for r in sources
+                   if os.path.abspath(r) != os.path.abspath(target_root)]
+        global _move_all_thread
+        _set_move_all(active=True, pct=0, error=None, done=False,
+                      stage="Starting the move", moved=0, skipped=0,
+                      target=ap)
+        _move_all_thread = threading.Thread(
+            target=_move_all_worker, args=(ap, sources), daemon=True)
+        _move_all_thread.start()
+        return {"ok": True, "moving": True,
+                "message": "Moving everything to the new drive - "
+                           "keep the app open until it finishes."}
 
     # -- old-copy cleanup ----------------------------------------------
     def old_copies(self):

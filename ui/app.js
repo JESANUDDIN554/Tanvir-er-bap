@@ -4694,6 +4694,25 @@ async function refreshStorage() {
   if (!st || !st.ok) return;
   const state = $("storageState");
   if (!state) return;
+  const ma = st.move_all || {};
+  if (ma.active) {
+    state.textContent = "Moving everything to " + (ma.target || "the new drive")
+      + " — " + (ma.stage || "working") + " · " + (ma.pct || 0)
+      + "%… keep the app open.";
+    show($("storageMoveBarWrap"));
+    $("storageMoveBar").style.width = (ma.pct || 0) + "%";
+    if (!storageTimer)
+      storageTimer = setInterval(refreshStorage, 1200);
+    return;
+  }
+  if (ma.done) {
+    $("storageResult").textContent = "Move complete — "
+      + (ma.moved || 0) + " project(s) moved"
+      + (ma.skipped ? ", " + ma.skipped + " could not be moved and stayed behind (still in your Library)" : "")
+      + ". Everything now lives in " + (ma.target || "the new location") + ".";
+  } else if (ma.error) {
+    $("storageResult").textContent = "The move stopped: " + ma.error;
+  }
   const mv = st.move || {};
   if (mv.active) {
     state.textContent = "Moving the AI model to the new location — "
@@ -4718,6 +4737,25 @@ async function refreshStorage() {
   if (document.activeElement !== $("storageDirInput"))
     $("storageDirInput").value = st.data_dir || "";
 }
+
+$("storageMoveAllBtn").addEventListener("click", async () => {
+  const btn = $("storageMoveAllBtn");
+  const res = $("storageResult");
+  const dir = $("storageDirInput").value.trim();
+  if (!dir) { res.textContent = "Type the new location first (e.g. D:\\ItrajiData)."; return; }
+  if (!window.confirm("Move the AI model and ALL your projects/clips to " + dir + "? The app must stay open until it finishes.")) return;
+  btn.disabled = true;
+  res.textContent = "Starting the move…";
+  try {
+    const r = await api.move_all_to_drive(dir);
+    if (!r.ok) throw new Error(r.error || "could not start the move");
+    res.textContent = r.message || "Moving…";
+    refreshStorage();
+  } catch (e) {
+    res.textContent = e.message;
+  }
+  btn.disabled = false;
+});
 
 $("storageSaveBtn").addEventListener("click", async () => {
   const btn = $("storageSaveBtn");

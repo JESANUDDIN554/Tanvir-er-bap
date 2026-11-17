@@ -1690,12 +1690,13 @@
     </div>
     <div class="field">
       <label class="field-label">Storage <span class="hint">— where the big files live</span></label>
-      <p class="sub" style="margin:6px 0 0">Put the AI model (~9 GB) and new projects on a bigger drive, e.g. D:\ItrajiData. If the model is already downloaded, saving a new location moves it there safely. Existing projects stay where they are and stay in your Library — the location applies to new projects.</p>
+      <p class="sub" style="margin:6px 0 0">Put the AI model (~9 GB) and new projects on a bigger drive, e.g. D:\ItrajiData. If the model is already downloaded, saving a new location moves it there safely. Existing projects stay where they are and stay in your Library — the location applies to new projects. Or press <b>Move everything to this drive</b> to carry the model AND all your existing projects and clips to the new location in one go, emptying the old drive.</p>
       <p class="sub" id="storageState" style="margin:6px 0 0">Checking…</p>
       <div class="bar hidden" id="storageMoveBarWrap" style="margin-top:10px"><div id="storageMoveBar" class="fill"></div></div>
       <div class="row row-tight" style="margin-top:10px">
         <input id="storageDirInput" type="text" placeholder="D:\ItrajiData" spellcheck="false" style="flex:1">
         <button id="storageSaveBtn" class="ghost-btn" type="button">Save location</button>
+        <button id="storageMoveAllBtn" class="ghost-btn" type="button">Move everything to this drive</button>
       </div>
       <span class="hint" id="storageResult"></span>
     </div>
