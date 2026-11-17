@@ -138,6 +138,12 @@
         <span class="tool-desc">Post finished clips straight to your social pages — pick destinations, approve, schedule and track every upload in one queue.</span>
         <span class="badge-row"><span class="badge badge-new">New</span></span>
       </button>
+      <button type="button" class="tool-card" data-tool="automation" data-name="automation os facebook automation dashboard send clip">
+        <span class="tool-emoji">🤖</span>
+        <span class="tool-name">Automation OS</span>
+        <span class="tool-desc">Send finished clips to your Facebook Automation OS — it distributes them to your Pages. Opens the Automation Dashboard.</span>
+        <span class="badge-row"><span class="badge badge-new">New</span></span>
+      </button>
     </div>
 
     <div class="home-section">
@@ -1302,6 +1308,7 @@
       </table>
       <p class="hint" id="aiStorageText" style="margin-top:8px"></p>
       <p class="hint" id="aiHwText"></p>
+      <p class="hint" id="aiBrainText"></p>
       <p class="hint" id="aiUpdateText"></p>
     </div>
 
@@ -1319,6 +1326,12 @@
         <button id="aiUpdateBtn" class="ghost-btn" type="button">Check for AI updates</button>
         <button id="aiDiagBtn" class="ghost-btn" type="button">Run diagnostic</button>
         <button id="aiReinstallBtn" class="ghost-btn" type="button">Reinstall AI</button>
+      </div>
+      <div class="row row-tight" style="margin-top:8px">
+        <span class="hint" style="align-self:center">AI brain:</span>
+        <button id="aiBrainAutoBtn" class="ghost-btn" type="button">Auto</button>
+        <button id="aiBrainFullBtn" class="ghost-btn" type="button">Full 14B</button>
+        <button id="aiBrainLightBtn" class="ghost-btn" type="button">Light 3B</button>
       </div>
       <p class="hint" id="aiActionText" style="margin-top:8px"></p>
     </div>
@@ -1734,6 +1747,35 @@
         </div>
       </div>
       <p class="hint" id="saState">Not connected.</p>
+    </div>
+    <div class="field">
+      <label class="field-label">Automation OS <span class="hint">— send finished clips to your Facebook Automation OS (same PC)</span></label>
+      <p class="sub" style="margin:6px 0 0">Clips sent from the Library go to the Automation OS webhook, which distributes them to your Pages. The shared secret is the platform's CLIPPER_WEBHOOK_SECRET — the same value as the Publishing webhook secret; leave it empty here to reuse that one. Live status reads back over the same shared secret, so no API token is needed (the token field below is unused and kept only for a future feature).</p>
+      <label class="field-label" for="fbosPlatformUrl" style="margin-top:10px">Platform URL</label>
+      <div class="row row-tight">
+        <input id="fbosPlatformUrl" type="text" placeholder="http://127.0.0.1:4000" spellcheck="false" autocomplete="off" style="flex:1">
+      </div>
+      <label class="field-label" for="fbosDashboardUrl" style="margin-top:8px">Dashboard URL</label>
+      <div class="row row-tight">
+        <input id="fbosDashboardUrl" type="text" placeholder="http://127.0.0.1:3000" spellcheck="false" autocomplete="off" style="flex:1">
+      </div>
+      <label class="field-label" for="fbosOrgId" style="margin-top:8px">Organization ID</label>
+      <div class="row row-tight">
+        <input id="fbosOrgId" type="text" placeholder="Platform organization id" spellcheck="false" autocomplete="off" style="flex:1">
+      </div>
+      <label class="field-label" for="fbosSecret" style="margin-top:8px">Shared secret <span class="hint" id="fbosSecretState"></span></label>
+      <div class="row row-tight">
+        <input id="fbosSecret" type="password" placeholder="Leave empty to keep the saved secret" spellcheck="false" autocomplete="off" style="flex:1">
+      </div>
+      <label class="field-label" for="fbosApiToken" style="margin-top:8px">API token <span class="hint" id="fbosTokenState"></span></label>
+      <div class="row row-tight">
+        <input id="fbosApiToken" type="password" placeholder="Not needed — live status uses the shared secret" spellcheck="false" autocomplete="off" style="flex:1">
+      </div>
+      <div class="row row-tight" style="margin-top:10px">
+        <button id="fbosSaveBtn" class="ghost-btn" type="button">Save Automation OS settings</button>
+        <button id="fbosDashboardBtn" class="ghost-btn" type="button">Open Automation Dashboard</button>
+      </div>
+      <p class="hint" id="fbosState"></p>
     </div>
     <div class="field">
       <label class="field-label">Admin Panel</label>

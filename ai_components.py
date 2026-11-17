@@ -80,13 +80,15 @@ def _engine_archive_entry():
 
 
 def _manifest():
+    prof = local_ai.active_profile()
     brain = {
         "id": "brain",
-        "name": "AI Brain - Qwen2.5-14B-Instruct",
+        "name": "AI Brain - " + (prof["label"].split(" - ", 1)[-1]
+                                 if prof else "custom model"),
         "detail": "The language model that finds and scores clips",
         "version": BRAIN_VERSION,
-        "size": local_ai.MODEL_SIZE,
-        "sha256": local_ai.MODEL_SHA256,
+        "size": local_ai.active_model_size(),
+        "sha256": local_ai.active_model_sha256(),
         "urls": local_ai._model_urls(),
     }
     runtime = {
@@ -660,11 +662,11 @@ def _verify_brain():
                           "(no pinned checksum for a custom source)")
         return False, "the model file is incomplete"
     got = local_ai._sha256_file(p)
-    if got == local_ai.MODEL_SHA256:
+    if got == local_ai.active_model_sha256():
         return True, "SHA-256 matches the pinned model checksum"
     return False, ("SHA-256 mismatch - the model file is damaged "
                    "(expected %s..., got %s...)"
-                   % (local_ai.MODEL_SHA256[:12], got[:12]))
+                   % (local_ai.active_model_sha256()[:12], got[:12]))
 
 
 def _verify_engine_dir(base, pins, label):
@@ -1307,6 +1309,14 @@ def manager_state():
             "preference": local_ai.engine_preference(),
             "fallback": local_ai.gpu_fallback_note()
                         or rec.get("gpu_note"),
+        },
+        "brain": {
+            "preference": local_ai.brain_preference(),
+            "active": (local_ai.active_profile() or {}).get("key")
+                      or "custom",
+            "label": (local_ai.active_profile() or {}).get("label")
+                     or "Custom model",
+            "file": local_ai.active_model_file(),
         },
         "overall": {"pct": min(100, overall_pct), "downloaded": done_b,
                     "total": total},

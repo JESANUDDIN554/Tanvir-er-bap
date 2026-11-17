@@ -94,14 +94,145 @@ _MODEL_MIRROR_URL = (os.environ.get("ITRAJI_LOCAL_MODEL_MIRROR_URL")
 
 
 def _model_urls():
-    """Download sources for the model file, best first. With a test
-    override of the model URL the mirror stays out of the way unless
-    ITRAJI_LOCAL_MODEL_MIRROR_URL is set explicitly."""
-    urls = [MODEL_URL]
-    if (not _MODEL_OVERRIDDEN
-            or os.environ.get("ITRAJI_LOCAL_MODEL_MIRROR_URL")):
-        urls.append(_MODEL_MIRROR_URL)
-    return urls
+    """Download sources for the ACTIVE brain's model file, best
+    first. With a test override of the model URL the mirror stays
+    out of the way unless ITRAJI_LOCAL_MODEL_MIRROR_URL is set
+    explicitly."""
+    if _MODEL_OVERRIDDEN:
+        urls = [MODEL_URL]
+        if os.environ.get("ITRAJI_LOCAL_MODEL_MIRROR_URL"):
+            urls.append(_MODEL_MIRROR_URL)
+        return urls
+    p = active_profile()
+    return [p["url"], p["mirror"]]
+
+
+# ---------------------------------------------------------------------------
+# Brain profiles: the full 14B brain and a light 3B brain
+# ---------------------------------------------------------------------------
+# The 14B brain is the quality default, but it physically cannot
+# start on a small PC: its ~9 GB of weights plus the engine's
+# workspace exceed the whole memory of a 6 GB machine, and every
+# launch dies at create_context no matter how lean the launch
+# ladder goes (proven on a real 5.9 GB, GPU-less PC on 2026-11-17:
+# model hash verified perfect, all six footprints failed). The
+# light brain - Qwen2.5-3B, same model family, pinned the same
+# way (size + SHA-256 cross-checked against the Hugging Face LFS
+# metadata on 2026-11-17) - fits comfortably in ~4 GB of RAM.
+# "Auto" picks the light brain when total RAM is <= 10 GB and the
+# full brain otherwise; a brain that is already downloaded and
+# fits the machine is never replaced by a forced re-download.
+
+_LIGHT_MODEL_FILE = "Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+_LIGHT_MODEL_SIZE = 1929903264
+_LIGHT_MODEL_SHA256 = ("9c9f56a391a3abbd5b89d0245bf6106081bcc3173119d42"
+                       "29235dd9d23253f94")
+_LIGHT_MODEL_URL = ("https://huggingface.co/bartowski/"
+                    "Qwen2.5-3B-Instruct-GGUF/resolve/main/"
+                    "Qwen2.5-3B-Instruct-Q4_K_M.gguf")
+_LIGHT_MODEL_MIRROR_URL = ("https://hf-mirror.com/bartowski/"
+                           "Qwen2.5-3B-Instruct-GGUF/resolve/main/"
+                           "Qwen2.5-3B-Instruct-Q4_K_M.gguf")
+
+MODEL_PROFILES = {
+    "full": {"key": "full",
+             "label": "Full brain - Qwen2.5-14B (best quality)",
+             "file": "Qwen2.5-14B-Instruct-Q4_K_M.gguf",
+             "size": MODEL_SIZE, "sha256": MODEL_SHA256,
+             "url": MODEL_URL, "mirror": _MODEL_MIRROR_URL},
+    "light": {"key": "light",
+              "label": "Light brain - Qwen2.5-3B (for small PCs)",
+              "file": _LIGHT_MODEL_FILE,
+              "size": _LIGHT_MODEL_SIZE, "sha256": _LIGHT_MODEL_SHA256,
+              "url": _LIGHT_MODEL_URL, "mirror": _LIGHT_MODEL_MIRROR_URL},
+}
+
+# Total RAM at or below this gets the light brain under "auto":
+# the full brain's weights alone are ~9 GB before any workspace.
+_AUTO_LIGHT_MAX_RAM = 10 * 1024 ** 3
+
+
+def total_ram_bytes():
+    """Total physical RAM, or None when it cannot be probed.
+    Mirrors ai_components._ram_bytes (ctypes on Windows, sysconf
+    elsewhere); a probe failure must never break a launch."""
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual",
+                             ctypes.c_ulonglong)]
+            ms = _MS()
+            ms.dwLength = ctypes.sizeof(_MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(
+                    ctypes.byref(ms)):
+                return int(ms.ullTotalPhys)
+            return None
+        return int(os.sysconf("SC_PAGE_SIZE")) * \
+            int(os.sysconf("SC_PHYS_PAGES"))
+    except Exception:  # noqa: BLE001 - probing is best-effort
+        return None
+
+
+def brain_preference():
+    """The recorded brain preference: "auto" (default), "full" or
+    "light" (ai_config.json - the same store as the engine pref)."""
+    return _ai_config().get("brain") or "auto"
+
+
+def set_brain_preference(pref):
+    cfg = _ai_config()
+    cfg["brain"] = pref if pref in ("full", "light") else "auto"
+    _save_ai_config(cfg)
+
+
+def _profile_file_present(profile):
+    for d in _gguf_dirs():
+        if _file_complete(os.path.join(d, profile["file"]), profile):
+            return True
+    return False
+
+
+def active_profile():
+    """The brain profile in effect, or None when a test override
+    (ITRAJI_LOCAL_MODEL_FILE / _URL) pins a custom model - the
+    legacy single-model behaviour then applies unchanged."""
+    if _MODEL_OVERRIDDEN:
+        return None
+    pref = brain_preference()
+    if pref in MODEL_PROFILES:
+        return MODEL_PROFILES[pref]
+    ram = total_ram_bytes()
+    if ram is not None and ram <= _AUTO_LIGHT_MAX_RAM:
+        return MODEL_PROFILES["light"]
+    if _profile_file_present(MODEL_PROFILES["full"]):
+        return MODEL_PROFILES["full"]
+    if _profile_file_present(MODEL_PROFILES["light"]):
+        return MODEL_PROFILES["light"]
+    return MODEL_PROFILES["full"]
+
+
+def active_model_file():
+    p = active_profile()
+    return p["file"] if p else MODEL_FILE
+
+
+def active_model_size():
+    p = active_profile()
+    return p["size"] if p else MODEL_SIZE
+
+
+def active_model_sha256():
+    p = active_profile()
+    return p["sha256"] if p else MODEL_SHA256
 
 
 # ---------------------------------------------------------------------------
@@ -151,22 +282,25 @@ def model_download_dir():
     return _gguf_dirs()[0]
 
 
-def _file_complete(p):
+def _file_complete(p, profile=None):
     """True when p is a finished model file (same rule model_ready
     has always used: exact pinned size, or >1 MB for test
-    overrides)."""
+    overrides). `profile` pins WHICH brain's size to expect; the
+    default is the active brain."""
     if not os.path.isfile(p):
         return False
-    if not _MODEL_OVERRIDDEN:
-        return os.path.getsize(p) == MODEL_SIZE
-    return os.path.getsize(p) > 1_000_000
+    if _MODEL_OVERRIDDEN:
+        return os.path.getsize(p) > 1_000_000
+    want = profile["size"] if profile else active_model_size()
+    return os.path.getsize(p) == want
 
 
 def existing_model_path():
-    """The complete model file to USE - chosen location first,
-    legacy second - or None when no complete model exists."""
+    """The complete ACTIVE-brain file to USE - chosen location
+    first, legacy second - or None when it is not downloaded."""
+    f = active_model_file()
     for d in _gguf_dirs():
-        p = os.path.join(d, MODEL_FILE)
+        p = os.path.join(d, f)
         if _file_complete(p):
             return p
     return None
@@ -177,13 +311,13 @@ def model_path():
     one is found (chosen location first, legacy second), else the
     path a download would write to."""
     return existing_model_path() or os.path.join(
-        model_download_dir(), MODEL_FILE)
+        model_download_dir(), active_model_file())
 
 
 def _expected_model_size():
     """Byte size the finished model file must have, when knowable."""
     if not _MODEL_OVERRIDDEN:
-        return MODEL_SIZE
+        return active_model_size()
     try:
         r = requests.head(MODEL_URL, allow_redirects=True, timeout=30)
         n = int(r.headers.get("Content-Length") or 0)
@@ -407,12 +541,16 @@ def model_info():
     if os.path.isfile(p):
         size = os.path.getsize(p)
     elif not _MODEL_OVERRIDDEN:
-        size = MODEL_SIZE
+        size = active_model_size()
+    prof = active_profile()
     return {
         "path": p,
-        "file": MODEL_FILE,
+        "file": active_model_file(),
         "size_gb": round((size or 0) / 1e9, 2),
         "downloaded": os.path.isfile(p),
+        "profile": prof["key"] if prof else "custom",
+        "profile_label": prof["label"] if prof else "Custom model",
+        "brain_preference": brain_preference(),
     }
 
 
@@ -451,7 +589,7 @@ def start_model_move(new_data_dir, on_done=None):
     if not src:
         return False
     dst_dir = os.path.join(os.path.abspath(new_data_dir), "models")
-    dst = os.path.join(dst_dir, MODEL_FILE)
+    dst = os.path.join(dst_dir, active_model_file())
     if os.path.abspath(src) == os.path.abspath(dst):
         return False
     # Claim the move INSIDE the lock: the check and the claim used
@@ -492,7 +630,7 @@ def start_model_move(new_data_dir, on_done=None):
                         if not chunk:
                             break
                         h.update(chunk)
-                if h.hexdigest() != MODEL_SHA256:
+                if h.hexdigest() != active_model_sha256():
                     raise OSError("the copy failed its integrity "
                                   "check - the original was kept")
             os.replace(tmp, dst)
@@ -1350,13 +1488,14 @@ def ensure_model():
     """Download the GGUF model if needed. Returns the model path."""
     if model_ready():
         return model_path()
-    expected = None if _MODEL_OVERRIDDEN else MODEL_SIZE
+    expected = None if _MODEL_OVERRIDDEN else active_model_size()
     urls = _model_urls()
     _download_file(urls[0], model_path(),
-                   "Downloading Built-in AI model (~9 GB)",
+                   "Downloading Built-in AI model (%s)"
+                   % (active_profile() or {}).get("label", "custom"),
                    expected_size=expected,
                    expected_sha256=None if _MODEL_OVERRIDDEN
-                   else MODEL_SHA256,
+                   else active_model_sha256(),
                    fallback_urls=urls[1:])
     if not model_ready():
         raise RuntimeError("Built-in AI model download finished but the "
@@ -1425,7 +1564,7 @@ def start_download():
 # llama-server lifecycle
 # ---------------------------------------------------------------------------
 
-_server = {"proc": None, "port": None, "log": None}
+_server = {"proc": None, "port": None, "log": None, "model": None}
 _server_lock = threading.RLock()
 
 
@@ -1464,6 +1603,7 @@ def _stop_server():
                     pass
         _server["proc"] = None
         _server["port"] = None
+        _server["model"] = None
         if _server["log"] is not None:
             try:
                 _server["log"].close()
@@ -1512,7 +1652,7 @@ def _launch_server(binary, progress_cb=None, extra_args=(), ctx=None):
         cmd += ["-c", str(ctx)]
     cmd += [str(a) for a in extra_args]
     proc = subprocess.Popen(cmd, stdout=log, stderr=log)
-    _server.update(proc=proc, port=port, log=log)
+    _server.update(proc=proc, port=port, log=log, model=model_path())
     base = f"http://127.0.0.1:{port}"
     deadline = time.time() + 300
     tick = 0
@@ -1588,7 +1728,9 @@ def ensure_server(progress_cb=None):
             "(one-time download, ~9 GB), then try again.")
     with _server_lock:
         if _server_alive():
-            return f"http://127.0.0.1:{_server['port']}"
+            if _server.get("model") == model_path():
+                return f"http://127.0.0.1:{_server['port']}"
+            _stop_server()  # the brain changed under a live server
         binary = ensure_engine()
         gpu = gpu_engine_path()
         is_gpu = bool(gpu) and os.path.abspath(binary) == \
@@ -1626,7 +1768,7 @@ def _admin_log(status, t0, error=None):
     when the request itself is sent."""
     try:
         import admin
-        admin.log_api_call("Built-in AI (local)", MODEL_FILE, status,
+        admin.log_api_call("Built-in AI (local)", active_model_file(), status,
                            (time.time() - t0) * 1000.0,
                            error=error, kind="chat")
     except Exception:  # noqa: BLE001
@@ -1667,7 +1809,7 @@ def _chat_once(messages, progress_cb=None):
     try:
         r = requests.post(
             base + "/v1/chat/completions",
-            json={"model": MODEL_FILE, "messages": messages,
+            json={"model": active_model_file(), "messages": messages,
                   "temperature": 0.3, "max_tokens": 4096},
             timeout=(10, 1800))
         r.raise_for_status()

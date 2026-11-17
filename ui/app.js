@@ -1790,7 +1790,9 @@ function renderRenders(renders) {
         <button class="ghost-btn small vttBtn" data-i="${i}">VTT</button>
         <button class="ghost-btn small enhCardBtn" data-i="${i}">Enhance</button>
         <button class="ghost-btn small pubCardBtn" data-i="${i}">📤 Publish</button>
+        <button class="ghost-btn small studioSendBtn" data-i="${i}">🤖 Send to OS</button>
       </div>
+      <div class="studio-chip" data-i="${i}"></div>
       <div class="trim-row">
         <input type="text" class="trim-s" data-i="${i}" inputmode="decimal" placeholder="Start s" title="Trim start (seconds)">
         <input type="text" class="trim-e" data-i="${i}" inputmode="decimal" placeholder="End s" title="Trim end (seconds)">
@@ -1868,6 +1870,50 @@ function renderRenders(renders) {
   box.querySelectorAll(".pubCardBtn").forEach((btn) =>
     btn.addEventListener("click", () =>
       openPublishFor(jobId, parseInt(btn.dataset.i, 10))));
+  /* Step 3: Automation OS — send one clip, show its platform status. */
+  const studioChipLabels = {
+    queued: "Automation OS: Queued",
+    awaiting_approval: "Automation OS: Awaiting approval",
+    published: "Automation OS: Published ✓",
+    failed: "Automation OS: Failed",
+    rejected: "Automation OS: Rejected",
+  };
+  async function refreshStudioChip(i) {
+    const chip = box.querySelector(`.studio-chip[data-i="${i}"]`);
+    if (!chip) return;
+    let res;
+    try { res = await api.studio_status(jobId, i); }
+    catch (e) { return; }
+    const rec = res.record || null;
+    const status = res.ok ? res.status
+      : (rec && rec.status ? rec.status : "");
+    if (!status && !rec) { chip.innerHTML = ""; return; }
+    const label = studioChipLabels[status] || ("Automation OS: " + status);
+    const cls = status === "published" ? "b-ok"
+      : status === "failed" || status === "rejected" ? "b-bad"
+      : status === "awaiting_approval" ? "b-warn" : "b-info";
+    const urls = (res.post_urls || (rec && rec.post_urls) || []);
+    chip.innerHTML = `<span class="mini-badge ${cls}">${escapeHtml(label)}</span>`
+      + (urls.length ? ` <a href="${escapeHtml(urls[0])}" target="_blank" rel="noopener">View post ↗</a>` : "")
+      + (!res.ok && res.error === "platform_status_unavailable"
+        ? ` <span class="hint">(last known state — Automation OS not configured)</span>` : "");
+  }
+  box.querySelectorAll(".studioSendBtn").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      const i = parseInt(btn.dataset.i, 10);
+      btn.disabled = true;
+      let res;
+      try { res = await api.studio_send(jobId, i); }
+      catch (e) { res = { ok: false, error: "Could not reach the app" }; }
+      btn.disabled = false;
+      if (!res.ok) { toast(res.error || "Send failed", true); return; }
+      toast(res.record && res.record.duplicate
+        ? "Already sent — the platform deduped it"
+        : "Sent to Automation OS ✓");
+      refreshStudioChip(i);
+    }));
+  box.querySelectorAll(".studio-chip").forEach((chip) =>
+    refreshStudioChip(parseInt(chip.dataset.i, 10)));
   renderRenders._list = renders;
   refreshPlanner();
   refreshEnhancePanel();
@@ -3073,6 +3119,12 @@ function renderAiManager(st) {
     " · Engine mode: " +
     (eng.flavor === "gpu" ? "GPU (CUDA)" : "CPU") +
     (eng.fallback ? " — " + eng.fallback : "");
+  const br = st.brain || {};
+  $("aiBrainText").textContent = "Brain: " + (br.label || "—") +
+    " · Choice: " + (br.preference || "auto") +
+    (br.preference === "auto"
+      ? " (Auto picks the light brain on PCs with 10 GB of memory or less, the full brain otherwise)"
+      : "");
 
   /* setup panel: stage, overall progress, speed, ETA */
   const busy = op.active || dl.active;
@@ -3208,6 +3260,12 @@ $("aiRepairBtn").addEventListener("click", () =>
   aiAct(() => api.ai_repair(), "Repairing the damaged components…"));
 $("aiDiagBtn").addEventListener("click", () =>
   aiAct(() => api.ai_diagnostic(), "Running the diagnostic…"));
+$("aiBrainAutoBtn").addEventListener("click", () =>
+  aiAct(() => api.ai_set_brain("auto"), "Setting the brain choice to Auto…"));
+$("aiBrainFullBtn").addEventListener("click", () =>
+  aiAct(() => api.ai_set_brain("full"), "Setting the brain to Full 14B…"));
+$("aiBrainLightBtn").addEventListener("click", () =>
+  aiAct(() => api.ai_set_brain("light"), "Setting the brain to Light 3B…"));
 $("aiReinstallBtn").addEventListener("click", () => {
   if (!window.confirm("Reinstall the AI? This deletes the AI Brain " +
       "(~9 GB), the runtime and the speech model, then downloads " +
@@ -3354,6 +3412,7 @@ document.querySelectorAll(".tool-card").forEach((card) => {
       toast("Pick a clip in the Library, then open Caption Studio on it");
     } else if (tool === "settings") $("settingsBtn").click();
     else if (tool === "admin") openAdmin();
+    else if (tool === "automation") openAutomationDashboard();
     else showTool(tool);
   });
 });
@@ -4399,6 +4458,7 @@ $("settingsBtn").addEventListener("click", async () => {
   refreshStorage();
   refreshUpdateInfo();
   refreshSaState();
+  refreshStudioConfig();
 });
 $("closeSettingsBtn").addEventListener("click", closeSettings);
 
@@ -4455,6 +4515,59 @@ $("falKeyClearBtn").addEventListener("click", async () => {
   $("falKeyState").textContent = "No key saved.";
   toast("fal.ai key removed");
 });
+
+/* ---------------- Automation OS (Step 3: "one app") ---------------
+   Hub card opens the platform dashboard; Settings holds the
+   platform URL / org id / shared secret / API token. Secrets are
+   never sent back to the page — the fields start empty and the
+   state lines say whether one is saved. */
+async function openAutomationDashboard() {
+  let url = "http://127.0.0.1:3000";
+  try {
+    const res = await api.studio_dashboard_url();
+    if (res && res.ok && res.url) url = res.url;
+  } catch (e) { /* offline — default dashboard URL */ }
+  window.open(url, "_blank", "noopener");
+}
+async function refreshStudioConfig() {
+  try {
+    const res = await api.studio_config();
+    const c = (res && res.config) || {};
+    $("fbosPlatformUrl").value = c.platform_url || "";
+    $("fbosDashboardUrl").value = c.dashboard_url || "";
+    $("fbosOrgId").value = c.organization_id || "";
+    $("fbosSecret").value = "";
+    $("fbosApiToken").value = "";
+    $("fbosSecretState").textContent = c.webhook_secret_set
+      ? "A secret is saved."
+      : "No secret saved yet — leave empty to reuse the Publishing webhook secret.";
+    $("fbosTokenState").textContent = c.api_token_set
+      ? "A token is saved (not used — live status uses the shared secret)."
+      : "No token needed — live status uses the shared secret.";
+    $("fbosState").textContent = c.configured
+      ? "Configured ✓"
+      : "Not configured yet — fill in the organization id and secret.";
+  } catch (e) { /* offline */ }
+}
+$("fbosSaveBtn").addEventListener("click", async () => {
+  $("fbosState").textContent = "Saving…";
+  let res;
+  try {
+    res = await api.studio_save_config({
+      fbos_platform_url: $("fbosPlatformUrl").value.trim(),
+      fbos_dashboard_url: $("fbosDashboardUrl").value.trim(),
+      fbos_org_id: $("fbosOrgId").value.trim(),
+      fbos_webhook_secret: $("fbosSecret").value.trim(),
+      fbos_api_token: $("fbosApiToken").value.trim(),
+    });
+  } catch (e) { res = { ok: false, error: "Could not reach the app" }; }
+  if (!res.ok) { $("fbosState").textContent = "✗ " + (res.error || "Save failed."); return; }
+  $("fbosSecret").value = "";
+  $("fbosApiToken").value = "";
+  await refreshStudioConfig();
+  toast("Automation OS settings saved");
+});
+$("fbosDashboardBtn").addEventListener("click", openAutomationDashboard);
 
 /* ---------------- Super Admin connection (opt-in) ---------------
    Two-step connect: prepare fetches the server's license public

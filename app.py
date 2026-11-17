@@ -50,6 +50,7 @@ import channels  # noqa: E402  (Phase 2: YouTube Channel Monitor client)
 import superadmin  # noqa: E402  (opt-in Super Admin connection + SDK)
 import ai_components  # noqa: E402  (AI Installation Manager backend)
 import ai_endpoint  # noqa: E402  (FB Automation Built-in AI channel, contract v1.1)
+import studio  # noqa: E402  (Step 3: send clips to FB Automation OS)
 import licensing  # noqa: E402  (signed license + core pack + integrity)
 import updater  # noqa: E402  (signed file-replacement update packs)
 from pipeline import load_corepack as _load_corepack  # noqa: E402
@@ -534,6 +535,21 @@ DEFAULT_SETTINGS = {
                                    # posts are SELF_ONLY - surfaced)
     "pub_webhook_url": "",         # completion events; off when ""
     "pub_webhook_secret": "",      # secret - HMAC key for the outbox
+    # -- Facebook Automation OS (Step 3: "one app") ------------------
+    # Sends finished clips to the platform webhook (studio.py) and
+    # reads their status back. The shared secret is the platform's
+    # CLIPPER_WEBHOOK_SECRET — the same value as pub_webhook_secret
+    # above; fbos_webhook_secret overrides it when set. Both are
+    # secrets, masked in get_settings like the other keys.
+    "fbos_platform_url": "",       # "" = http://127.0.0.1:4000
+    "fbos_dashboard_url": "",      # "" = http://127.0.0.1:3000
+    "fbos_org_id": "",             # platform organization id
+    "fbos_webhook_secret": "",     # secret - overrides pub_webhook_secret
+    "fbos_api_token": "",          # secret - UNUSED by Step 3 (live
+                                   # status reads back over the
+                                   # HMAC-signed endpoint instead);
+                                   # kept, harmless, for a future
+                                   # user-scoped feature
     # -- Phase 2 ---------------------------------------------------
     "export_presets": [],          # [{id, name, ratio, quality,
                                    #   quality_tier, audio_polish,
@@ -680,6 +696,17 @@ def _ensure_pub():
         publishing.bind_settings(load_settings, _pub_save_settings_patch)
         _PUB_BOUND["done"] = True
     publishing.ensure_worker()
+
+
+# Automation OS glue (Step 3): studio.py reads app settings through
+# the same injected callables as publishing.py.
+_STUDIO_BOUND = {"done": False}
+
+
+def _ensure_studio():
+    if not _STUDIO_BOUND["done"]:
+        studio.bind_settings(load_settings, _pub_save_settings_patch)
+        _STUDIO_BOUND["done"] = True
 
 
 _AI_EP_BOUND = {"done": False}
@@ -1419,7 +1446,8 @@ class Api:
         # and account tokens are replaced by *_set flags, and account
         # rows go out token-free with a has_token flag.
         for key in ("pub_fb_app_secret", "pub_yt_client_secret",
-                    "pub_tt_client_secret", "pub_webhook_secret"):
+                    "pub_tt_client_secret", "pub_webhook_secret",
+                    "fbos_webhook_secret", "fbos_api_token"):
             s[key + "_set"] = bool(str(s.get(key) or "").strip())
             s.pop(key, None)
         s["pub_accounts"] = [
@@ -1469,6 +1497,7 @@ class Api:
             # stored token (matched by id).
             for key in ("pub_fb_app_secret", "pub_yt_client_secret",
                         "pub_tt_client_secret", "pub_webhook_secret",
+                        "fbos_webhook_secret", "fbos_api_token",
                         "pub_account_status"):
                 settings.pop(key, None)
                 settings.pop(key + "_set", None)
@@ -1579,6 +1608,80 @@ class Api:
         return {"ok": ok, "detail": detail,
                 "state": superadmin.status()}
 
+    # -- Facebook Automation OS (Step 3: "one app") ------------------
+    # Sends finished clips to the platform webhook (studio.py) and
+    # reads their status back. Secrets are owned by studio_save_config
+    # only — a wholesale settings save can never wipe them (see
+    # save_settings above), and get_settings masks them.
+
+    def studio_config(self):
+        """Masked Automation OS config for the Settings section."""
+        _ensure_studio()
+        return {"ok": True, "config": studio.config_view()}
+
+    def studio_save_config(self, config):
+        """Save platform_url / dashboard_url / organization_id and,
+        when non-empty, the shared secret and API token. Empty secret
+        / token fields keep the stored value (the UI sends masked
+        blanks, never the real secret)."""
+        _ensure_studio()
+        cfg = dict(config or {})
+        patch = {}
+        for key in ("fbos_platform_url", "fbos_dashboard_url",
+                    "fbos_org_id"):
+            if key in cfg:
+                patch[key] = str(cfg.get(key) or "").strip()
+        for key in ("fbos_webhook_secret", "fbos_api_token"):
+            if str(cfg.get(key) or "").strip():
+                patch[key] = str(cfg.get(key)).strip()
+        if patch:
+            with _SETTINGS_LOCK:
+                current = load_settings()
+                current.update(patch)
+                save_settings(current)
+        return {"ok": True, "config": studio.config_view()}
+
+    def studio_dashboard_url(self):
+        _ensure_studio()
+        return {"ok": True, "url": studio.dashboard_url()}
+
+    def studio_send(self, job_id, render_index):
+        """Send one finished clip to the Automation OS. Idempotent:
+        a retry reuses the clip's event_id, so the platform dedupes
+        it instead of creating a second video."""
+        _ensure_studio()
+        _load_library()
+        job, render, err = self._pub_render(job_id, render_index)
+        if err:
+            return {"ok": False, "error": err}
+        try:
+            rec = studio.send_clip_to_platform({
+                "job_id": job_id, "render_index": int(render_index),
+                "path": render.get("path") or "",
+                "title": render.get("title") or "",
+                "duration": 0,
+                "aspect_ratio": render.get("aspect") or "",
+                "thumbnail_uri": ""})
+        except studio.StudioError as e:
+            return {"ok": False, "error": e.message}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)[:200]}
+        return {"ok": True, "record": rec}
+
+    def studio_status(self, job_id, render_index):
+        """Platform status for a sent clip (queued / awaiting
+        approval / published + post links), read back over the
+        HMAC-signed status endpoint. Without a configured org id /
+        shared secret this honestly reports
+        platform_status_unavailable and returns the last known local
+        state instead."""
+        _ensure_studio()
+        try:
+            res = studio.get_clip_status(job_id, int(render_index))
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)[:200]}
+        return res
+
     # -- in-app updates (signed file-replacement packs) ---------------
     def update_info(self):
         return {"ok": True, "version": APP_VERSION}
@@ -1627,7 +1730,7 @@ class Api:
             loc = "default"
             if dd:
                 want = os.path.join(os.path.abspath(dd), "models",
-                                    local_ai.MODEL_FILE)
+                                    local_ai.active_model_file())
                 if os.path.abspath(eff) == want:
                     loc = "custom"
         return {"ok": True,
@@ -1680,7 +1783,7 @@ class Api:
                     "error": "A model move is already running - "
                              "wait for it to finish."}
         eff = local_ai.existing_model_path()
-        want = os.path.join(ap, "models", local_ai.MODEL_FILE)
+        want = os.path.join(ap, "models", local_ai.active_model_file())
         if eff and os.path.abspath(eff) != os.path.abspath(want):
             def _done(ok, err, _ap=ap):
                 if ok:
@@ -2323,6 +2426,15 @@ class Api:
         st = ai_components.manager_state()
         st["started"] = started
         return st
+
+    def ai_set_brain(self, pref):
+        """Record the brain choice (auto/full/light). The running
+        engine notices the changed model on its next start and
+        relaunches with the newly chosen brain; a brain that is
+        not downloaded yet is fetched by the normal Install /
+        Download flow, which is profile-aware."""
+        local_ai.set_brain_preference(pref)
+        return ai_components.manager_state()
 
     # -- licensing -------------------------------------------------------
     def license_status(self):
@@ -6517,7 +6629,7 @@ def _admin_stats_payload():
         "machine_code": licensing.machine_code(),
         "app_version": APP_VERSION,
         "model_ready": bool(local_ai.model_ready()),
-        "model_file": local_ai.MODEL_FILE,
+        "model_file": local_ai.active_model_file(),
         "model_downloading": bool(dl.get("downloading")),
         "fal_key_set": bool((settings.get("fal_key") or "").strip()),
         "clip_allowance": lic_usage["max_clips"],
@@ -6984,6 +7096,19 @@ def make_wsgi_app(api):
         return _wsgi_response(start_response, "200 OK", ctype, data)
 
     return app
+
+
+def _pinned_port():
+    """Fixed listen port from ITRAJI_CLIPER_PORT (Step 3 "one app":
+    the Automation OS platform calls this app's Built-in AI endpoint
+    at http://127.0.0.1:8973/..., so the Studio launcher pins the
+    port). None when unset/invalid — the caller falls back to a free
+    port, as before."""
+    try:
+        port = int(os.environ.get("ITRAJI_CLIPER_PORT") or "")
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
 
 
 def _free_port():
@@ -7744,7 +7869,7 @@ def main():
         threading.Thread(target=_auto_update_ytdlp, daemon=True).start()
 
         api = Api()
-        port = _free_port()
+        port = _pinned_port() or _free_port()
         url = "http://127.0.0.1:%d/" % port
         print("Itraji Cliper running at " + url, flush=True)
 
