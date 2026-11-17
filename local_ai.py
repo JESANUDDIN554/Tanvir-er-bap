@@ -1484,12 +1484,16 @@ def _server_log_tail(n=1500):
         return ""
 
 
-def _launch_server(binary, progress_cb=None):
+def _launch_server(binary, progress_cb=None, extra_args=(), ctx=None):
     """Launch llama-server on `binary` and wait until it answers
     health checks. Returns the base URL; raises RuntimeError with
-    the server's log tail when it cannot start. The GPU build gets
-    all layers offloaded (-ngl 99); the CPU build's command line is
-    exactly what it has always been."""
+    the server's log tail when it cannot start. `ctx` and
+    `extra_args` carry ONE launch attempt's memory footprint (see
+    _launch_attempts): the caller walks a ladder from the richest
+    footprint to the leanest, because a footprint that is wrong for
+    the machine - every layer on an 8 GB graphics card, a 32K
+    context in small RAM - makes the engine exit while creating
+    its context, which the user sees as a dead Built-in AI."""
     port = _free_port()
     # Rotate the engine log: it was append-only forever, growing by
     # one model-load transcript per launch for the life of the
@@ -1503,10 +1507,10 @@ def _launch_server(binary, progress_cb=None):
     log = open(log_path, "ab")
     cmd = [binary, "-m", model_path(),
            "--host", "127.0.0.1", "--port", str(port),
-           "-c", "32768", "-t", str(os.cpu_count() or 4)]
-    gpu = gpu_engine_path()
-    if gpu and os.path.abspath(binary) == os.path.abspath(gpu):
-        cmd += ["-ngl", "99"]
+           "-t", str(os.cpu_count() or 4)]
+    if ctx:
+        cmd += ["-c", str(ctx)]
+    cmd += [str(a) for a in extra_args]
     proc = subprocess.Popen(cmd, stdout=log, stderr=log)
     _server.update(proc=proc, port=port, log=log)
     base = f"http://127.0.0.1:{port}"
@@ -1537,6 +1541,38 @@ def _launch_server(binary, progress_cb=None):
                        "5 minutes. " + _server_log_tail()[-400:])
 
 
+def _launch_attempts(is_gpu):
+    """(ctx, extra_args) footprints to try, richest first.
+
+    The pre-ladder command line pinned -ngl 99 and -c 32768: on a
+    graphics card smaller than the ~9 GB model (an 8 GB RTX 5060,
+    say) the engine died at create_context, and because BOTH values
+    were set explicitly, llama.cpp's own --fit (on by default in
+    the pinned build) was not allowed to shrink either of them.
+    GPU attempt 1 therefore sets neither: --fit sizes the offload
+    and the context to the card it actually finds. The later
+    attempts are deterministic partial offloads, then leaner
+    contexts with a quantised KV cache. CPU attempts step the
+    context down for small-RAM machines. Every prompt the app
+    sends is bounded (posting text is truncated to 6000 chars;
+    detection windows are transcript segments) and chat asks for
+    at most 4096 output tokens, so even the leanest 4096 context
+    stays usable, just slower and shorter-sighted."""
+    if is_gpu:
+        return [
+            (16384, ["--fit", "on"]),
+            (8192, ["-ngl", "20"]),
+            (8192, ["-ngl", "12", "-ctk", "q8_0", "-ctv", "q8_0",
+                    "--flash-attn", "on"]),
+        ]
+    return [
+        (16384, []),
+        (8192, ["-ctk", "q8_0", "-ctv", "q8_0",
+                "--flash-attn", "on"]),
+        (4096, []),
+    ]
+
+
 def ensure_server(progress_cb=None):
     """Start llama-server (once) and wait until it answers health checks.
 
@@ -1554,17 +1590,29 @@ def ensure_server(progress_cb=None):
         if _server_alive():
             return f"http://127.0.0.1:{_server['port']}"
         binary = ensure_engine()
-        try:
-            return _launch_server(binary, progress_cb)
-        except RuntimeError:
-            gpu = gpu_engine_path()
-            if not gpu or os.path.abspath(binary) != \
-                    os.path.abspath(gpu):
-                raise
-            _mark_gpu_fallback(
-                "the GPU engine failed to start - the CPU engine "
-                "is being used instead")
-            return _launch_server(ensure_engine(), progress_cb)
+        gpu = gpu_engine_path()
+        is_gpu = bool(gpu) and os.path.abspath(binary) == \
+            os.path.abspath(gpu)
+        last_err = None
+        for ctx, extra in _launch_attempts(is_gpu):
+            try:
+                return _launch_server(binary, progress_cb,
+                                      extra_args=extra, ctx=ctx)
+            except RuntimeError as e:
+                last_err = e
+        if not is_gpu:
+            raise last_err
+        _mark_gpu_fallback(
+            "the GPU engine failed to start - the CPU engine "
+            "is being used instead")
+        binary = ensure_engine()
+        for ctx, extra in _launch_attempts(False):
+            try:
+                return _launch_server(binary, progress_cb,
+                                      extra_args=extra, ctx=ctx)
+            except RuntimeError as e:
+                last_err = e
+        raise last_err
 
 
 # ---------------------------------------------------------------------------
