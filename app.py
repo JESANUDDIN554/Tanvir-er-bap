@@ -477,12 +477,13 @@ DEFAULT_SETTINGS = {
     "remove_fillers": False,
     "auto_censor": False,
     "face_track": True,
+    "reframe": "auto",             # auto/track/backdrop/crop (9:16)
     "use_cookies": False,
     # Opus-gap features (all offline-first; new toggles)
     "speaker_colors": False,       # Speaker 1/2 caption colors
     "speaker_color_1": "#ffd166",
     "speaker_color_2": "#6cc7ff",
-    "hook_overlay": True,          # hook text overlay, first ~2.5s
+    "hook_overlay": True,          # hook title overlay, first ~3s
     "cta_overlay": True,           # CTA overlay in the last 2s
     "cta_text": "Follow for more 🔔",
     "safe_zone": False,            # Reels-safe caption nudge + filename tag
@@ -1185,12 +1186,39 @@ def _hex_to_ass(hex_color):
     return ("&H00" + b + g + r).upper()
 
 
+def _progress_family(stage):
+    """A stage text with its numbers blanked out, so 'Downloading
+    video - 128.5 MB of 610 MB (21%)' and the same line at 22% count
+    as the SAME stage for log-throttling purposes."""
+    return "".join(c for c in str(stage) if not c.isdigit())
+
+
 def _job_progress(job_id):
     def cb(pct, stage):
         job = JOBS.get(job_id)
-        if job:
-            job["progress"] = pct
-            job["stage"] = stage
+        if not job:
+            return
+        job["progress"] = pct
+        job["stage"] = stage
+        # Stream progress into the job's System Log (2026-11-20: the
+        # log showed only "Download started" for a whole download -
+        # the user could not see where things were or how much was
+        # done). Log a line when the stage family changes, at each
+        # +10% step, or after 30s of the same stage - never more
+        # often, so the log reads as a live feed, not a flood.
+        if not stage:
+            return
+        st = job.setdefault("_plog",
+                            {"fam": None, "step": -1, "t": 0.0})
+        now = time.time()
+        try:
+            step = int(float(pct) // 10)
+        except (TypeError, ValueError):
+            step = st["step"]
+        fam = _progress_family(stage)
+        if fam != st["fam"] or step > st["step"] or now - st["t"] >= 30:
+            st.update({"fam": fam, "step": step, "t": now})
+            _job_log(job_id, stage)
     return cb
 
 
@@ -2109,6 +2137,7 @@ class Api:
         batch = BATCHES.get(batch_id)
         if not batch:
             return
+        batch["failed"] = 0
         for url in urls:
             job_id = self._new_job()
             batch["job_ids"].append(job_id)
@@ -2116,15 +2145,23 @@ class Api:
                 self._run_import(job_id, url, use_cookies, language)
             except Exception:  # noqa: BLE001 - job holds the error
                 pass
+            # The batch must not claim a clean "done" when imports
+            # failed (audit 2026-11-17, S-2): count the jobs that
+            # ended in error and say so in the batch status.
+            job = JOBS.get(job_id) or {}
+            if job.get("status") == "error" or job.get("error"):
+                batch["failed"] += 1
             batch["done"] += 1
-        batch["status"] = "done"
+        batch["status"] = ("done_with_errors" if batch["failed"]
+                           else "done")
 
     def batch_status(self, batch_id):
         b = BATCHES.get(batch_id)
         if not b:
             return {"status": "missing"}
         return {"status": b["status"], "done": b["done"],
-                "total": b["total"], "job_ids": b["job_ids"]}
+                "total": b["total"], "job_ids": b["job_ids"],
+                "failed": b.get("failed", 0)}
 
     def list_jobs(self):
         _load_library()
@@ -2304,6 +2341,12 @@ class Api:
             return ("YouTube asked for bot verification. Turn on 'Use my "
                     "browser's YouTube login' in Step 1 (log into YouTube "
                     "in Chrome/Edge first), then retry.")
+        if "download_stalled" in msg:
+            return ("The download stalled - no data arrived for 3 "
+                    "minutes, so it was stopped instead of hanging. "
+                    "Check your connection and retry. If this video is "
+                    "age-restricted, turn on 'Use my browser's YouTube "
+                    "login' in Step 1 and retry.")
         if "no_speech" in msg:
             return "No speech found in this video - nothing to clip."
         if "Private video" in msg or "Login required" in msg:
@@ -2718,6 +2761,19 @@ class Api:
         def cb(pct, text):
             st["pct"] = max(0, min(100, int(pct)))
             st["stage"] = text
+            # Same live-feed logging as the main jobs: stage-family
+            # change, each +10% step, or a 30s heartbeat.
+            if not text:
+                return
+            ps = st.setdefault("_plog",
+                               {"fam": None, "step": -1, "t": 0.0})
+            now = time.time()
+            step = int(st["pct"] // 10)
+            fam = _progress_family(text)
+            if fam != ps["fam"] or step > ps["step"] \
+                    or now - ps["t"] >= 30:
+                ps.update({"fam": fam, "step": step, "t": now})
+                _remover_log(rid, text)
 
         mode_names = {"crop": "Crop Band", "fill": "Smart Fill",
                       "ai": "AI Inpaint (frame by frame)",
@@ -5477,6 +5533,7 @@ class Api:
         opts = dict(options or {})
         # defaults from settings, overridable per render call
         for key in ("caption_style", "ratio", "quality", "face_track",
+                    "reframe",
                     "remove_fillers", "remove_silences", "auto_censor",
                     "emojis", "highlight", "speaker_colors", "hook_overlay",
                     "cta_overlay", "cta_text", "safe_zone", "punch_zoom",
@@ -5536,7 +5593,7 @@ class Api:
         opts = self._render_opts(options)
         job["last_render_opts"] = {k: opts.get(k) for k in
                                    ("caption_style", "ratio", "quality",
-                                    "face_track", "remove_fillers",
+                                    "face_track", "reframe", "remove_fillers",
                                     "remove_silences", "auto_censor",
                                     "emojis", "highlight", "speaker_colors",
                                     "hook_overlay", "cta_text", "safe_zone",
@@ -5579,6 +5636,8 @@ class Api:
                     opts.get("caption_style", "bold-pop"),
                     out, _job_progress(job_id),
                     face_track=bool(opts.get("face_track", True)),
+                    reframe=(str(opts.get("reframe") or "").strip()
+                             or None),
                     remove_fillers=bool(opts.get("remove_fillers")),
                     remove_silences=bool(opts.get("remove_silences")),
                     auto_censor=bool(opts.get("auto_censor")),
@@ -6617,16 +6676,23 @@ def _work_in_progress():
     download check self-heals first (see local_ai), so a wedged
     download whose worker is long gone does not claim to be work."""
     what = []
+    # Every probe fails CLOSED (audit 2026-11-17, S-1): if checking
+    # a store throws, the guard must assume work is running and ask
+    # before closing - the old fail-open probes could report
+    # "nothing in progress" on a broken check and let the app close
+    # mid-download or mid-render, the exact failure this guard
+    # exists to prevent. A needless "are you sure?" prompt is cheap;
+    # a cut-off 9 GB download is not.
     try:
         if local_ai.download_state().get("active"):
             what.append("the Built-in AI download")
-    except Exception:  # noqa: BLE001 - the guard must never break
-        pass
+    except Exception:  # noqa: BLE001 - fail closed, see above
+        what.append("the Built-in AI download")
     try:
         if any(j.get("status") == "working" for j in list(JOBS.values())):
             what.append("video processing")
     except Exception:  # noqa: BLE001
-        pass
+        what.append("video processing")
     # The session tools were invisible to the guard: closing the
     # app mid Caption-Remover / Enhancer / Generator / Enhance-All
     # run cut the work off with no warning at all, despite this
@@ -6639,19 +6705,19 @@ def _work_in_progress():
                    for s in list(store.values())):
                 what.append(label)
         except Exception:  # noqa: BLE001
-            pass
+            what.append(label)
     try:
         if any(b.get("state") == "running"
                for b in list(_BENHANCE_BATCHES.values())):
             what.append("clip enhancement")
     except Exception:  # noqa: BLE001
-        pass
+        what.append("clip enhancement")
     try:
         if any(b.get("status") == "working"
                for b in list(BATCHES.values())):
             what.append("batch import")
     except Exception:  # noqa: BLE001
-        pass
+        what.append("batch import")
     return what
 
 

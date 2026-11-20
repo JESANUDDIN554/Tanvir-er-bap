@@ -468,6 +468,22 @@ def _run_encode(cmd, **kwargs):
 # yt-dlp download (with YouTube bot-check retry chain)
 # ---------------------------------------------------------------------------
 
+# Seconds without any downloaded-byte progress before a download
+# attempt is declared stalled and abandoned (slow downloads are NOT
+# stalled - their byte count keeps growing and resets this timer).
+_DL_STALL_S = 180.0
+
+
+def _fmt_clock(seconds):
+    """Seconds -> 'M:SS' (or 'H:MM:SS' past an hour) for progress
+    lines the user watches live."""
+    s = max(0, int(seconds or 0))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m}:{sec:02d}"
+
 # Markers that identify YouTube's "Sign in to confirm you're not a bot" wall.
 BOTCHECK_MARKERS = (
     "sign in to confirm you're not a bot",
@@ -481,20 +497,48 @@ def _is_botcheck_error(msg):
     return any(k in m for k in BOTCHECK_MARKERS)
 
 
-def _download_once(url, out_dir, progress_cb, extra_opts, attempt_label):
-    """Single yt-dlp attempt. Returns (video_path, title, duration_sec)."""
+def _download_once(url, out_dir, progress_cb, extra_opts, attempt_label,
+                   tracker=None):
+    """Single yt-dlp attempt. Returns (video_path, title, duration_sec).
+
+    When tracker is given it is updated on every progress-hook call
+    ({"bytes": int, "t": float}) so the caller's stall watchdog can
+    tell a slow download (bytes still growing) from a dead one.
+    """
     import yt_dlp
 
     os.makedirs(out_dir, exist_ok=True)
     out_tmpl = os.path.join(out_dir, "source.%(ext)s")
 
     def hook(d):
+        if tracker is not None:
+            tracker["bytes"] = d.get("downloaded_bytes") or tracker.get(
+                "bytes", 0)
+            tracker["t"] = time.time()
         if progress_cb and d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             done = d.get("downloaded_bytes") or 0
             pct = (done / total * 100) if total else 0
-            progress_cb(min(99, pct), "Downloading video"
-                        + (f" [{attempt_label}]" if attempt_label else ""))
+            # The user must SEE where the download is: how much has
+            # arrived, how much there is, how fast, how long left -
+            # a bare "Downloading video" reads as "stuck" even when
+            # bytes are flowing (his 2026-11-20 screenshot).
+            msg = "Downloading video"
+            if total:
+                msg += (f" - {done / 1048576:.1f} MB of "
+                        f"{total / 1048576:.1f} MB ({pct:.0f}%)")
+            elif done:
+                msg += f" - {done / 1048576:.1f} MB"
+            speed = d.get("speed") or 0
+            if speed:
+                msg += f" - {speed / 1048576:.1f} MB/s"
+                eta = d.get("eta")
+                if eta and total:
+                    msg += (f" - ~{int(eta) // 60} min left"
+                            if eta >= 90 else f" - ~{int(eta)} sec left")
+            if attempt_label:
+                msg += f" [{attempt_label}]"
+            progress_cb(min(99, pct), msg)
 
     opts = {
         "format": "bv*[height<=2160][ext=mp4]+ba[ext=m4a]/b[height<=2160][ext=mp4]/b[height<=2160]/b",
@@ -504,6 +548,11 @@ def _download_once(url, out_dir, progress_cb, extra_opts, attempt_label):
         "no_warnings": True,
         "progress_hooks": [hook],
         "retries": 3,
+        # A stalled socket must surface as an error in seconds, not
+        # hang the import forever (2026-11-18: a job sat on
+        # "Download started" for 30+ minutes with no error at all).
+        "socket_timeout": 20,
+        "fragment_retries": 3,
     }
     opts.update(extra_opts or {})
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -544,30 +593,72 @@ def download_video(url, out_dir, progress_cb=None, use_cookies=False):
             attempts.append((f"cookies:{browser}",
                              {"cookiesfrombrowser": (browser,)}))
 
-    last_err, botcheck_seen = None, False
+    last_err, botcheck_seen, stall_seen = None, False, False
     for label, extra in attempts:
         if progress_cb:
             progress_cb(2, "Downloading video"
                         + (f" [{label}]" if label != "default" else ""))
-        try:
-            path, title, duration = _download_once(
-                url, out_dir, progress_cb, extra, label)
+        # Stall watchdog: the attempt runs in a daemon thread while
+        # this loop watches the tracker's last-progress timestamp.
+        # Slow is fine (bytes keep growing, timer keeps resetting);
+        # NO byte progress for _DL_STALL_S means the connection is
+        # dead - abandon the attempt and let the chain try the next
+        # route instead of hanging the import forever. Each attempt
+        # gets its own subdir so an abandoned thread that later wakes
+        # up can never corrupt the winning attempt's file.
+        tracker = {"bytes": 0, "t": time.time()}
+        holder = {}
+        attempt_dir = os.path.join(
+            out_dir, "dl-" + re.sub(r"[^A-Za-z0-9]+", "-", label))
+
+        def _run(_extra=extra, _label=label, _dir=attempt_dir,
+                 _tracker=tracker, _holder=holder):
+            try:
+                _holder["result"] = _download_once(
+                    url, _dir, progress_cb, _extra, _label,
+                    tracker=_tracker)
+            except Exception as e:  # noqa: BLE001 - surfaced by caller
+                _holder["error"] = e
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        stalled = False
+        while worker.is_alive():
+            worker.join(timeout=2.0)
+            if worker.is_alive() and (
+                    time.time() - tracker["t"] > _DL_STALL_S):
+                stalled = True
+                break
+        if stalled:
+            stall_seen = True
+            print(f"[pipeline] download attempt '{label}' stalled "
+                  f"(no progress for {_DL_STALL_S:.0f}s) - "
+                  "abandoning it and trying the next route",
+                  flush=True)
+            if progress_cb:
+                progress_cb(2, "Download stalled - trying another way")
+            continue
+        if "result" in holder:
             if progress_cb:
                 progress_cb(100, "Download complete")
-            return path, title, duration
-        except Exception as e:  # noqa: BLE001 - part of the retry chain
-            msg = str(e)
-            if _is_botcheck_error(msg):
-                botcheck_seen = True
-            if label.startswith("cookies:") and "cookie" in msg.lower() and (
-                    "could not" in msg.lower() or "not found" in msg.lower()
-                    or "no such" in msg.lower()):
-                continue  # no usable profile for this browser; try next
-            last_err = e
+            return holder["result"]
+        e = holder.get("error")
+        if e is None:
             continue
+        msg = str(e)
+        if _is_botcheck_error(msg):
+            botcheck_seen = True
+        if label.startswith("cookies:") and "cookie" in msg.lower() and (
+                "could not" in msg.lower() or "not found" in msg.lower()
+                or "no such" in msg.lower()):
+            continue  # no usable profile for this browser; try next
+        last_err = e
+        continue
 
     if botcheck_seen:
         raise RuntimeError("youtube_bot_check")
+    if stall_seen and last_err is None:
+        raise RuntimeError("download_stalled")
     if last_err is not None:
         raise RuntimeError(str(last_err)[:300])
     raise RuntimeError("download failed")
@@ -1036,7 +1127,9 @@ def _collect_words(segments, audio_dur, progress_cb, pct):
             p = 15 + int(min(seg.end, audio_dur) / audio_dur * 80)
             if p > pct["last"]:
                 pct["last"] = p
-                progress_cb(p, "Transcribing audio")
+                progress_cb(p, f"Transcribing audio - "
+                            f"{_fmt_clock(seg.end)} of "
+                            f"{_fmt_clock(audio_dur)}")
         if seg.words:
             for w in seg.words:
                 out.append(
@@ -1256,11 +1349,64 @@ def _load_whisper_model(model_name, progress_cb=None):
     return model
 
 
+def _release_ai_engine():
+    """Park the Built-in AI engine so transcription gets the RAM.
+
+    The llama-server keeps the brain (up to ~9 GB for the 14B)
+    resident after its first use. On a 15 GB PC that leaves too
+    little room for transcription's feature computation - a real
+    job died with "Unable to allocate 110 MiB" while the engine
+    sat loaded (2026-11-17). The engine restarts itself on demand
+    the next time an AI feature needs it, so parking it here costs
+    nothing but a reload later. Best-effort by design: transcription
+    must never fail because the engine could not be parked."""
+    try:
+        import local_ai
+        was_loaded = local_ai._server_alive()
+        local_ai._stop_server()
+        if was_loaded and local_ai._server_alive():
+            # Parking failed: the OOM this prevents can recur, so
+            # leave a trace instead of failing silently (audit
+            # 2026-11-17, Phase 1 note on this function).
+            print("[pipeline] WARNING: AI engine did not stop; "
+                  "transcription proceeds with it resident",
+                  flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import gc
+        gc.collect()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def transcribe(video_path, model_name="base", progress_cb=None,
                language="auto"):
     """Transcribe with word-level timestamps. Returns list of word dicts.
 
-    language: faster-whisper language code ("en", "es", ...) or "auto"."""
+    language: faster-whisper language code ("en", "es", ...) or "auto".
+
+    The AI engine is parked first (see _release_ai_engine), and a
+    MemoryError anywhere in the attempt earns exactly one retry
+    after freeing everything again - a memory squeeze must not
+    kill a job that would succeed with the RAM handed back."""
+    _release_ai_engine()
+    try:
+        return _transcribe_once(video_path, model_name, progress_cb,
+                                language)
+    except MemoryError:
+        _release_ai_engine()
+        if progress_cb:
+            progress_cb(5, "Memory was full - freed the AI engine, "
+                           "retrying transcription")
+        return _transcribe_once(video_path, model_name, progress_cb,
+                                language)
+
+
+def _transcribe_once(video_path, model_name="base", progress_cb=None,
+                     language="auto"):
+    """One transcription attempt (see transcribe() for the wrapper
+    that parks the AI engine and retries on MemoryError)."""
     if progress_cb:
         progress_cb(5, "Loading transcription model")
     model = _load_whisper_model(model_name, progress_cb)
@@ -1325,7 +1471,9 @@ def transcribe(video_path, model_name="base", progress_cb=None,
                 pct = 15 + int(min(seg.end, audio_dur) / audio_dur * 80)
                 if pct > _pct["last"]:
                     _pct["last"] = pct
-                    progress_cb(pct, "Transcribing audio")
+                    progress_cb(pct, f"Transcribing audio - "
+                                f"{_fmt_clock(seg.end)} of "
+                                f"{_fmt_clock(audio_dur)}")
             if seg.words:
                 for w in seg.words:
                     out.append(
@@ -3995,7 +4143,7 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
         painted by its "speaker" field (Speaker 1/2), overriding the
         highlight color. Words without a speaker field count as Speaker 1.
     hook_overlay: show the hook text as an animated overlay in the first
-        ~2.5s (top safe zone). False suppresses it entirely.
+        ~3s (top safe zone). False suppresses it entirely.
     cta_text: when set, shown as a faded overlay in the last 2 seconds
         (top safe zone).
     safe_zone: nudge captions/hook inside Reels UI safe areas (captions
@@ -4019,7 +4167,11 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
     W, H = int(res[0]), int(res[1])
     sx, sy = W / 1080.0, H / 1920.0
     cap_font = max(24, int(60 * sx))
-    hook_font = max(22, int(54 * sx))
+    # The hook is a TITLE card, not a caption line (2026-11-17,
+    # JpClips-look upgrade): sized well above the captions so the
+    # opening seconds read as a headline.
+    hook_font = max(28, int(84 * sx))
+    cta_font = max(22, int(54 * sx))
     # safe-zone: captions clear the Reels bottom UI (~20% of height),
     # hook clears the top bar
     cap_margin_v = int((360 if safe_zone else 240) * sy)
@@ -4050,13 +4202,35 @@ def build_ass(words, start_s, end_s, style_name, hook_text, out_path,
     body = []
     box_events = []
     use_box = bool(st.get("box"))
-    # hook overlay at the top, first ~2.5s (animated fade)
+    # Hook TITLE at the top, first ~3s: big bold text with a pop-in
+    # and a vector-drawn dark box behind it (this libass build
+    # ignores BorderStyle 3, so - like the caption boxes - the box
+    # is drawn with \p1 graphics, sized from the same per-character
+    # width estimate the caption boxes use, scaled to the hook font
+    # and wrapped onto as many lines as the text needs).
     if hook_text and hook_overlay:
-        hook_end = min(start_s + 2.5, end_s)
-        layer = 1 if use_box else 0
+        hook_end = min(start_s + 3.0, end_s)
         body.append(
-            f"Dialogue: {layer},{ts(start_s)},{ts(hook_end)},Hook,,0,0,0,,"
-            f"{{\\fad(250,250)}}{_esc(hook_text.upper())}")
+            f"Dialogue: 2,{ts(start_s)},{ts(hook_end)},Hook,,0,0,0,,"
+            f"{{\\fad(180,250)\\fscx94\\fscy94"
+            f"\\t(0,220,\\fscx100\\fscy100)}}"
+            f"{_esc(hook_text.upper())}")
+        _hk = hook_text.upper()
+        _est = (sum(20 if c == " " else
+                    24 if c in "ilj.,!;:'\"" else 36 for c in _hk)
+                + 56) * sx * (hook_font / max(cap_font, 1))
+        _maxw = max(W - 120 * sx, 200)
+        _lines = max(1, int(-(-_est // _maxw)))  # ceil
+        _bw = min(_est, _maxw)
+        _cx = W / 2.0
+        _x0, _x1 = _cx - _bw / 2 - 28 * sx, _cx + _bw / 2 + 28 * sx
+        _y0 = max(0, hook_margin_v - 20 * sy)
+        _y1 = _y0 + _lines * hook_font * 1.22 + 36 * sy
+        box_events.append(
+            f"Dialogue: 0,{ts(start_s)},{ts(hook_end)},"
+            f"Box,,0,0,0,,{{\\an7\\pos(0,0)\\p1}}"
+            f"m {_x0:.0f} {_y0:.0f} l {_x1:.0f} {_y0:.0f} "
+            f"l {_x1:.0f} {_y1:.0f} l {_x0:.0f} {_y1:.0f}{{\\p0}}")
     # CTA overlay: last 2 seconds, top safe zone, faded
     if cta_text:
         cta_start = max(start_s, end_s - 2.0)
@@ -4242,7 +4416,7 @@ ScaledBorderAndShadow: yes
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 {cap_style_line}
 Style: Hook,Arial,{hook_font},&H0000FFFF,&H00FFFFFF,&H00000000,&HCC000000,1,0,0,0,100,100,0,0,3,2,0,8,40,40,{hook_margin_v},1
-Style: CTA,Arial,{hook_font},&H00FFFFFF,&H00FFFFFF,&H00000000,&HCC000000,1,0,0,0,100,100,0,0,3,2,0,8,40,40,{hook_margin_v},1
+Style: CTA,Arial,{cta_font},&H00FFFFFF,&H00FFFFFF,&H00000000,&HCC000000,1,0,0,0,100,100,0,0,3,2,0,8,40,40,{hook_margin_v},1
 {box_style_line}
 
 [Events]
@@ -5591,6 +5765,100 @@ def _render_plain(video_path, start, end, keep_segs, ass_path,
     return out_path
 
 
+def _clip_has_faces(video_path, start, end):
+    """Sparse face check for the auto reframe: samples every ~2s
+    with the bundled detector. True when any face is found - and
+    also True when the detector is unavailable or anything goes
+    wrong, so the backdrop mode only ever engages on a POSITIVE
+    no-face finding from a working detector (a broken detector
+    must not reframe anyone's clips)."""
+    try:
+        from facetrack import FaceTracker, sample_face_centers
+        tracker = FaceTracker()
+        if tracker.backend == "none":
+            return True
+        samples = sample_face_centers(video_path, start, end,
+                                      tracker, sample_every=2.0)
+        return any(cx is not None for _, cx in samples)
+    except Exception:  # noqa: BLE001 - conservative by design
+        return True
+
+
+def _render_backdrop(video_path, start, end, keep_segs, ass_path,
+                     W, H, ratio, out_path, progress_cb=None,
+                     enhance_clarity=False, enc_preset="slow",
+                     enc_crf="16", force_cpu=False):
+    """Blurred-backdrop reframe (the GENERAL mode of the look the
+    user asked for, 2026-11-17): the full source width stays
+    visible, centred over a blurred, slightly darkened scale-to-
+    fill copy of itself - wide and group shots keep everyone in
+    frame instead of being cropped down to one face. Falls back
+    to the plain crop when the source is not wider than the
+    target ratio (nothing to pad)."""
+    src_w, src_h, _fps = probe_video(video_path)
+    if not src_w or not src_h or src_w / src_h <= W / H:
+        return _render_plain(video_path, start, end, keep_segs,
+                             ass_path, W, H, ratio, out_path,
+                             progress_cb,
+                             enhance_clarity=enhance_clarity,
+                             enc_preset=enc_preset, enc_crf=enc_crf,
+                             force_cpu=force_cpu)
+    graph_v = (
+        "split=2[bgin][fgin];"
+        f"[bgin]scale={W}:{H}:flags=lanczos"
+        f":force_original_aspect_ratio=increase,crop={W}:{H},"
+        f"gblur=sigma=42,eq=brightness=-0.12:saturation=0.85[bg];"
+        f"[fgin]scale={W}:-2:flags=lanczos[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2[vcomp]")
+    sub = (f"subtitles={_ffmpeg_ass_path(ass_path)}"
+           f"{_fontsdir_opt()}")
+    enh = (",hqdn3d=4:3:6:4.5,unsharp=5:5:0.7:5:5:0.0"
+           if enhance_clarity else "")
+    single = (len(keep_segs) == 1
+              and abs(keep_segs[0][0] - start) < 0.01
+              and abs(keep_segs[0][1] - end) < 0.01)
+    if single:
+        fc = f"[0:v]{graph_v};[vcomp]{sub}{enh}[vout]"
+        cmd = (["ffmpeg", "-y", "-v", "error",
+                "-ss", str(start), "-to", str(end),
+                "-i", video_path,
+                "-filter_complex", fc,
+                # "0:a?" - a silent source (no audio stream) must
+                # still render, like every other render path.
+                "-map", "[vout]", "-map", "0:a?"]
+               + encode_args_for(enc_preset, enc_crf, force_cpu)
+               + ["-c:a", "aac", "-b:a", "192k",
+                  "-movflags", "+faststart", out_path])
+    else:
+        vparts, aparts, vl, al = [], [], [], []
+        for i, (s, e) in enumerate(keep_segs):
+            vparts.append(f"[0:v]trim=start={s:.3f}:end={e:.3f},"
+                          f"setpts=PTS-STARTPTS[v{i}]")
+            aparts.append(f"[0:a]atrim=start={s:.3f}:end={e:.3f},"
+                          f"asetpts=PTS-STARTPTS[a{i}]")
+            vl.append(f"[v{i}]")
+            al.append(f"[a{i}]")
+        n = len(keep_segs)
+        vparts.append("".join(vl) + f"concat=n={n}:v=1:a=0[vcat]")
+        aparts.append("".join(al) + f"concat=n={n}:v=0:a=1[aout]")
+        fc = ";".join(vparts + aparts
+                      + [f"[vcat]{graph_v}",
+                         f"[vcomp]{sub}{enh}[vout]"])
+        cmd = (["ffmpeg", "-y", "-v", "error", "-i", video_path,
+                "-filter_complex", fc,
+                "-map", "[vout]", "-map", "[aout]"]
+               + encode_args_for(enc_preset, enc_crf, force_cpu)
+               + ["-c:a", "aac", "-b:a", "192k",
+                  "-movflags", "+faststart", out_path])
+    if progress_cb:
+        progress_cb(5, "Rendering clip (blurred backdrop)")
+    r = _run_encode(cmd, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0 or not os.path.exists(out_path):
+        raise RuntimeError("ffmpeg failed: " + r.stderr[-2000:])
+    return out_path
+
+
 def _overlay_logo(clip_path, logo_path):
     """Corner logo watermark (top-left, ~14% of clip width).
 
@@ -6084,7 +6352,8 @@ def make_cover(clip_path, cap_words, out_path, text, W=1080, H=1920):
 
 
 def render_clip(video_path, moment, words, style_name, out_path,
-                progress_cb=None, face_track=False, remove_fillers=False,
+                progress_cb=None, face_track=False, reframe=None,
+                remove_fillers=False,
                 remove_silences=False, auto_censor=False, emojis=False,
                 highlight=False, ratio="9:16", quality="1080p",
                 custom_styles=None, edited_words=None,
@@ -6105,7 +6374,7 @@ def render_clip(video_path, moment, words, style_name, out_path,
     speaker_colors -> (color1, color2) ASS colors: each caption word is
         painted by its heuristic speaker (Speaker 1/2 labels, honest -
         no identity claims). Overrides the highlight color.
-    hook_overlay -> show the hook text overlay in the first ~2.5s.
+    hook_overlay -> show the hook title overlay in the first ~3s.
     cta_text -> when set, shown as a faded overlay in the last 2s.
     safe_zone -> nudge captions/hook inside Reels UI safe areas.
     punch_zoom -> subtle zoom-punch on the hook + slow drift.
@@ -6253,12 +6522,37 @@ def render_clip(video_path, moment, words, style_name, out_path,
     out_path = _part_sibling(_final_out)
     _render_ok = False
     try:
-        if face_track:
+        # Reframe mode (2026-11-17, JpClips-look): "track" is the
+        # damped face-following crop; "backdrop" keeps the full
+        # width over a blurred backdrop; "crop" is the historical
+        # centre crop; "auto" (the face_track default) tracks when
+        # the clip has faces and falls back to the backdrop for
+        # faceless wide shots instead of cropping them blind.
+        _mode = str(reframe or "").strip().lower()
+        if _mode not in ("auto", "track", "backdrop", "crop"):
+            _mode = "auto" if face_track else "crop"
+        if _mode == "auto":
+            _mode = "track" if face_track else "crop"
+            if _mode == "track" and ratio == "9:16" \
+                    and not _clip_has_faces(video_path, start, end):
+                _mode = "backdrop"
+                if progress_cb:
+                    progress_cb(3, "No faces in this clip - using "
+                                   "the blurred-backdrop reframe")
+        if _mode == "backdrop" and ratio not in ("9:16", "4:5"):
+            _mode = "track" if face_track else "crop"
+        if _mode == "track":
             _render_tracked(video_path, start, end, keep_segs, removed,
                             ass_path, W, H, ratio, out_path, progress_cb,
                             punch_zoom=punch_zoom,
                             enc_preset=enc_preset, enc_crf=enc_crf,
                             face_center=face_center)
+        elif _mode == "backdrop":
+            _render_backdrop(video_path, start, end, keep_segs,
+                             ass_path, W, H, ratio, out_path,
+                             progress_cb,
+                             enhance_clarity=enhance_clarity,
+                             enc_preset=enc_preset, enc_crf=enc_crf)
         else:
             _render_plain(video_path, start, end, keep_segs, ass_path,
                           W, H, ratio, out_path, progress_cb,
@@ -7387,7 +7681,12 @@ def _remove_captions_temporal(src, out, W, H, y0, y1, duration, cb, tier):
                         win_mode = "wide"
                     else:
                         win_mode = "narrow"
-                except Exception:
+                except Exception as _ocr_e:
+                    # Detection degrades to the non-OCR path for this
+                    # window - log it, or a broken OCR stage looks
+                    # identical to "no captions found".
+                    print(f"[pipeline] caption-band OCR classify "
+                          f"failed, degrading: {_ocr_e!r}", flush=True)
                     mask_ocr = None
                 since_ocr = 0
             since_ocr += 1

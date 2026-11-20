@@ -309,7 +309,7 @@ async function poll() {
    renders the backend per-job event log incrementally, and the
    rail mirrors renders as they land in job state. */
 let liveLogJobId = null, liveLogRendered = 0, liveLogFirstT = -1;
-let liveThumbJob = null, lastRailSig = "";
+let lastRailSig = "";
 
 function fmtClock(epochSec) {
   const d = new Date(epochSec * 1000);
@@ -473,21 +473,8 @@ function updateLivePanel(st) {
   const bEl = $("liveBadge");
   bEl.textContent = badge;
   bEl.className = "live-badge " + badge.toLowerCase();
-  $("livePhaseChip").textContent = livePhaseFor(st);
-  const chip = $("liveStateChip");
-  chip.textContent = badge;
-  chip.className = "live-chip right " + badge.toLowerCase();
-  if (liveThumbJob !== jobId) {          // new job: clear stale thumb
-    liveThumbJob = jobId;
-    $("liveThumb").removeAttribute("src");
-    hide($("liveThumb")); show($("liveThumbFallback"));
-  }
-  const vsrc = thumbLoadedFor === jobId
-    ? $("videoThumb").getAttribute("src") : null;
-  if (vsrc && $("liveThumb").getAttribute("src") !== vsrc) {
-    $("liveThumb").src = vsrc;
-    show($("liveThumb")); hide($("liveThumbFallback"));
-  }
+  $("livePhaseLine").innerHTML = "&gt; PHASE: <b>"
+    + escapeHtml(livePhaseFor(st)) + "</b>";
   $("liveLine1").innerHTML = "&gt; AUDIO_TRANSCRIPT: <b>"
     + (st.word_count ? st.word_count + " WORDS READY"
        : st.status === "error" ? "ERROR" : "PROCESSING") + "</b>";
@@ -622,11 +609,17 @@ $("batchBtn").addEventListener("click", async () => {
     if (b.status === "missing") { clearInterval(batchTimer); return; }
     $("batchStatus").textContent = `Imported ${b.done}/${b.total}…`;
     refreshQueue();
-    if (b.status === "done") {
+    if (b.status === "done" || b.status === "done_with_errors") {
       clearInterval(batchTimer);
       $("batchBtn").disabled = false;
-      $("batchStatus").textContent = `Done — ${b.total} videos imported. Click one above.`;
-      toast(`Batch done — ${b.total} videos`);
+      if (b.status === "done_with_errors") {
+        const okCount = b.total - (b.failed || 0);
+        $("batchStatus").textContent = `Done — ${okCount} of ${b.total} videos imported, ${b.failed || 0} failed. Failed ones show their reason in the job list.`;
+        toast(`Batch done — ${b.failed || 0} of ${b.total} failed`);
+      } else {
+        $("batchStatus").textContent = `Done — ${b.total} videos imported. Click one above.`;
+        toast(`Batch done — ${b.total} videos`);
+      }
       if (b.job_ids && b.job_ids.length && !jobId) selectJob(b.job_ids[0]);
     }
   }, 1500);
@@ -695,6 +688,7 @@ function initControls() {
   $("fillerCheck").checked = !!settings.remove_fillers;
   $("censorCheck").checked = !!settings.auto_censor;
   $("faceTrackCheck").checked = settings.face_track !== false;
+  if ($("reframeSel")) $("reframeSel").value = settings.reframe || "auto";
   $("speakerColorsCheck").checked = !!settings.speaker_colors;
   $("hookOverlayCheck").checked = settings.hook_overlay !== false;
   $("ctaOverlayCheck").checked = settings.cta_overlay !== false;
@@ -1601,6 +1595,7 @@ function collectRenderOptions() {
     caption_style: captionStyle,
     ratio, quality, quality_tier: encodeTier,
     face_track: $("faceTrackCheck").checked,
+    reframe: $("reframeSel") ? $("reframeSel").value : "auto",
     remove_fillers: $("fillerCheck").checked,
     remove_silences: $("silencesCheck").checked,
     auto_censor: $("censorCheck").checked,

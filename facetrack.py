@@ -151,45 +151,97 @@ def sample_face_centers(video_path, start_s, end_s, tracker,
 
 
 def smooth_trajectory(samples, src_w, crop_w, max_gap_s=2.5):
-    """Turn raw (t, cx) samples into a smoothed (t, x_left) trajectory.
+    """Turn raw (t, cx) samples into a damped (t, x_left) trajectory.
 
     - Forward-fills short gaps (face briefly lost), drifts to center on
       long gaps.
     - Centered moving average kills jitter.
+    - SAFE-ZONE DEADBAND: the window then holds perfectly still while
+      the (smoothed) face centre stays inside a central zone of the
+      crop window, and moves only enough to bring it back to the zone
+      edge when it leaves - a talking head's small shifts no longer
+      drag the frame around (the calm-camera behaviour users asked
+      for, 2026-11-17).
+    - VELOCITY CAP: the window's pan speed is capped, so even a fast
+      walk across the frame reads as a smooth glide, never a swing.
     - Clamps the window inside the frame.
     """
     if not samples:
         return []
     center_left = (src_w - crop_w) / 2.0
 
-    # 1. fill gaps
+    # 1. fill gaps (drift points are marked: no subject is visible,
+    # so the deadband below must not apply to them - the window is
+    # supposed to re-centre fully, not stop at the zone edge)
     filled = []
     last_cx, gap_start = None, None
     for t, cx in samples:
         if cx is not None:
             last_cx, gap_start = cx, None
-            filled.append((t, cx))
+            filled.append((t, cx, False))
         else:
             if gap_start is None:
                 gap_start = t
             if last_cx is not None and (t - gap_start) <= max_gap_s:
-                filled.append((t, last_cx))  # hold last position
+                filled.append((t, last_cx, False))  # hold last position
             else:
-                filled.append((t, src_w / 2.0))  # drift to center
+                filled.append((t, src_w / 2.0, True))  # drift to center
 
     # 2. moving average over x (window of 5 samples)
-    xs = np.array([c for _, c in filled], dtype=float)
-    ts = np.array([t for t, _ in filled], dtype=float)
+    xs = np.array([c for _, c, _ in filled], dtype=float)
+    ts = np.array([t for t, _, _ in filled], dtype=float)
+    drift = [d for _, _, d in filled]
     k = 5
     kernel = np.ones(k) / k
     pad = k // 2
     padded = np.pad(xs, pad, mode="edge")
     smooth = np.convolve(padded, kernel, mode="valid")
 
-    # 3. clamp to frame
+    # 3. safe-zone deadband around the held window centre: the face
+    # may roam the middle SAFE_ZONE_FRAC of the crop window without
+    # the window moving at all; outside it, the window follows only
+    # far enough to return the face to the zone edge.
+    zone_half = 0.5 * SAFE_ZONE_FRAC * crop_w
+    held = float(smooth[0])
+    centred = np.empty_like(smooth)
+    for i, cx in enumerate(smooth):
+        if drift[i]:
+            held = src_w / 2.0  # no subject: re-centre completely
+        elif cx > held + zone_half:
+            held = cx - zone_half
+        elif cx < held - zone_half:
+            held = cx + zone_half
+        centred[i] = held
+
+    # 4. velocity cap on the window's left edge (pixels per second),
+    # walked in time order using the real sample spacing.
+    lefts = centred - crop_w / 2.0
+    max_step_v = MAX_PAN_FRAC * crop_w
+    for i in range(1, len(lefts)):
+        dt = max(float(ts[i] - ts[i - 1]), 1e-3)
+        step = lefts[i] - lefts[i - 1]
+        # Re-centring after a long gap is a deliberate camera move,
+        # not subject tracking: it glides at its own faster cap so
+        # the window actually arrives at centre.
+        cap = (DRIFT_PAN_FRAC if drift[i] else MAX_PAN_FRAC) \
+            * crop_w * dt
+        if step > cap:
+            lefts[i] = lefts[i - 1] + cap
+        elif step < -cap:
+            lefts[i] = lefts[i - 1] - cap
+
+    # 5. clamp to frame
     max_left = max(src_w - crop_w, 0)
-    lefts = np.clip(smooth - crop_w / 2.0, 0, max_left)
+    lefts = np.clip(lefts, 0, max_left)
     return list(zip(ts.tolist(), lefts.tolist()))
+
+
+# Damping tuning (facetrack): the face may roam the middle 36% of
+# the crop window without moving it, and the window pans at most
+# 60% of its own width per second.
+SAFE_ZONE_FRAC = 0.36
+MAX_PAN_FRAC = 0.60
+DRIFT_PAN_FRAC = 1.20
 
 
 def interpolate_x(trajectory, t):

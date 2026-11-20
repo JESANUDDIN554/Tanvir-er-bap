@@ -289,19 +289,8 @@
     </div>
     <div class="live-grid">
       <div class="live-main">
-        <div class="live-frame" id="liveFrame">
-          <img id="liveThumb" class="hidden" alt="video thumbnail">
-          <div id="liveThumbFallback" class="live-thumb-fallback">
-            <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="3"/><path d="M10 9l5 3-5 3z" fill="currentColor" stroke="none"/></svg>
-          </div>
-          <div class="live-grid-overlay"></div>
-          <div class="live-scanline" id="liveScanline"></div>
-          <span class="live-corner tl"></span><span class="live-corner tr"></span>
-          <span class="live-corner bl"></span><span class="live-corner br"></span>
-          <span id="livePhaseChip" class="live-chip left">SCANNING CONTENT</span>
-          <span id="liveStateChip" class="live-chip right">PROCESSING</span>
-        </div>
         <div class="live-readouts">
+          <div class="live-line" id="livePhaseLine">&gt; PHASE: —</div>
           <div class="live-line" id="liveLine1">&gt; AUDIO_TRANSCRIPT: —</div>
           <div class="live-line" id="liveLine2">&gt; ANALYSIS: —</div>
           <div class="live-eq" id="liveEq" aria-hidden="true">
@@ -500,8 +489,17 @@
       <label class="switch-row" for="fillerCheck"><span class="switch-text">Remove filler words <span class="hint">— um, uh, like, you know…</span></span><span class="switch"><input type="checkbox" id="fillerCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="censorCheck"><span class="switch-text">Auto-censor <span class="hint">— beep over profanity</span></span><span class="switch"><input type="checkbox" id="censorCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="faceTrackCheck"><span class="switch-text">Face-tracked reframe <span class="hint">— follows the speaker (slower)</span></span><span class="switch"><input type="checkbox" id="faceTrackCheck"><span class="track"><span class="thumb"></span></span></span></label>
+      <div class="row row-tight">
+        <label class="field-label" for="reframeSel">Reframe style (9:16)</label>
+        <select id="reframeSel" class="mini-select">
+          <option value="auto">Auto — track faces, backdrop if none</option>
+          <option value="track">Face track — calm, damped follow</option>
+          <option value="backdrop">Blurred backdrop — keep full picture</option>
+          <option value="crop">Centre crop</option>
+        </select>
+      </div>
       <label class="switch-row" for="speakerColorsCheck"><span class="switch-text">Speaker color captions <span class="hint">— Speaker 1/2 get different caption colors (heuristic split)</span></span><span class="switch"><input type="checkbox" id="speakerColorsCheck"><span class="track"><span class="thumb"></span></span></span></label>
-      <label class="switch-row" for="hookOverlayCheck"><span class="switch-text">Hook text overlay <span class="hint">— punchiest line over the first ~2.5s</span></span><span class="switch"><input type="checkbox" id="hookOverlayCheck"><span class="track"><span class="thumb"></span></span></span></label>
+      <label class="switch-row" for="hookOverlayCheck"><span class="switch-text">Hook text overlay <span class="hint">— punchiest line as a big title over the first ~3s</span></span><span class="switch"><input type="checkbox" id="hookOverlayCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="ctaOverlayCheck"><span class="switch-text">CTA overlay <span class="hint">— call-to-action in the last 2 seconds</span></span><span class="switch"><input type="checkbox" id="ctaOverlayCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="punchZoomCheck"><span class="switch-text">Punch-in zoom <span class="hint">— subtle zoom on the hook + slow drift</span></span><span class="switch"><input type="checkbox" id="punchZoomCheck"><span class="track"><span class="thumb"></span></span></span></label>
       <label class="switch-row" for="zoomBeatsCheck"><span class="switch-text">Emphasis zoom <span class="hint">— punch in on the strongest spoken beat</span></span><span class="switch"><input type="checkbox" id="zoomBeatsCheck"><span class="track"><span class="thumb"></span></span></span></label>

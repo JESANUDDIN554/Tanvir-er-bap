@@ -1630,8 +1630,10 @@ def check_once():
 def _worker_loop():
     try:
         _reconcile_boot()
-    except Exception:  # noqa: BLE001 - worker must survive
-        pass
+    except Exception as e:  # noqa: BLE001 - worker must survive
+        # Survive, but never silently: a boot reconcile that fails on
+        # every start would otherwise be invisible forever.
+        print(f"[publishing] boot reconcile failed: {e!r}", flush=True)
     tick = _env_float("ITRAJI_PUB_TICK", 2)
     while not _WORKER["stop"]:
         try:
@@ -1640,8 +1642,15 @@ def _worker_loop():
                 _run_claimed(job)
                 continue
             check_once()
-        except Exception:  # noqa: BLE001 - worker must survive
-            pass
+        except Exception as e:  # noqa: BLE001 - worker must survive
+            # Log at most once a minute: a persistent failure (store
+            # corruption, adapter bug) must be diagnosable from the
+            # log instead of looking like a healthy idle worker.
+            now = time.time()
+            if now - _WORKER.get("last_err_log", 0) > 60:
+                _WORKER["last_err_log"] = now
+                print(f"[publishing] worker loop error: {e!r}",
+                      flush=True)
         time.sleep(tick)
 
 

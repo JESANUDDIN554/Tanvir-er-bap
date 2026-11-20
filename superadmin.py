@@ -253,8 +253,15 @@ class CliperTracker:
                     self.emit("session.heartbeat", {})
                     next_heartbeat = time.time() + self._heartbeat_seconds
                 self.flush_once()
-            except Exception:  # noqa: BLE001 - the loop must survive
-                pass
+            except Exception as e:  # noqa: BLE001 - the loop must survive
+                # Survive, but surface it (throttled): a flush that
+                # fails forever would otherwise look like a healthy
+                # tracker while events pile up in the outbox.
+                now = time.time()
+                if now - getattr(self, "_last_err_log", 0) > 300:
+                    self._last_err_log = now
+                    print(f"[superadmin] flush loop error: {e!r}",
+                          flush=True)
             self._stop.wait(self._flush_interval)
 
 
