@@ -65,6 +65,14 @@ function syncSidebar(view) {
   const t = $("viewTitle");
   if (t && VIEW_TITLES[view]) t.textContent = VIEW_TITLES[view];
   document.body.dataset.view = view;
+  // The Live Analysis panel belongs to the Clip Maker only (user,
+  // 2026-11-20: it followed him into every tool page and the
+  // Library). Every view switch funnels through here, so hiding it
+  // on any non-wizard view covers sidebar, hub cards and Back alike.
+  if (view !== "wizard") {
+    const lp = $("livePanel");
+    if (lp) { lp.classList.add("hidden"); lp.classList.remove("live"); }
+  }
 }
 
 const $ = (id) => document.getElementById(id);
@@ -466,7 +474,10 @@ async function watchTranslate() {
 function updateLivePanel(st) {
   const panel = $("livePanel");
   const active = st.status === "working" || st.status === "error";
-  if (!active) { hide(panel); panel.classList.remove("live"); return; }
+  // Clip Maker view only - never show on tool pages / Library / hub.
+  if (!active || document.body.dataset.view !== "wizard") {
+    hide(panel); panel.classList.remove("live"); return;
+  }
   show(panel);
   panel.classList.toggle("live", st.status === "working");
   const badge = st.status === "error" ? "ERROR" : "PROCESSING";
@@ -557,6 +568,14 @@ function resetForNewImport() {
 function detectModeReadyReset() { /* controls re-init on next transcribed poll */ }
 
 /* ---------------- step 1 events ---------------- */
+$("dlQualitySel").addEventListener("change", async () => {
+  settings.download_quality = $("dlQualitySel").value;
+  try {
+    await api.save_settings(
+      { download_quality: settings.download_quality });
+  } catch (e) { /* offline */ }
+});
+
 $("importBtn").addEventListener("click", async () => {
   const url = $("urlInput").value.trim();
   if (!url) return;
@@ -6056,6 +6075,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     settings = await api.get_settings();
     sel.value = settings.language || "auto";
     $("cookiesCheck").checked = !!settings.use_cookies;
+    $("dlQualitySel").value = settings.download_quality || "max";
   } catch (e) { /* offline-safe defaults below */ }
   applyTheme();
   syncQualityAvailability();

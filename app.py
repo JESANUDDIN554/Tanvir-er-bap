@@ -479,6 +479,7 @@ DEFAULT_SETTINGS = {
     "face_track": True,
     "reframe": "auto",             # auto/track/backdrop/crop (9:16)
     "use_cookies": False,
+    "download_quality": "max",       # max (2160p) / fast (1080p)
     # Opus-gap features (all offline-first; new toggles)
     "speaker_colors": False,       # Speaker 1/2 caption colors
     "speaker_color_1": "#ffd166",
@@ -654,6 +655,14 @@ def save_settings(data):
         _SETTINGS_LOAD_WARNING["active"] = False
     except OSError:
         pass
+
+
+def _dl_max_height(settings=None):
+    """Download-quality switch -> pipeline height cap. 'fast' pulls
+    1080p sources (roughly 3-4x smaller downloads); anything else is
+    Max (2160p). The rendered clips are 1080x1920 either way."""
+    s = settings if settings is not None else load_settings()
+    return 1080 if s.get("download_quality") == "fast" else 2160
 
 
 def _apply_perf_settings():
@@ -2234,7 +2243,8 @@ class Api:
             _job_log(job_id, "Download started")
             video_path, title, duration = download_video(
                 url, workdir, _job_progress(job_id),
-                use_cookies=use_cookies)
+                use_cookies=use_cookies,
+                max_height=_dl_max_height())
             job.update({"video_path": video_path, "title": title,
                         "duration": duration})
             try:
@@ -2794,7 +2804,8 @@ class Api:
                 src, _dl_title, _dl_dur = download_video(
                     source, work,
                     lambda p, t: cb(int(p * 0.25), t),
-                    use_cookies=bool(settings.get("use_cookies")))
+                    use_cookies=bool(settings.get("use_cookies")),
+                    max_height=_dl_max_height(settings))
                 try:
                     _mb = os.path.getsize(src) / (1024 * 1024)
                     _remover_log(rid, f"Download finished ({_mb:.1f} MB)")
@@ -2942,7 +2953,8 @@ class Api:
                 src, _dl_title, _dl_dur = download_video(
                     source, work,
                     lambda p, t: cb(int(p * 0.25), t),
-                    use_cookies=bool(settings.get("use_cookies")))
+                    use_cookies=bool(settings.get("use_cookies")),
+                    max_height=_dl_max_height(settings))
                 _remover_log(rid, "Download finished")
             else:
                 src = source
@@ -3961,12 +3973,19 @@ class Api:
             # the hook)
             ic = None
             if clip_index >= 0:
-                for i, r in enumerate(job.get("renders", [])):
-                    if r.get("moment_index") == clip_index \
-                            and not r.get("hook_clip") \
-                            and not r.get("merged") \
-                            and os.path.isfile(r.get("path", "")):
-                        ic = i
+                # Prefer the vertical (9:16) straight render when a
+                # moment exists in several aspects; fall back to any.
+                for _want in (("9:16", None), ("any",)):
+                    for i, r in enumerate(job.get("renders", [])):
+                        if r.get("moment_index") == clip_index \
+                                and not r.get("hook_clip") \
+                                and not r.get("merged") \
+                                and ("any" in _want
+                                     or r.get("aspect") in _want) \
+                                and os.path.isfile(r.get("path", "")):
+                            ic = i
+                            break
+                    if ic is not None:
                         break
             if ic is None:
                 outdir = os.path.join(_job_folder(job_id), "clips")
@@ -4005,13 +4024,16 @@ class Api:
         fresh render with no hook overlay of its own (the cold open
         carries the hook). Mirrors the hook+clip reuse rule."""
         if clip_index >= 0:
-            for i, r in enumerate(job.get("renders", [])):
-                if r.get("moment_index") == clip_index \
-                        and not r.get("hook_clip") \
-                        and not r.get("merged") \
-                        and not r.get("teaser") \
-                        and os.path.isfile(r.get("path", "")):
-                    return i
+            for _want in (("9:16", None), ("any",)):
+                for i, r in enumerate(job.get("renders", [])):
+                    if r.get("moment_index") == clip_index \
+                            and not r.get("hook_clip") \
+                            and not r.get("merged") \
+                            and not r.get("teaser") \
+                            and ("any" in _want
+                                 or r.get("aspect") in _want) \
+                            and os.path.isfile(r.get("path", "")):
+                        return i
         outdir = os.path.join(_job_folder(job_id), "clips")
         os.makedirs(outdir, exist_ok=True)
         out = self._hook_out_path(job, outdir, "teaserclip")
@@ -5673,10 +5695,17 @@ class Api:
         # Keep clips from earlier render batches: a second batch must
         # extend the project, not replace it (Download-all relies on
         # the full list). Clips whose moment is being re-rendered now
-        # are dropped here and re-added below with their fresh file.
+        # IN THE SAME ASPECT are dropped here and re-added below with
+        # their fresh file; the same moment in a DIFFERENT aspect is
+        # a different deliverable (TikTok 9:16 vs YouTube 16:9) and
+        # must survive - before 2026-11-20 it was silently replaced
+        # because the filename carried no aspect.
         redo = set(indices)
+        _batch_ratio = opts.get("ratio", "9:16")
         renders = [r for r in job.get("renders", [])
-                   if r.get("moment_index") not in redo
+                   if not (r.get("moment_index") in redo
+                           and (r.get("aspect") or "9:16")
+                           == _batch_ratio)
                    and os.path.isfile(r.get("path", ""))]
         # Caption Studio: explicit per-render caption params
         # (normalized once here for storage; render_clip normalizes
@@ -5713,9 +5742,13 @@ class Api:
                 safe = "".join(c if c.isalnum() or c in " -_" else ""
                                for c in m["title"])[:40].strip() or "clip"
                 tag = "_reels-safe" if opts.get("safe_zone") else ""
-                # named by MOMENT index (stable across batches), so
-                # two batches can never overwrite each other's files
-                out = os.path.join(outdir, f"{i + 1:02d}_{safe}{tag}.mp4")
+                # Named by MOMENT index + ASPECT (stable across
+                # batches): re-rendering the same moment for another
+                # platform must never overwrite the first file.
+                _atag = "_" + str(opts.get("ratio", "9:16")).replace(
+                    ":", "x")
+                out = os.path.join(outdir,
+                                   f"{i + 1:02d}_{safe}{tag}{_atag}.mp4")
                 self._call_render_clip(job_id, job, m, out, opts)
                 # Speed pass: record which encoder actually produced
                 # this clip (GPU/CPU) so the job is honest about it.

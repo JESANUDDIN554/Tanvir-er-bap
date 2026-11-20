@@ -570,8 +570,14 @@ def _download_once(url, out_dir, progress_cb, extra_opts, attempt_label,
     return path, title, duration
 
 
-def download_video(url, out_dir, progress_cb=None, use_cookies=False):
-    """Download best <=720p mp4. Returns (video_path, title, duration_sec).
+def download_video(url, out_dir, progress_cb=None, use_cookies=False,
+                   max_height=2160):
+    """Download a source video. Returns (video_path, title, duration).
+
+    max_height caps the downloaded resolution (the Settings ->
+    Download quality switch): 2160 = Max (best source for crops,
+    big files), 1080 = Fast (roughly 3-4x smaller downloads; the
+    rendered clips are 1080x1920 either way).
 
     Retry chain for YouTube's bot check: normal -> android player client
     (usually bypasses the check) -> browser cookies (chrome -> edge).
@@ -580,6 +586,13 @@ def download_video(url, out_dir, progress_cb=None, use_cookies=False):
     Raises RuntimeError("youtube_bot_check") when YouTube's bot wall
     blocks every attempt.
     """
+    try:
+        _h = int(max_height)
+    except (TypeError, ValueError):
+        _h = 2160
+    _h = max(144, min(4320, _h))
+    _fmt = (f"bv*[height<={_h}][ext=mp4]+ba[ext=m4a]"
+            f"/b[height<={_h}][ext=mp4]/b[height<={_h}]/b")
     attempts = []  # (label, extra_opts)
     if use_cookies:
         for browser in ("chrome", "edge", "firefox"):
@@ -615,7 +628,8 @@ def download_video(url, out_dir, progress_cb=None, use_cookies=False):
                  _tracker=tracker, _holder=holder):
             try:
                 _holder["result"] = _download_once(
-                    url, _dir, progress_cb, _extra, _label,
+                    url, _dir, progress_cb,
+                    {**_extra, "format": _fmt}, _label,
                     tracker=_tracker)
             except Exception as e:  # noqa: BLE001 - surfaced by caller
                 _holder["error"] = e
@@ -1240,7 +1254,11 @@ def _transcribe_chunked(model, wav_path, lang, progress_cb):
         try:
             words = _chunked_decode(model, reader, lang, progress_cb,
                                     pct, use_vad=True)
-        except Exception:
+        except Exception as exc:
+            if _is_cuda_lib_error(exc):
+                # Broken GPU stack, not a VAD problem - let
+                # transcribe() restart the attempt on the CPU.
+                raise
             # Same contract as the whole-file path: retry once
             # without VAD - the usual culprit - keeping the language.
             if progress_cb:
@@ -1380,6 +1398,24 @@ def _release_ai_engine():
         pass
 
 
+def _is_cuda_lib_error(exc):
+    """True when the error is the CUDA runtime libraries failing to
+    load (cublas / cudnn / cudart DLLs missing). ctranslate2 can
+    enumerate a GPU and even load the model without them - the
+    first decode then dies with e.g. "Library cublas64_12.dll is
+    not found or cannot be loaded" (a real RTX 5060 PC, 2026-11-20,
+    where the card was fine but the CUDA runtime DLLs were not on
+    the system). That is a broken GPU stack, not a broken job:
+    transcription must continue on the CPU."""
+    msg = str(exc).lower()
+    if any(tok in msg for tok in ("cublas", "cudnn", "cudart",
+                                  "cufft", "curand", "cusparse",
+                                  "cuda_error", "cuda error")):
+        return True
+    return "cannot be loaded" in msg and (".dll" in msg
+                                          or "library" in msg)
+
+
 def transcribe(video_path, model_name="base", progress_cb=None,
                language="auto"):
     """Transcribe with word-level timestamps. Returns list of word dicts.
@@ -1389,18 +1425,36 @@ def transcribe(video_path, model_name="base", progress_cb=None,
     The AI engine is parked first (see _release_ai_engine), and a
     MemoryError anywhere in the attempt earns exactly one retry
     after freeing everything again - a memory squeeze must not
-    kill a job that would succeed with the RAM handed back."""
+    kill a job that would succeed with the RAM handed back. A
+    CUDA-library failure while running on the GPU earns one retry
+    on the CPU with CUDA disabled for the rest of the session -
+    the GPU probe can see the card, but only a real decode proves
+    the runtime libraries are actually installed."""
     _release_ai_engine()
-    try:
-        return _transcribe_once(video_path, model_name, progress_cb,
-                                language)
-    except MemoryError:
-        _release_ai_engine()
-        if progress_cb:
-            progress_cb(5, "Memory was full - freed the AI engine, "
-                           "retrying transcription")
-        return _transcribe_once(video_path, model_name, progress_cb,
-                                language)
+    mem_retried = False
+    while True:
+        try:
+            return _transcribe_once(video_path, model_name,
+                                    progress_cb, language)
+        except MemoryError:
+            if mem_retried:
+                raise
+            mem_retried = True
+            _release_ai_engine()
+            if progress_cb:
+                progress_cb(5, "Memory was full - freed the AI "
+                               "engine, retrying transcription")
+        except Exception as exc:  # noqa: BLE001 - re-raised unless CUDA-lib
+            if (_WHISPER_DEVICE.get("used") == "cuda"
+                    and _is_cuda_lib_error(exc)):
+                _WHISPER_DEVICE["cuda_ok"] = False
+                _WHISPER_DEVICE["used"] = None
+                if progress_cb:
+                    progress_cb(5, "GPU transcription failed "
+                                   "(missing CUDA library) - "
+                                   "switching to CPU")
+                continue
+            raise
 
 
 def _transcribe_once(video_path, model_name="base", progress_cb=None,
@@ -1499,7 +1553,12 @@ def _transcribe_once(video_path, model_name="base", progress_cb=None,
         segments, _info = model.transcribe(
             audio, word_timestamps=True, vad_filter=True, language=lang)
         words = _collect(segments)
-    except Exception:
+    except Exception as exc:
+        if _is_cuda_lib_error(exc):
+            # Not a VAD problem - the GPU stack itself is broken.
+            # Retrying on the same device would die identically;
+            # let transcribe() restart the attempt on the CPU.
+            raise
         # The fallback must cover DECODE-TIME failures too:
         # model.transcribe() returns a lazy generator, so most real
         # errors surface while _collect iterates it, not at the call.
