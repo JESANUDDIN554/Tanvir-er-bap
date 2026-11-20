@@ -510,6 +510,15 @@ def _download_once(url, out_dir, progress_cb, extra_opts, attempt_label,
     os.makedirs(out_dir, exist_ok=True)
     out_tmpl = os.path.join(out_dir, "source.%(ext)s")
 
+    # Display state for THIS attempt: DASH fragment estimates make
+    # the reported total jump up and down (his log showed 763 ->
+    # 787 -> 731 MB) and yt-dlp's per-fragment ETA collapses with
+    # it ("~21 sec left" at 15% done). Keep the largest total seen
+    # and smooth the speed, so the numbers he watches are stable
+    # and the ETA is computed from the whole download, not one
+    # fragment.
+    disp = {"total": 0, "speed": 0.0}
+
     def hook(d):
         if tracker is not None:
             tracker["bytes"] = d.get("downloaded_bytes") or tracker.get(
@@ -517,6 +526,9 @@ def _download_once(url, out_dir, progress_cb, extra_opts, attempt_label,
             tracker["t"] = time.time()
         if progress_cb and d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            if total > disp["total"]:
+                disp["total"] = total
+            total = disp["total"]
             done = d.get("downloaded_bytes") or 0
             pct = (done / total * 100) if total else 0
             # The user must SEE where the download is: how much has
@@ -531,9 +543,11 @@ def _download_once(url, out_dir, progress_cb, extra_opts, attempt_label,
                 msg += f" - {done / 1048576:.1f} MB"
             speed = d.get("speed") or 0
             if speed:
-                msg += f" - {speed / 1048576:.1f} MB/s"
-                eta = d.get("eta")
-                if eta and total:
+                disp["speed"] = (speed if not disp["speed"]
+                                 else disp["speed"] * 0.7 + speed * 0.3)
+                msg += f" - {disp['speed'] / 1048576:.1f} MB/s"
+                if total and disp["speed"] > 0 and done < total:
+                    eta = (total - done) / disp["speed"]
                     msg += (f" - ~{int(eta) // 60} min left"
                             if eta >= 90 else f" - ~{int(eta)} sec left")
             if attempt_label:
@@ -552,7 +566,16 @@ def _download_once(url, out_dir, progress_cb, extra_opts, attempt_label,
         # hang the import forever (2026-11-18: a job sat on
         # "Download started" for 30+ minutes with no error at all).
         "socket_timeout": 20,
-        "fragment_retries": 3,
+        "fragment_retries": 10,
+        # YouTube throttles a SINGLE media connection to roughly
+        # 8-10 MB/s no matter how fast the line is (his 870 Mbps
+        # line - 109 MB/s - showed 8.4 MB/s in the app, 2026-11-21).
+        # DASH video arrives as fragments: pull several at once on
+        # parallel connections so the download can actually use
+        # the line. http_chunk_size does the same job for the
+        # single-file formats (ranged chunks instead of one stream).
+        "concurrent_fragment_downloads": 8,
+        "http_chunk_size": 10 * 1024 * 1024,
     }
     opts.update(extra_opts or {})
     with yt_dlp.YoutubeDL(opts) as ydl:
