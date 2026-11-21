@@ -1644,7 +1644,25 @@ def _launch_server(binary, progress_cb=None, extra_args=(), ctx=None):
             os.replace(log_path, log_path + ".old")
     except OSError:
         pass
-    log = open(log_path, "ab")
+    # LLAMA_DIR is the CPU engine's folder; when only the GPU
+    # engine is installed (or the data dir was reset) it may not
+    # exist yet - and the log must never be the reason the brain
+    # cannot start (real RTX 5060 PC, 2026-11-22: detection died
+    # with "[Errno 2] No such file or directory: ...\\llama\\
+    # server.log" before the server even launched). Create it,
+    # and if the log still cannot be opened, fall back to a temp
+    # log, then to DEVNULL.
+    try:
+        os.makedirs(LLAMA_DIR, exist_ok=True)
+        log = open(log_path, "ab")
+    except OSError:
+        try:
+            import tempfile
+            log = open(os.path.join(
+                tempfile.gettempdir(),
+                "itraji-llama-server.log"), "ab")
+        except OSError:
+            log = open(os.devnull, "ab")
     cmd = [binary, "-m", model_path(),
            "--host", "127.0.0.1", "--port", str(port),
            "-t", str(os.cpu_count() or 4)]

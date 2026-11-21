@@ -1691,6 +1691,15 @@
       </div>
     </div>
     <div class="field">
+      <label class="field-label">AI Training Data <span class="hint">— teach a future brain upgrade your taste</span></label>
+      <p class="sub" style="margin:6px 0 0">While you work, Cliper quietly saves each video's transcript, the moments the AI proposed, and which ones you actually rendered. That collection is the training data for a future fine-tuned brain that picks moments the way you do. It stays on this PC only — nothing is uploaded. Around 200+ collected videos make a real training run possible.</p>
+      <div class="row row-tight" style="margin-top:8px">
+        <label class="switch-row" for="tdCollectCheck" style="flex:1"><span class="switch-text">Collect training data <span class="hint">— on is recommended; off stops new snapshots, the ones already saved stay</span></span><span class="switch"><input type="checkbox" id="tdCollectCheck" checked><span class="track"><span class="thumb"></span></span></span></label>
+        <button id="tdExportBtn" class="ghost-btn small" type="button">Export dataset</button>
+      </div>
+      <p class="hint" id="tdStats">Checking…</p>
+    </div>
+    <div class="field">
       <label class="field-label">Storage <span class="hint">— where the big files live</span></label>
       <p class="sub" style="margin:6px 0 0">Put the AI model (~9 GB) and new projects on a bigger drive, e.g. D:\ItrajiData. If the model is already downloaded, saving a new location moves it there safely. Existing projects stay where they are and stay in your Library — the location applies to new projects. Or press <b>Move everything to this drive</b> to carry the model AND all your existing projects and clips to the new location in one go, emptying the old drive.</p>
       <p class="sub" id="storageState" style="margin:6px 0 0">Checking…</p>

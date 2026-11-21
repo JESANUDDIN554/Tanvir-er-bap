@@ -52,6 +52,7 @@ import superadmin  # noqa: E402  (opt-in Super Admin connection + SDK)
 import ai_components  # noqa: E402  (AI Installation Manager backend)
 import ai_endpoint  # noqa: E402  (FB Automation Built-in AI channel, contract v1.1)
 import studio  # noqa: E402  (Step 3: send clips to FB Automation OS)
+import training_data  # noqa: E402  (AI training-data collector)
 import licensing  # noqa: E402  (signed license + core pack + integrity)
 import updater  # noqa: E402  (signed file-replacement update packs)
 from pipeline import load_corepack as _load_corepack  # noqa: E402
@@ -480,6 +481,9 @@ DEFAULT_SETTINGS = {
     "reframe": "auto",             # auto/track/backdrop/crop (9:16)
     "use_cookies": False,
     "download_quality": "max",       # max (2160p) / fast (1080p)
+    "training_collect": True,        # AI Training Data: keep
+                                   # transcript + pick snapshots
+                                   # for a future brain fine-tune
     # Opus-gap features (all offline-first; new toggles)
     "speaker_colors": False,       # Speaker 1/2 caption colors
     "speaker_color_1": "#ffd166",
@@ -749,6 +753,7 @@ def _sa_save_settings_patch(patch):
 superadmin.bind_settings(load_settings, _sa_save_settings_patch,
                          APP_VERSION, lambda: local_ai.DATA_DIR)
 superadmin.start_if_connected()
+training_data.bind_settings(load_settings)
 
 
 # ---------------------------------------------------------------------------
@@ -2490,6 +2495,8 @@ class Api:
             _job_log(job_id, f"Detection finished - {len(moments)} "
                              "moments found (Offline)")
             _save_job(job_id)
+            training_data.record_detect(job_id, job, "offline",
+                                        category)
         except Exception as e:  # noqa: BLE001
             # back to transcript state - unless keyword moments from
             # find_moments are still present, then stay on moments
@@ -2557,6 +2564,8 @@ class Api:
             _job_log(job_id, f"Detection finished - {len(moments)} "
                              "moments found (Built-in AI)")
             _save_job(job_id)
+            training_data.record_detect(job_id, job, "local",
+                                        category)
         except Exception as e:  # noqa: BLE001
             # back to transcript state - unless keyword moments from
             # find_moments are still present, then stay on moments
@@ -2574,6 +2583,13 @@ class Api:
             job["stage"] = "Transcript ready"
             job["progress"] = 100
             _job_log(job_id, "ERROR: " + job.get("detect_error", ""))
+
+    # -- AI Training Data (passive fine-tune collection) ------------
+    def training_stats(self):
+        return training_data.stats()
+
+    def training_export(self):
+        return training_data.export_dataset()
 
     # -- built-in AI download/status (Step 2 card) ------------------------
     def local_ai_status(self):
@@ -5707,6 +5723,9 @@ class Api:
                            and (r.get("aspect") or "9:16")
                            == _batch_ratio)
                    and os.path.isfile(r.get("path", ""))]
+        # AI Training Data: renders appended past this count are
+        # this batch's - their moment indices are the user's picks.
+        _td_before = len(renders)
         # Caption Studio: explicit per-render caption params
         # (normalized once here for storage; render_clip normalizes
         # again for the actual ASS build - cheap and consistent)
@@ -5841,6 +5860,10 @@ class Api:
             # started in that gap saw status=done yet was refused
             # with render_in_progress (sweep2 T4).
             _release_render_lock(job)
+            training_data.record_render(
+                job_id, job,
+                [r.get("moment_index")
+                 for r in renders[_td_before:]], opts)
             if tamper_hit:
                 job["status"] = "moments"
                 job["stage"] = "Usage data problem"

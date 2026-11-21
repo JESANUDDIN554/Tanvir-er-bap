@@ -576,6 +576,44 @@ $("dlQualitySel").addEventListener("change", async () => {
   } catch (e) { /* offline */ }
 });
 
+/* ---------------- AI Training Data (Settings) ---------------- */
+async function refreshTrainingStats() {
+  const el = $("tdStats");
+  if (!el) return;
+  try {
+    const st = await api.training_stats();
+    if (!st || !st.ok) {
+      el.textContent = "Couldn't read the collection yet.";
+      return;
+    }
+    el.textContent = "Collected so far: " + st.detects
+      + " videos analyzed, " + st.renders + " render picks — "
+      + st.labelled_examples + " complete training examples ("
+      + st.size_mb + " MB), saved on this PC only.";
+  } catch (e) { /* offline */ }
+}
+$("tdCollectCheck").addEventListener("change", async () => {
+  settings.training_collect = $("tdCollectCheck").checked;
+  try {
+    await api.save_settings(
+      { training_collect: settings.training_collect });
+  } catch (e) { /* offline */ }
+  refreshTrainingStats();
+});
+$("tdExportBtn").addEventListener("click", async () => {
+  const el = $("tdStats");
+  try {
+    const r = await api.training_export();
+    if (r && r.ok) {
+      el.textContent = "Dataset exported: " + r.examples
+        + " training examples → " + r.path;
+    } else {
+      el.textContent = "Export failed: "
+        + ((r && r.error) || "unknown error");
+    }
+  } catch (e) { el.textContent = "Export failed (offline?)."; }
+});
+
 $("importBtn").addEventListener("click", async () => {
   const url = $("urlInput").value.trim();
   if (!url) return;
@@ -6076,6 +6114,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     sel.value = settings.language || "auto";
     $("cookiesCheck").checked = !!settings.use_cookies;
     $("dlQualitySel").value = settings.download_quality || "max";
+    if ($("tdCollectCheck"))
+      $("tdCollectCheck").checked = settings.training_collect !== false;
+    refreshTrainingStats();
   } catch (e) { /* offline-safe defaults below */ }
   applyTheme();
   syncQualityAvailability();
